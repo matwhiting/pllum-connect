@@ -191,6 +191,46 @@ func (f *fakeClient) ParseWebMessage(chat types.JID, webMsg *waWeb.WebMessageInf
 	return f.parser.ParseWebMessage(chat, webMsg)
 }
 
+// deliver hands an encrypted message stanza to the adapter the way whatsmeow
+// does with EnableDecryptedEventBuffer (message.go bufferedDecrypt and
+// decryptMessages), using the real device store's event buffer: the first
+// copy is "decrypted" (its plaintext kept in the buffer, as the session
+// moves on), a redelivery replays the kept plaintext, and once the handlers
+// succeed the plaintext is cleared, so a later copy is acked unhandled. It
+// reports whether whatsmeow would ack the stanza.
+func (f *fakeClient) deliver(hash [32]byte, evt *events.Message) (acked bool, err error) {
+	ctx := context.Background()
+	buf, err := f.dev.EventBuffer.GetBufferedEvent(ctx, hash)
+	if err != nil {
+		return false, err
+	}
+	if buf != nil && buf.Plaintext == nil {
+		return true, nil // ErrEventAlreadyProcessed: acked, not dispatched
+	}
+	var plaintext []byte
+	if buf != nil {
+		plaintext = buf.Plaintext
+	} else {
+		if plaintext, err = proto.Marshal(evt.RawMessage); err != nil {
+			return false, err
+		}
+		if err := f.dev.EventBuffer.DoDecryptionTxn(ctx, func(ctx context.Context) error {
+			return f.dev.EventBuffer.PutBufferedEvent(ctx, hash, plaintext, evt.Info.Timestamp)
+		}); err != nil {
+			return false, err
+		}
+	}
+	var m waE2E.Message
+	if err := proto.Unmarshal(plaintext, &m); err != nil {
+		return false, err
+	}
+	again := &events.Message{Info: evt.Info, RawMessage: &m}
+	if !f.dispatch(again.UnwrapRaw()) {
+		return false, nil // handler failed: no ack, the plaintext stays
+	}
+	return true, f.dev.EventBuffer.ClearBufferedEventPlaintext(ctx, hash)
+}
+
 // dispatch hands evt to the adapter as whatsmeow would, and reports whether
 // every handler said it was handled (whatsmeow acks only then).
 func (f *fakeClient) dispatch(evt any) bool {

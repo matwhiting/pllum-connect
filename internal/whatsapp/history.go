@@ -53,7 +53,7 @@ func (w *WhatsApp) drainHistory(ctx context.Context) {
 		}
 		var notif waE2E.HistorySyncNotification
 		if err := proto.Unmarshal(blob, &notif); err != nil {
-			if w.st.DeletePendingHistory(Name, id) != nil {
+			if w.dropPending(id) != nil {
 				return
 			}
 			continue
@@ -75,7 +75,7 @@ func (w *WhatsApp) drainHistory(ctx context.Context) {
 				gone = true
 			}
 			if gone {
-				if w.st.DeletePendingHistory(Name, id) != nil {
+				if w.dropPending(id) != nil {
 					return
 				}
 				continue
@@ -83,14 +83,31 @@ func (w *WhatsApp) drainHistory(ctx context.Context) {
 			w.retryHistory()
 			return
 		}
-		if err := w.storeHistory(cli, hs); err != nil {
+		complete, err := w.storeHistory(cli, hs)
+		if err != nil {
 			w.retryHistory()
 			return
 		}
-		if w.st.DeletePendingHistory(Name, id) != nil {
+		if w.dropPending(id) != nil {
 			return
 		}
+		// Told only once the row is gone, so the done timer never finds it
+		// still waiting.
+		w.historyProgress(complete)
+		w.changed()
 	}
+}
+
+// dropPending deletes a pending row and forgets its failures: ids are
+// reused once the table empties, so a later row must not inherit them.
+func (w *WhatsApp) dropPending(id int64) error {
+	if err := w.st.DeletePendingHistory(Name, id); err != nil {
+		return err
+	}
+	w.mu.Lock()
+	delete(w.tries, id)
+	w.mu.Unlock()
+	return nil
 }
 
 // historyGone reports whether a download failed for good: the blob is gone
@@ -166,13 +183,14 @@ func (w *WhatsApp) retryHistory() {
 
 // storeHistory writes one downloaded history blob: names, number–LID
 // mappings, and each conversation with its lines, unread state and mute.
-func (w *WhatsApp) storeHistory(cli waClient, hs *waHistorySync.HistorySync) error {
+// complete reports a FULL sync at 100%.
+func (w *WhatsApp) storeHistory(cli waClient, hs *waHistorySync.HistorySync) (complete bool, err error) {
 	for _, m := range hs.GetPhoneNumberToLidMappings() {
 		pn, err1 := types.ParseJID(m.GetPnJID())
 		lid, err2 := types.ParseJID(m.GetLidJID())
 		if err1 == nil && err2 == nil {
 			if err := w.link(lid, pn); err != nil {
-				return err
+				return false, err
 			}
 		}
 	}
@@ -184,7 +202,7 @@ func (w *WhatsApp) storeHistory(cli waClient, hs *waHistorySync.HistorySync) err
 			}
 		}
 		if err := w.refreshTitles(jids...); err != nil {
-			return err
+			return false, err
 		}
 	}
 
@@ -194,7 +212,7 @@ func (w *WhatsApp) storeHistory(cli waClient, hs *waHistorySync.HistorySync) err
 	for _, conv := range hs.GetConversations() {
 		chatID, n, err := w.storeConversation(cli, conv)
 		if err != nil {
-			return err
+			return false, err
 		}
 		if chatID != "" {
 			chats = append(chats, chatID)
@@ -210,7 +228,7 @@ func (w *WhatsApp) storeHistory(cli waClient, hs *waHistorySync.HistorySync) err
 		}
 	}
 	w.hMessages += messages
-	complete := full && hs.GetProgress() >= 100
+	complete = full && hs.GetProgress() >= 100
 	var completed []string
 	if complete {
 		for c := range w.hFull {
@@ -224,13 +242,11 @@ func (w *WhatsApp) storeHistory(cli waClient, hs *waHistorySync.HistorySync) err
 		yes := true
 		for _, c := range completed {
 			if err := w.st.PutChat(Name, store.ChatInfo{ID: c, HistoryComplete: &yes}); err != nil {
-				return err
+				return false, err
 			}
 		}
 	}
-	w.historyProgress(complete)
-	w.changed()
-	return nil
+	return complete, nil
 }
 
 // storeConversation writes one conversation; chatID is empty for a chat
@@ -395,8 +411,31 @@ func (w *WhatsApp) armHistoryQuiet() {
 	}
 }
 
-// historyQuietEnded: 120 s with no batch, so the history sync is done.
+// holdHistoryQuiet restarts the 120 s wait when a notification arrives,
+// unless the sync is already done.
+func (w *WhatsApp) holdHistoryQuiet() {
+	w.hmu.Lock()
+	armed := w.hStop != nil
+	w.hmu.Unlock()
+	if armed {
+		w.armHistoryQuiet()
+	}
+}
+
+// historyQuietEnded: 120 s with no batch, so the history sync is done,
+// unless a notification is still waiting to be downloaded (for a connection,
+// say); then the wait starts again.
 func (w *WhatsApp) historyQuietEnded() {
+	w.mu.Lock()
+	stopped := w.stopped
+	w.mu.Unlock()
+	if stopped {
+		return
+	}
+	if _, _, waiting, err := w.st.NextPendingHistory(Name); waiting || err != nil {
+		w.armHistoryQuiet()
+		return
+	}
 	w.hmu.Lock()
 	if w.hDone {
 		w.hmu.Unlock()

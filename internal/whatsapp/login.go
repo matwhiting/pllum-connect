@@ -83,10 +83,7 @@ func (w *WhatsApp) watchLogin(cli waClient, ctx context.Context, qr <-chan whats
 		case whatsmeow.QRChannelEventCode:
 			w.showCode(cli, item)
 		case whatsmeow.QRChannelSuccess.Event:
-			// whatsmeow reconnects as the linked device; Connected follows.
-			// The history sync is done after 120 s even if none comes.
-			w.endLogin(cli, network.Connecting, "", false)
-			w.armHistoryQuiet()
+			w.loginSucceeded(cli)
 		case whatsmeow.QRChannelTimeout.Event:
 			// The channel says timeout for a dropped connection too.
 			kind := wire.Timeout
@@ -109,6 +106,15 @@ func (w *WhatsApp) watchLogin(cli waClient, ctx context.Context, qr <-chan whats
 	}
 }
 
+// loginSucceeded: his phone linked the device. whatsmeow reconnects as the
+// linked device and Connected follows; the history sync is done after 120 s
+// even if none comes.
+func (w *WhatsApp) loginSucceeded(cli waClient) {
+	if w.endLogin(cli, network.Connecting, "", false) {
+		w.armHistoryQuiet()
+	}
+}
+
 // showCode sends one QR code to Pllum, with the moment it expires.
 func (w *WhatsApp) showCode(cli waClient, item whatsmeow.QRChannelItem) {
 	w.mu.Lock()
@@ -125,12 +131,13 @@ func (w *WhatsApp) showCode(cli waClient, item whatsmeow.QRChannelItem) {
 }
 
 // endLogin ends the QR login cli runs, if it is still the current one, in
-// state s; stop also cancels it and disconnects.
-func (w *WhatsApp) endLogin(cli waClient, s network.State, kind wire.Kind, stop bool) {
+// state s; stop also cancels it and disconnects. It reports whether it
+// ended the login (false for a login already ended or a stale client).
+func (w *WhatsApp) endLogin(cli waClient, s network.State, kind wire.Kind, stop bool) bool {
 	w.mu.Lock()
 	if w.cli != cli || w.loginStop == nil {
 		w.mu.Unlock()
-		return
+		return false
 	}
 	cancel := w.loginStop
 	w.loginStop = nil
@@ -143,6 +150,7 @@ func (w *WhatsApp) endLogin(cli waClient, s network.State, kind wire.Kind, stop 
 		cancel()
 		cli.Disconnect()
 	}
+	return true
 }
 
 // CancelLogin stops a QR login in progress.

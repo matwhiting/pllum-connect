@@ -175,6 +175,12 @@ func setDeviceProps() {
 func newWhatsmeowClient(dev *wastore.Device) *whatsmeow.Client {
 	cli := whatsmeow.NewClient(dev, waLog.Noop)
 	cli.SynchronousAck = true
+	// Decrypted plaintext is kept in the (encrypted) device database until
+	// every handler has succeeded, and replayed when WhatsApp sends the
+	// stanza again. Without it a handler's failure loses the message: the
+	// Signal session has moved past it, so the redelivered copy fails to
+	// decrypt and is acked unhandled.
+	cli.EnableDecryptedEventBuffer = true
 	cli.ManualHistorySyncDownload = true
 	cli.DisableManualHistorySyncReceipt = true // sent once the notification is stored
 	cli.EmitAppStateEventsOnFullSync = true
@@ -558,6 +564,9 @@ func (w *WhatsApp) restored() {
 	defer w.mu.Unlock()
 	if w.state == network.Offline && !w.replaced {
 		w.setState(network.Live, "")
+		// No Connected follows a restored keep-alive: wake the history
+		// worker for anything that arrived while it waited.
+		w.kickHistory()
 	}
 }
 

@@ -201,6 +201,7 @@ func (w *WhatsApp) ingest(evt *events.Message, source string) (prep, error) {
 		if cli := w.client(); cli != nil {
 			_ = cli.SendProtocolMessageReceipt(context.WithoutCancel(w.bg()), evt.Info.ID, types.ReceiptTypeHistorySync)
 		}
+		w.holdHistoryQuiet()
 		w.kickHistory()
 		return prep{}, nil
 	}
