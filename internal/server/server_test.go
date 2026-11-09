@@ -87,11 +87,14 @@ func (f *fakeNetwork) SendState(messageID string) network.SendState {
 	return network.SendState{State: network.SendFailed, Kind: wire.Refused}
 }
 
-func (f *fakeNetwork) SendFor(clientID string) string {
-	if clientID == "client-invented" {
-		return "made-id-1"
+func (f *fakeNetwork) SendFor(clientID string) (string, error) {
+	switch clientID {
+	case "client-invented":
+		return "made-id-1", nil
+	case "client-unreadable":
+		return "", &wire.Error{Kind: wire.StoreKey}
 	}
-	return ""
+	return "", nil
 }
 
 func (f *fakeNetwork) React(ctx context.Context, chatID, messageID, emoji, transactionID string) error {
@@ -577,6 +580,10 @@ func TestNetworkMethodsReachTheNetwork(t *testing.T) {
 	r = result(t, call("2u", "sendStatus", `,"clientID":"client-other"`))
 	if r["state"] != "unknown" || r["messageID"] != nil {
 		t.Errorf("sendStatus by an unknown key = %v", r)
+	}
+	// a store that can't be read is an error, never "none"
+	if k := kindOf(t, call("2e", "sendStatus", `,"clientID":"client-unreadable"`)); k != string(wire.StoreKey) {
+		t.Errorf("sendStatus by a key the store can't read gave %v", k)
 	}
 	for _, params := range []string{``, `,"messageID":"made-id-1","clientID":"client-invented"`} {
 		if k := kindOf(t, call("2b", "sendStatus", params)); k != string(wire.BadRequest) {

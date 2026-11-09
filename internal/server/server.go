@@ -556,7 +556,11 @@ var methods = map[string]handler{
 		id := p.MessageID
 		if p.ClientID != "" {
 			// asked by the caller's key: the send it names, when there is one
-			if id = n.SendFor(p.ClientID); id == "" {
+			var err error
+			if id, err = n.SendFor(p.ClientID); err != nil {
+				return nil, err
+			}
+			if id == "" {
 				return map[string]any{"state": network.SendUnknown}, nil
 			}
 			r["messageID"] = id

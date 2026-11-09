@@ -538,6 +538,15 @@ func TestAPhotoWithTextIsOneMessageWithACaption(t *testing.T) {
 	if line := r.message(aliceJID.String(), vid); line.Kind != "video" || line.Text != "invented clip" {
 		t.Errorf("the video line is %+v", line)
 	}
+	// A QuickTime movie (as Pllum's cleaned copy of one is) is a video too.
+	movPath := filepath.Join(r.dir, "outbox", "invented.mov")
+	_ = os.WriteFile(movPath, append([]byte("\x00\x00\x00\x14ftypqt  \x00\x00\x00\x00qt  "), make([]byte, 64)...), 0o600)
+	mid := r.sendOK(network.Outgoing{ChatID: aliceJID.String(), File: movPath})
+	r.settled(mid)
+	sent = c.sentMessages()
+	if v := sent[3].msg.GetVideoMessage(); v.GetMimetype() != "video/quicktime" || c.uploadList()[3].kind != whatsmeow.MediaVideo {
+		t.Errorf("the QuickTime movie went as %v", sent[3].msg)
+	}
 }
 
 func TestAnUnknownTypeIsADocument(t *testing.T) {
@@ -1144,11 +1153,11 @@ func TestARepeatedClientIDIsAnsweredWhileTheConnectionIsDown(t *testing.T) {
 	c.with(func() { c.sendBlock = release })
 	m := network.Outgoing{ChatID: aliceJID.String(), Text: "invented", ClientID: "client-invented-down"}
 	id := r.sendOK(m)
-	if got := r.w.SendFor("client-invented-down"); got != id {
-		t.Fatalf("SendFor = %q, want %q", got, id)
+	if got, err := r.w.SendFor("client-invented-down"); err != nil || got != id {
+		t.Fatalf("SendFor = %q, %v; want %q", got, err, id)
 	}
-	if got := r.w.SendFor("client-invented-none"); got != "" {
-		t.Fatalf("SendFor an unknown key = %q", got)
+	if got, err := r.w.SendFor("client-invented-none"); err != nil || got != "" {
+		t.Fatalf("SendFor an unknown key = %q, %v", got, err)
 	}
 	// unlinked mid-send: a new send is notConnected, but the repeat gets the send it made
 	c.dispatch(&events.LoggedOut{})

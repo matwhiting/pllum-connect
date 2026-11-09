@@ -224,13 +224,17 @@ func (w *WhatsApp) Send(ctx context.Context, m network.Outgoing) (string, error)
 }
 
 // SendFor is the message ID of the send kept under the caller's key (a
-// failed one included), or "" for none.
-func (w *WhatsApp) SendFor(clientID string) string {
+// failed one included), or "" for none. A store that can't be read is an
+// error, so the caller hears "can't say", never "none".
+func (w *WhatsApp) SendFor(clientID string) (string, error) {
 	o, ok, err := w.st.OutgoingClient(Name, clientID)
-	if err != nil || !ok {
-		return ""
+	if err != nil {
+		return "", err
 	}
-	return o.ID
+	if !ok {
+		return "", nil
+	}
+	return o.ID, nil
 }
 
 // sentFor is the send already kept under the caller's key, when one is
@@ -261,16 +265,25 @@ func fileKind(path, name string) (kind, mimetype string, err error) {
 	head := make([]byte, 512)
 	n, _ := io.ReadFull(f, head)
 	sniffed := http.DetectContentType(head[:n])
+	if isQuickTime(head[:n]) {
+		sniffed = "video/quicktime"
+	}
 	size := fi.Size()
 	switch {
 	case (sniffed == "image/jpeg" || sniffed == "image/png") && size <= photoLimit:
 		return "photo", sniffed, nil
-	case sniffed == "video/mp4" && size <= videoLimit:
+	case (sniffed == "video/mp4" || sniffed == "video/quicktime") && size <= videoLimit:
 		return "video", sniffed, nil
 	case size <= fileLimit:
 		return "file", documentType(name, path, sniffed), nil
 	}
 	return "", "", errTooLarge
+}
+
+// isQuickTime reports whether head starts a QuickTime movie: its first box
+// is ftyp with the brand "qt  " (which Go's sniffing doesn't name).
+func isQuickTime(head []byte) bool {
+	return len(head) >= 12 && string(head[4:8]) == "ftyp" && string(head[8:12]) == "qt  "
 }
 
 // documentType is a document's MIME type: its name's, else its content's.

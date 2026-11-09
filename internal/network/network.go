@@ -104,8 +104,8 @@ type Network interface {
 	Send(ctx context.Context, m Outgoing) (messageID string, err error)
 	SendState(messageID string) SendState
 	// SendFor is the message ID of the send kept under the caller's key,
-	// or "" when there is none.
-	SendFor(clientID string) string
+	// or "" when there is none; an error when it can't say.
+	SendFor(clientID string) (string, error)
 	React(ctx context.Context, chatID, messageID, emoji, transactionID string) error
 	MarkRead(ctx context.Context, chatID, through string) error
 	MarkUnread(ctx context.Context, chatID string) error
