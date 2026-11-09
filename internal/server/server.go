@@ -26,6 +26,12 @@ import (
 // When it is empty, hello reports the module version Go stamped, else "dev".
 var Version = ""
 
+// Commit is the commit the helper was built from, set at build time with
+// -ldflags "-X github.com/matwhiting/pllum-connect/internal/server.Commit=…"
+// (Pllum's build stamps connect.lock's commit, and builds with -buildvcs=false).
+// When it is empty, hello reports the commit Go stamped, else "unknown".
+var Commit = ""
+
 // shutdownGrace is how long Serve waits, once input ends, for the networks to
 // stop and the requests in flight to finish. The contract allows 5 s in all.
 const shutdownGrace = 3 * time.Second
@@ -363,6 +369,9 @@ func parseKey(s string) (key [32]byte, ok bool) {
 // buildInfo is hello's version and commit.
 func buildInfo() (version, commit string) {
 	version, commit = Version, "unknown"
+	if Commit != "" {
+		commit = Commit
+	}
 	bi, ok := debug.ReadBuildInfo()
 	if !ok {
 		if version == "" {
@@ -377,7 +386,7 @@ func buildInfo() (version, commit string) {
 		version = "dev"
 	}
 	for _, kv := range bi.Settings {
-		if kv.Key == "vcs.revision" && kv.Value != "" {
+		if Commit == "" && kv.Key == "vcs.revision" && kv.Value != "" {
 			commit = kv.Value
 		}
 	}

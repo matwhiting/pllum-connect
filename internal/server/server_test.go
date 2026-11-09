@@ -687,3 +687,18 @@ func TestAHandlerWithNoResultAnswersEmpty(t *testing.T) {
 		t.Fatalf("got %v, want an empty result", m)
 	}
 }
+
+func TestHelloReportsTheCommitAndVersionTheBuildStamps(t *testing.T) {
+	oldVersion, oldCommit := Version, Commit
+	t.Cleanup(func() { Version, Commit = oldVersion, oldCommit })
+	Version, Commit = "0.1.0", "0123456789abcdef0123456789abcdef01234567"
+	fake := &fakeNetwork{name: "whatsapp"}
+	h := start(t, fake)
+	r := result(t, h.hello())
+	if r["version"] != "0.1.0" {
+		t.Errorf("version = %v, want the stamped 0.1.0", r["version"])
+	}
+	if r["commit"] != "0123456789abcdef0123456789abcdef01234567" {
+		t.Errorf("commit = %v, want the stamped commit", r["commit"])
+	}
+}
