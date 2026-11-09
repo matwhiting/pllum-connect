@@ -173,3 +173,65 @@ func TestATransactionIsKeptOnce(t *testing.T) {
 		t.Fatalf("another network's transaction: %v", err)
 	}
 }
+
+func TestAClientIDIsKeptOnceAndMovesOffAFailedSend(t *testing.T) {
+	s := openTest(t)
+	first := Outgoing{ID: "3EB0O0021", ChatID: phoneChat, Kind: "message", Client: "client-same", MadeMs: base}
+	if err := s.PutOutgoing(net, first); err != nil {
+		t.Fatal(err)
+	}
+	second := first
+	second.ID = "3EB0O0022"
+	if err := s.PutOutgoing(net, second); err == nil {
+		t.Fatalf("a second row was kept for one client ID while the first is sending")
+	}
+	if o, ok, err := s.OutgoingClient(net, "client-same"); err != nil || !ok || o.ID != "3EB0O0021" || o.Client != "client-same" {
+		t.Fatalf("OutgoingClient = %+v, %v, %v", o, ok, err)
+	}
+	// Once the first failed, the key moves to a new row.
+	if err := s.SetOutgoingState(net, "3EB0O0021", OutFailed, "refused"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.PutOutgoing(net, second); err != nil {
+		t.Fatalf("a new row for a failed send's key: %v", err)
+	}
+	if o, ok, _ := s.OutgoingClient(net, "client-same"); !ok || o.ID != "3EB0O0022" {
+		t.Fatalf("the key names %+v", o)
+	}
+	if o, _, _ := s.Outgoing(net, "3EB0O0021"); o.Client != "" || o.State != OutFailed {
+		t.Fatalf("the failed row is %+v", o)
+	}
+	if _, ok, err := s.OutgoingClient(net, ""); ok || err != nil {
+		t.Fatalf("no key found a row")
+	}
+}
+
+func TestASchema6StoreGainsTheClientID(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(dir, testKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, stmt := range []string{
+		`DROP INDEX outgoing_client_once`,
+		`ALTER TABLE outgoing DROP COLUMN client_id`,
+		`UPDATE meta SET value = '6' WHERE key = 'schema'`,
+	} {
+		if _, err := s.db.Exec(stmt); err != nil {
+			t.Fatalf("%s: %v", stmt, err)
+		}
+	}
+	s.Close()
+	if s, err = Open(dir, testKey); err != nil {
+		t.Fatalf("a schema 6 store did not open: %v", err)
+	}
+	defer s.Close()
+	o := Outgoing{ID: "3EB0O0031", ChatID: phoneChat, Kind: "message", Client: "client-up", MadeMs: base}
+	if err := s.PutOutgoing(net, o); err != nil {
+		t.Fatalf("PutOutgoing after the upgrade: %v", err)
+	}
+	o.ID = "3EB0O0032"
+	if err := s.PutOutgoing(net, o); err == nil {
+		t.Fatalf("the upgraded store kept two rows for one client ID")
+	}
+}

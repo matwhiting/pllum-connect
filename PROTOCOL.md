@@ -34,7 +34,7 @@ The contract between Pllum and this helper. Pllum refuses any other protocol ver
 | `messages` | `chatID`, `before`?, `limit` (≤200) | `items: [Message]` oldest first, `hasMore`, `oldestCursor`? |
 | `search` | `text`?, `chatIDs`, `fromMe`?, `senderID`?, `afterMs`?, `beforeMs`?, `limit` (≤50), `cursor`? | `items: [Message]` newest first, `cursor`? |
 | `findChats` | `query`, `limit` (≤20) | `items: [Chat]` |
-| `send` | `chatID`, `text`, `replyTo`?, `file`? (an absolute path), `fileName`? | `messageID` (made before sending; returns at once) |
+| `send` | `chatID`, `text`, `replyTo`?, `file`? (an absolute path), `fileName`?, `clientID`? (the caller's own key for this send) | `messageID` (made before sending; returns at once). A repeat with the `clientID` of a send that is sending or sent returns that send's `messageID` and sends nothing more; one whose send failed makes a new send, which the key then names |
 | `sendStatus` | `messageID` | `state`: `sending`\|`sent`\|`failed`\|`unknown`, `kind`? |
 | `react` | `chatID`, `messageID`, `emoji` (`""` removes), `transactionID` | `{}` |
 | `markRead` | `chatID`, `through`? (a message ID; null = newest incoming) | `{}` |

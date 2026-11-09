@@ -549,11 +549,12 @@ func TestNetworkMethodsReachTheNetwork(t *testing.T) {
 		return m
 	}
 
-	r := result(t, call("1", "send", `,"chatID":"chat-a","text":"invented words","replyTo":"line-b","file":"/invented/file","fileName":"f.txt"`))
+	r := result(t, call("1", "send", `,"chatID":"chat-a","text":"invented words","replyTo":"line-b","file":"/invented/file","fileName":"f.txt","clientID":"client-invented"`))
 	if r["messageID"] != "made-id-1" {
 		t.Errorf("send result = %v", r)
 	}
-	if want := (network.Outgoing{ChatID: "chat-a", Text: "invented words", ReplyTo: "line-b", File: "/invented/file", FileName: "f.txt"}); fake.sent != want {
+	if want := (network.Outgoing{ChatID: "chat-a", Text: "invented words", ReplyTo: "line-b", File: "/invented/file", FileName: "f.txt",
+		ClientID: "client-invented"}); fake.sent != want {
 		t.Errorf("send passed %+v", fake.sent)
 	}
 

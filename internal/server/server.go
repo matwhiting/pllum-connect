@@ -526,6 +526,7 @@ var methods = map[string]handler{
 			ReplyTo  string `json:"replyTo"`
 			File     string `json:"file"`
 			FileName string `json:"fileName"`
+			ClientID string `json:"clientID"`
 		}
 		if err := decode(params, &p); err != nil {
 			return nil, err
@@ -533,7 +534,8 @@ var methods = map[string]handler{
 		if p.ChatID == "" || (p.File != "" && !filepath.IsAbs(p.File)) {
 			return nil, badRequest
 		}
-		id, err := n.Send(ctx, network.Outgoing{ChatID: p.ChatID, Text: p.Text, ReplyTo: p.ReplyTo, File: p.File, FileName: p.FileName})
+		id, err := n.Send(ctx, network.Outgoing{ChatID: p.ChatID, Text: p.Text, ReplyTo: p.ReplyTo, File: p.File, FileName: p.FileName,
+			ClientID: p.ClientID})
 		if err != nil {
 			return nil, err
 		}

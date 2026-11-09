@@ -70,6 +70,10 @@ type Outgoing struct {
 	ReplyTo  string // a message ID, or empty
 	File     string // an absolute path, or empty
 	FileName string
+	// ClientID is the caller's own key for this send: a send repeated with
+	// it (its answer was lost) gives the same message ID and sends nothing
+	// more, unless the first one failed.
+	ClientID string
 }
 
 // SendState is what `sendStatus` answers. Kind is set only when State is

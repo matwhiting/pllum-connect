@@ -1060,3 +1060,80 @@ func TestAReactionCutOffAcrossAReconnectGoesOnceMore(t *testing.T) {
 		return len(l.Reactions) == 1 && l.Reactions[0].FromMe
 	})
 }
+
+func TestASendRepeatedWithItsClientIDGivesTheSameIDAndSendsOnce(t *testing.T) {
+	r, c := withAlice(t)
+	release := make(chan struct{})
+	c.with(func() { c.sendBlock = release })
+	m := network.Outgoing{ChatID: aliceJID.String(), Text: "invented once", ClientID: "client-invented-1"}
+	id := r.sendOK(m)
+	// The caller lost the answer and asks again, while the first is still going and after it went.
+	if again := r.sendOK(m); again != id {
+		t.Fatalf("a repeat while sending gave %q, want %q", again, id)
+	}
+	close(release)
+	if st := r.settled(id); st.State != network.SendSent {
+		t.Fatalf("state %+v, want sent", st)
+	}
+	if again := r.sendOK(m); again != id {
+		t.Fatalf("a repeat after it went gave %q, want %q", again, id)
+	}
+	time.Sleep(20 * time.Millisecond)
+	if n := len(c.sentMessages()); n != 1 {
+		t.Fatalf("one client ID sent %d messages", n)
+	}
+	// The same key for another chat is a bad request, and sends nothing.
+	r.send(textFrom(bobJID, bobJID, "3EB0B0000000000000001", base+2000, "invented from bob"))
+	if _, err := r.w.Send(context.Background(), network.Outgoing{ChatID: bobJID.String(), Text: "invented", ClientID: "client-invented-1"}); kindOf(err) != wire.BadRequest {
+		t.Fatalf("the key for another chat gave %v, want badRequest", err)
+	}
+	if n := len(c.sentMessages()); n != 1 {
+		t.Fatalf("%d sends after a key for another chat", n)
+	}
+}
+
+func TestDifferentClientIDsSendTwice(t *testing.T) {
+	r, c := withAlice(t)
+	first := r.sendOK(network.Outgoing{ChatID: aliceJID.String(), Text: "invented same words", ClientID: "client-invented-a"})
+	second := r.sendOK(network.Outgoing{ChatID: aliceJID.String(), Text: "invented same words", ClientID: "client-invented-b"})
+	none1 := r.sendOK(network.Outgoing{ChatID: aliceJID.String(), Text: "invented same words"})
+	none2 := r.sendOK(network.Outgoing{ChatID: aliceJID.String(), Text: "invented same words"})
+	ids := map[string]bool{first: true, second: true, none1: true, none2: true}
+	if len(ids) != 4 {
+		t.Fatalf("four sends made %d IDs", len(ids))
+	}
+	for id := range ids {
+		r.settled(id)
+	}
+	if n := len(c.sentMessages()); n != 4 {
+		t.Fatalf("%d sends, want 4", n)
+	}
+}
+
+func TestAClientIDWhoseSendFailedMakesANewSend(t *testing.T) {
+	r, c := withAlice(t)
+	c.with(func() { c.sendErr = whatsmeow.ErrRecipientNotOnWhatsApp })
+	m := network.Outgoing{ChatID: aliceJID.String(), Text: "invented", ClientID: "client-invented-f"}
+	first := r.sendOK(m)
+	if st := r.settled(first); st.State != network.SendFailed || st.Kind != wire.Refused {
+		t.Fatalf("state %+v, want failed/refused", st)
+	}
+	// Try again: the failed send is done, so the key makes a new one.
+	c.with(func() { c.sendErr = nil })
+	second := r.sendOK(m)
+	if second == first {
+		t.Fatalf("a send whose first try failed kept its ID")
+	}
+	if st := r.settled(second); st.State != network.SendSent {
+		t.Fatalf("the new send is %+v", st)
+	}
+	if st := r.w.SendState(first); st.State != network.SendFailed {
+		t.Fatalf("the failed send became %+v", st)
+	}
+	if again := r.sendOK(m); again != second {
+		t.Fatalf("the key now names %q, want the new send %q", again, second)
+	}
+	if n := len(c.sentMessages()); n != 2 {
+		t.Fatalf("%d sends, want 2", n)
+	}
+}

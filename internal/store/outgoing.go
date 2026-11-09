@@ -23,13 +23,15 @@ type Outgoing struct {
 	State   string // OutSending, OutSent or OutFailed
 	Fail    string // the error kind, when failed
 	Txn     string // the caller's transaction ID, when it gave one
+	Client  string // the caller's own key for a send, when it gave one
 	MadeMs  int64
 	Request []byte
 	Message []byte
 }
 
 // PutOutgoing keeps a new write as sending. An ID already kept is an error:
-// each write has its own.
+// each write has its own. So is a send key another row still holds, unless
+// that row failed: the key moves to the new row, as the failed send is done.
 func (s *Store) PutOutgoing(network string, o Outgoing) error {
 	if network == "" || o.ID == "" || o.ChatID == "" || o.Kind == "" {
 		return errBadRequest
@@ -39,9 +41,15 @@ func (s *Store) PutOutgoing(network string, o Outgoing) error {
 		if err != nil {
 			return err
 		}
-		_, err = tx.Exec(`INSERT INTO outgoing (network, msg_id, chat_id, kind, state, txn, made_ms, request, message)
-				VALUES (?, ?, ?, ?, ?, NULLIF(?, ''), ?, ?, ?)`,
-			network, o.ID, chat, o.Kind, OutSending, o.Txn, o.MadeMs, nilIfEmpty(o.Request), nilIfEmpty(o.Message))
+		if o.Client != "" {
+			if _, err := tx.Exec(`UPDATE outgoing SET client_id = NULL WHERE network = ? AND client_id = ? AND state = ?`,
+				network, o.Client, OutFailed); err != nil {
+				return err
+			}
+		}
+		_, err = tx.Exec(`INSERT INTO outgoing (network, msg_id, chat_id, kind, state, txn, made_ms, request, message, client_id)
+				VALUES (?, ?, ?, ?, ?, NULLIF(?, ''), ?, ?, ?, NULLIF(?, ''))`,
+			network, o.ID, chat, o.Kind, OutSending, o.Txn, o.MadeMs, nilIfEmpty(o.Request), nilIfEmpty(o.Message), o.Client)
 		return err
 	})
 }
@@ -73,11 +81,12 @@ func (s *Store) SetOutgoingState(network, id, state, fail string) error {
 	})
 }
 
-const outgoingColumns = `msg_id, chat_id, kind, state, COALESCE(fail, ''), COALESCE(txn, ''), made_ms, request, message`
+const outgoingColumns = `msg_id, chat_id, kind, state, COALESCE(fail, ''), COALESCE(txn, ''), made_ms, request, message,
+	COALESCE(client_id, '')`
 
 func scanOutgoing(row interface{ Scan(...any) error }) (Outgoing, error) {
 	var o Outgoing
-	err := row.Scan(&o.ID, &o.ChatID, &o.Kind, &o.State, &o.Fail, &o.Txn, &o.MadeMs, &o.Request, &o.Message)
+	err := row.Scan(&o.ID, &o.ChatID, &o.Kind, &o.State, &o.Fail, &o.Txn, &o.MadeMs, &o.Request, &o.Message, &o.Client)
 	return o, err
 }
 
@@ -107,6 +116,14 @@ func (s *Store) OutgoingTxn(network, txn string) (Outgoing, bool, error) {
 	}
 	return s.oneOutgoing(`SELECT `+outgoingColumns+` FROM outgoing WHERE network = ? AND txn = ?
 			ORDER BY made_ms DESC, rowid DESC LIMIT 1`, network, txn)
+}
+
+// OutgoingClient is the send kept for a caller's send key.
+func (s *Store) OutgoingClient(network, client string) (Outgoing, bool, error) {
+	if client == "" {
+		return Outgoing{}, false, nil
+	}
+	return s.oneOutgoing(`SELECT `+outgoingColumns+` FROM outgoing WHERE network = ? AND client_id = ?`, network, client)
 }
 
 // OutgoingSending is every write still sending, oldest first.

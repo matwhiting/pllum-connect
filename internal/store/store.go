@@ -298,6 +298,11 @@ func (s *Store) migrate() error {
 				return err
 			}
 		}
+		for _, stmt := range lateSchema {
+			if _, err := tx.Exec(stmt); err != nil {
+				return err
+			}
+		}
 		_, err := tx.Exec(`INSERT OR REPLACE INTO meta (key, value) VALUES ('schema', ?)`, strconv.Itoa(schemaVersion))
 		return err
 	})

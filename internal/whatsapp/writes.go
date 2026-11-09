@@ -166,7 +166,10 @@ func writeErr(err error) error {
 // Send keeps the message in the outbox under an ID made for it, returns the
 // ID at once, and sends it in the background: when connected, in the order
 // sends were made; while offline, once the connection is back within a
-// minute, else it fails with offline.
+// minute, else it fails with offline. A send repeated with the caller's key
+// (m.ClientID) of one kept as sending or sent gives that send's ID and sends
+// nothing more: the caller lost the first answer. One whose send failed is
+// done, so the key makes a new send.
 func (w *WhatsApp) Send(ctx context.Context, m network.Outgoing) (string, error) {
 	if err := w.writeGate(); err != nil && err != errOffline {
 		return "", err
@@ -177,6 +180,9 @@ func (w *WhatsApp) Send(ctx context.Context, m network.Outgoing) (string, error)
 	chat, _, err := w.writableChat(m.ChatID)
 	if err != nil {
 		return "", err
+	}
+	if id, held, err := w.sentFor(m.ClientID, chat); err != nil || held {
+		return id, err
 	}
 	req := sendRequest{Text: m.Text, ReplyTo: m.ReplyTo, Kind: "text"}
 	if m.File != "" {
@@ -200,12 +206,28 @@ func (w *WhatsApp) Send(ctx context.Context, m network.Outgoing) (string, error)
 	}
 	now := w.clock.Now()
 	id := cli.GenerateMessageID()
-	if err := w.st.PutOutgoing(Name, store.Outgoing{ID: id, ChatID: chat, Kind: outMessage,
+	if err := w.st.PutOutgoing(Name, store.Outgoing{ID: id, ChatID: chat, Kind: outMessage, Client: m.ClientID,
 		MadeMs: now.UnixMilli(), Request: body}); err != nil {
+		if raced, held, rerr := w.sentFor(m.ClientID, chat); rerr == nil && held {
+			return raced, nil // another call with this key kept it first, and sends it
+		}
 		return "", err
 	}
 	w.enqueue(sendJob{id: id, madeMs: now.UnixMilli(), deadline: now.Add(sendWait)})
 	return id, nil
+}
+
+// sentFor is the send already kept under the caller's key, when one is
+// sending or sent. A key naming a send to another chat is a bad request.
+func (w *WhatsApp) sentFor(client, chat string) (string, bool, error) {
+	o, ok, err := w.st.OutgoingClient(Name, client)
+	if err != nil || !ok || o.State == store.OutFailed {
+		return "", false, err
+	}
+	if o.ChatID != chat || o.Kind != outMessage {
+		return "", false, errBadRequest
+	}
+	return o.ID, true, nil
 }
 
 // fileKind is how a file goes: a JPEG or PNG photo or an MP4 video up to

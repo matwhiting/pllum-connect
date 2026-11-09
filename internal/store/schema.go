@@ -2,7 +2,7 @@ package store
 
 // schemaVersion is the version written to meta. An older store is brought up
 // to it; a store from a newer helper is refused rather than guessed at.
-const schemaVersion = 6 // 2 added beeper_ids; 3 messages.early; 4 messages.copied; 5 the outbox's write; 6 one row per transaction
+const schemaVersion = 7 // 2 added beeper_ids; 3 messages.early; 4 messages.copied; 5 the outbox's write; 6 one row per transaction; 7 the caller's send key
 
 // schema makes every table. Every key starts with network, so each network
 // keeps to its own rows. Chats and messages have an integer rid, stable for
@@ -132,7 +132,9 @@ var schema = []string{
 	// what to send (request, and message once the network has built it), so
 	// a send cut off by a crash is sent again under the same ID. kind is
 	// what is sent ('message' or 'reaction'); state is 'sending', 'sent' or
-	// 'failed', with the error kind in fail.
+	// 'failed', with the error kind in fail. client_id is the caller's own
+	// key for a send, so a send repeated after an answer was lost is the
+	// same send.
 	`CREATE TABLE IF NOT EXISTS outgoing (
 		network TEXT    NOT NULL,
 		msg_id  TEXT    NOT NULL,
@@ -144,6 +146,7 @@ var schema = []string{
 		fail    TEXT,
 		request BLOB,
 		message BLOB,
+		client_id TEXT,
 		PRIMARY KEY (network, msg_id)
 	)`,
 	// One outbox row per caller transaction, so two calls racing with the
@@ -204,6 +207,14 @@ var addedColumns = []struct{ table, column, definition string }{
 	{"outgoing", "fail", "TEXT"},                         // 5
 	{"outgoing", "request", "BLOB"},                      // 5
 	{"outgoing", "message", "BLOB"},                      // 5
+	{"outgoing", "client_id", "TEXT"},                    // 7
+}
+
+// lateSchema runs after addedColumns, on every open: what needs a column an
+// older store gains only there.
+var lateSchema = []string{
+	// One outbox row per caller's send key: a repeat finds the send it made.
+	`CREATE UNIQUE INDEX IF NOT EXISTS outgoing_client_once ON outgoing (network, client_id) WHERE client_id IS NOT NULL`,
 }
 
 // hasBody is the SQL test for a line holding text or media: media entries,
