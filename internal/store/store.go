@@ -118,6 +118,7 @@ type ChatInfo struct {
 	Phone           *string
 	Muted           *bool
 	ReadThroughMs   *int64 // his read marker: incoming lines after it are unread
+	ReadForwardOnly bool   // ReadThroughMs only moves the marker forward, never back
 	HistoryComplete *bool
 	LastActivityMs  int64
 	Participants    []Participant
@@ -782,14 +783,15 @@ func (s *Store) PutChat(network string, c ChatInfo) error {
 				title = CASE WHEN ? THEN NULLIF(?, '') ELSE title END,
 				phone = CASE WHEN ? THEN NULLIF(?, '') ELSE phone END,
 				muted = COALESCE(?, muted),
-				read_through_ms = COALESCE(?, read_through_ms),
+				read_through_ms = CASE WHEN ? THEN MAX(read_through_ms, COALESCE(?, read_through_ms))
+					ELSE COALESCE(?, read_through_ms) END,
 				history_complete = COALESCE(?, history_complete),
 				last_activity_ms = MAX(last_activity_ms, ?)
 			WHERE network = ? AND chat_id = ?`,
 			c.Kind,
 			c.Title != nil, deref(c.Title),
 			c.Phone != nil, deref(c.Phone),
-			c.Muted, c.ReadThroughMs, c.HistoryComplete,
+			c.Muted, c.ReadForwardOnly, c.ReadThroughMs, c.ReadThroughMs, c.HistoryComplete,
 			c.LastActivityMs,
 			network, chat)
 		if err != nil {

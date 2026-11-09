@@ -21,6 +21,7 @@ import (
 	"github.com/matwhiting/pllum-connect/internal/quiet"
 	"github.com/matwhiting/pllum-connect/internal/server"
 	"github.com/matwhiting/pllum-connect/internal/store"
+	"github.com/matwhiting/pllum-connect/internal/whatsapp"
 )
 
 const (
@@ -77,7 +78,7 @@ func run(args []string) int {
 			return store.Open(dir, key)
 		},
 		Networks: func(st *store.Store, dir string, key [32]byte, emit network.Emit) []network.Network {
-			return nil
+			return []network.Network{whatsapp.New(st, dir, key, emit.For(whatsapp.Name))}
 		},
 	}
 	if err := server.Serve(ctx, os.Stdin, os.Stdout, deps); err != nil {
