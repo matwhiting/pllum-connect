@@ -67,11 +67,16 @@ type Counts struct {
 	OldestMs      *int64 `json:"oldestMs"`
 }
 
+// lineKinds are the protocol's kinds of line.
+var lineKinds = map[string]bool{
+	"text": true, "photo": true, "video": true, "voiceNote": true, "sticker": true, "file": true, "notice": true,
+}
+
 func importMediaKind(m ImportMessage) string {
 	if len(m.Media) > 0 && m.Media[0].Kind != "" {
 		return m.Media[0].Kind
 	}
-	return m.Kind
+	return kindOr(m.Kind)
 }
 
 // Import carries one batch of Beeper's copy into the store, in one
@@ -89,6 +94,11 @@ func (s *Store) Import(network string, in ImportBatch) (ImportResult, error) {
 	}
 	if kind != "single" && kind != "group" {
 		return r, errBadRequest
+	}
+	for _, m := range in.Messages {
+		if !lineKinds[kindOr(m.Kind)] {
+			return r, errBadRequest
+		}
 	}
 	err := s.write(func(tx *sql.Tx) error {
 		r = ImportResult{}
@@ -120,7 +130,7 @@ func (s *Store) Import(network string, in ImportBatch) (ImportResult, error) {
 		}
 
 		for _, m := range in.Messages {
-			outcome, err := importLine(tx, network, target, m)
+			outcome, err := importLine(tx, network, target, in.BeeperChatID, m)
 			if err != nil {
 				return err
 			}
@@ -157,12 +167,13 @@ const (
 	added
 )
 
-func importLine(tx *sql.Tx, network, chat string, m ImportMessage) (outcome, error) {
+func importLine(tx *sql.Tx, network, chat, beeperChatID string, m ImportMessage) (outcome, error) {
 	if m.BeeperID == "" {
 		return skipped, nil
 	}
 	var one int
-	err := tx.QueryRow(`SELECT 1 FROM messages WHERE network = ? AND chat_id = ? AND beeper_id = ? LIMIT 1`,
+	err := tx.QueryRow(`SELECT 1 FROM beeper_ids AS b JOIN messages AS m ON m.rid = b.rid
+			WHERE m.network = ? AND m.chat_id = ? AND b.beeper_id = ? LIMIT 1`,
 		network, chat, m.BeeperID).Scan(&one)
 	if err == nil {
 		return skipped, nil // carried before
@@ -171,24 +182,28 @@ func importLine(tx *sql.Tx, network, chat string, m ImportMessage) (outcome, err
 		return skipped, err
 	}
 
-	rid, err := directLineFor(tx, network, chat, m)
+	rid, err := matchBeeperCopy(tx, network, chat, beeperCopy{
+		beeperChatID: beeperChatID, networkID: m.NetworkID, fromMe: m.FromMe,
+		timeMs: m.TimeMs, text: m.Text, mediaKind: importMediaKind(m),
+	})
 	if err != nil {
 		return skipped, err
 	}
 	if rid != 0 {
 		var lineID string
-		if err := tx.QueryRow(`UPDATE messages SET beeper_id = COALESCE(beeper_id, ?) WHERE rid = ? RETURNING msg_id`,
-			m.BeeperID, rid).Scan(&lineID); err != nil {
+		if err := tx.QueryRow(`UPDATE messages SET
+				beeper_id = COALESCE(beeper_id, ?),
+				network_id = CASE WHEN source = 'beeper' THEN COALESCE(network_id, NULLIF(?, '')) ELSE network_id END
+			WHERE rid = ? RETURNING msg_id`, m.BeeperID, m.NetworkID, rid).Scan(&lineID); err != nil {
+			return skipped, err
+		}
+		if err := carryBeeperID(tx, network, rid, m.BeeperID, beeperChatID); err != nil {
 			return skipped, err
 		}
 		// Beeper's reactions fill in; the network's own stay as they are.
 		return matched, addReactions(tx, network, chat, lineID, m.Reactions)
 	}
 
-	kind := m.Kind
-	if kind == "" {
-		kind = "text"
-	}
 	media := make([]Media, 0, len(m.Media))
 	for _, x := range m.Media {
 		media = append(media, Media{Kind: x.Kind, Width: x.Width, Height: x.Height})
@@ -203,18 +218,29 @@ func importLine(tx *sql.Tx, network, chat string, m ImportMessage) (outcome, err
 	}
 	var replyTo any
 	if m.ReplyToBeeperID != "" {
-		replyTo = beeperPrefix + m.ReplyToBeeperID // resolveReplies points it at the line
+		replyTo = beeperPrefix + m.ReplyToBeeperID // resolveReplies points it at its line
 	}
 	lineID := beeperPrefix + m.BeeperID
-	if _, err := tx.Exec(`INSERT INTO messages
+	if err := tx.QueryRow(`INSERT INTO messages
 			(network, chat_id, msg_id, sender_id, sender_name, from_me, ts_ms, text, kind,
 			 hidden, deleted, edited, reply_to, media_json, source, beeper_id, network_id)
-			VALUES (?, ?, ?, ?, NULLIF(?, ''), ?, ?, ?, ?, ?, ?, 0, ?, ?, 'beeper', ?, NULLIF(?, ''))`,
-		network, chat, lineID, m.SenderID, m.SenderName, m.FromMe, m.TimeMs, text, kind,
-		m.Hidden, m.Deleted, replyTo, mj, m.BeeperID, m.NetworkID); err != nil {
+			VALUES (?, ?, ?, ?, NULLIF(?, ''), ?, ?, ?, ?, ?, ?, 0, ?, ?, 'beeper', ?, NULLIF(?, ''))
+			RETURNING rid`,
+		network, chat, lineID, m.SenderID, m.SenderName, m.FromMe, m.TimeMs, text, kindOr(m.Kind),
+		m.Hidden, m.Deleted, replyTo, mj, m.BeeperID, m.NetworkID).Scan(&rid); err != nil {
+		return skipped, err
+	}
+	if err := carryBeeperID(tx, network, rid, m.BeeperID, beeperChatID); err != nil {
 		return skipped, err
 	}
 	return added, addReactions(tx, network, chat, lineID, m.Reactions)
+}
+
+// carryBeeperID records that line rid carries a Beeper message.
+func carryBeeperID(tx *sql.Tx, network string, rid int64, beeperID, beeperChatID string) error {
+	_, err := tx.Exec(`INSERT OR IGNORE INTO beeper_ids (rid, network, beeper_id, beeper_chat_id) VALUES (?, ?, ?, ?)`,
+		rid, network, beeperID, beeperChatID)
+	return err
 }
 
 // addReactions adds Beeper's reactions to a line, keeping any already held.
@@ -234,14 +260,11 @@ func addReactions(tx *sql.Tx, network, chat, lineID string, rs []Reaction) error
 // resolveReplies points every reply to beeper:<id> in a chat at the line now
 // carrying that Beeper message, wherever it arrived from.
 func resolveReplies(tx *sql.Tx, network, chat string) error {
-	_, err := tx.Exec(`UPDATE messages AS m SET reply_to = (
-			SELECT t.msg_id FROM messages AS t
-			WHERE t.network = m.network AND t.chat_id = m.chat_id AND t.beeper_id = substr(m.reply_to, 8)
-			ORDER BY t.rid LIMIT 1)
+	const carrier = `SELECT t.msg_id FROM beeper_ids AS b JOIN messages AS t ON t.rid = b.rid
+			WHERE t.network = m.network AND t.chat_id = m.chat_id AND b.beeper_id = substr(m.reply_to, 8)`
+	_, err := tx.Exec(`UPDATE messages AS m SET reply_to = (`+carrier+` ORDER BY t.rid LIMIT 1)
 		WHERE m.network = ? AND m.chat_id = ? AND m.reply_to LIKE 'beeper:%'
-		AND EXISTS (SELECT 1 FROM messages AS t
-			WHERE t.network = m.network AND t.chat_id = m.chat_id AND t.beeper_id = substr(m.reply_to, 8)
-			AND t.msg_id <> m.reply_to)`, network, chat)
+		AND EXISTS (`+carrier+` AND t.msg_id <> m.reply_to)`, network, chat)
 	return err
 }
 
@@ -270,14 +293,16 @@ func dropCarried(tx *sql.Tx, network, unplaced, placed string) error {
 	if err != nil {
 		return err
 	}
-	const carried = `SELECT beeper_id FROM messages WHERE network = ? AND chat_id = ? AND beeper_id IS NOT NULL`
-	if _, err := tx.Exec(`DELETE FROM reactions WHERE network = ? AND chat_id = ? AND msg_id IN (
-			SELECT msg_id FROM messages WHERE network = ? AND chat_id = ? AND beeper_id IN (`+carried+`))`,
-		network, unplaced, network, unplaced, network, placed); err != nil {
+	// The unplaced lines carrying a Beeper message the placed chat carries.
+	const carried = `SELECT b.rid FROM beeper_ids AS b JOIN messages AS m ON m.rid = b.rid
+		WHERE m.network = ?1 AND m.chat_id = ?2 AND b.beeper_id IN (
+			SELECT b2.beeper_id FROM beeper_ids AS b2 JOIN messages AS m2 ON m2.rid = b2.rid
+			WHERE m2.network = ?1 AND m2.chat_id = ?3)`
+	if _, err := tx.Exec(`DELETE FROM reactions WHERE network = ?1 AND chat_id = ?2 AND msg_id IN (
+			SELECT msg_id FROM messages WHERE rid IN (`+carried+`))`, network, unplaced, placed); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(`DELETE FROM messages WHERE network = ? AND chat_id = ? AND beeper_id IN (`+carried+`)`,
-		network, unplaced, network, placed); err != nil {
+	if _, err := tx.Exec(`DELETE FROM messages WHERE rid IN (`+carried+`)`, network, unplaced, placed); err != nil {
 		return err
 	}
 	var left int
@@ -343,9 +368,10 @@ func (s *Store) LineIDs(network string, beeperIDs []string) (map[string]string, 
 		for _, id := range chunk {
 			args = append(args, id)
 		}
-		rows, err := s.db.Query(`SELECT m.beeper_id, m.msg_id FROM messages AS m
+		rows, err := s.db.Query(`SELECT b.beeper_id, m.msg_id FROM beeper_ids AS b
+				JOIN messages AS m ON m.rid = b.rid
 				JOIN chats AS c ON c.network = m.network AND c.chat_id = m.chat_id
-				WHERE m.network = ? AND m.beeper_id IN (?`+strings.Repeat(", ?", len(chunk)-1)+`)
+				WHERE b.network = ? AND b.beeper_id IN (?`+strings.Repeat(", ?", len(chunk)-1)+`)
 				ORDER BY c.placed ASC, m.rid DESC`, args...)
 		if err != nil {
 			return nil, dbErr(err)

@@ -31,6 +31,9 @@ const (
 )
 
 func main() {
+	// Everything the helper makes is his alone: files 0600, folders 0700,
+	// including those SQLite makes later (0666 less the umask).
+	syscall.Umask(0o077)
 	quiet.Init()
 	os.Exit(run(os.Args[1:]))
 }

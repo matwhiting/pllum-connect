@@ -3,7 +3,10 @@ package store
 import (
 	"fmt"
 	"slices"
+	"strconv"
 	"testing"
+
+	"github.com/matwhiting/pllum-connect/internal/wire"
 )
 
 func TestChatsAreNewestFirstWithAStableCursor(t *testing.T) {
@@ -238,5 +241,118 @@ func TestAnAliasLandsInTheSameChat(t *testing.T) {
 	p, err := s.Chats(net, 0, "", 200)
 	if err != nil || len(p.Items) != 1 {
 		t.Fatalf("Chats = %d items, %v; want one", len(p.Items), err)
+	}
+}
+
+func TestAliasingAChatThatHoldsLinesMergesIt(t *testing.T) {
+	s := openTest(t)
+	// WhatsApp's sync made a chat under the LID...
+	name := "Alex Example"
+	if err := s.PutChat(net, ChatInfo{ID: lidChat, Title: &name,
+		Participants: []Participant{{ID: lidChat, Name: name}}}); err != nil {
+		t.Fatal(err)
+	}
+	put(t, s, text(lidChat, "3EB0Z0001", base+1000, "only under the lid"))
+	clash := text(lidChat, "3EB0Z0002", base+2000, "the same line, edited")
+	clash.Edited = true
+	put(t, s, clash)
+	put(t, s, text(lidChat, "3EB0Z0003", base+3000, "Dinner?"))
+	if err := s.SetReaction(net, lidChat, "3EB0Z0001", Reaction{Emoji: "👍", SenderID: lidChat}); err != nil {
+		t.Fatal(err)
+	}
+
+	// ...while the phone chat holds the clash, a Beeper line and its own line.
+	put(t, s, text(phoneChat, "3EB0Z0002", base+2000, "the same line"))
+	importOne(t, s, ImportBatch{BeeperChatID: "bc-1", ChatID: phoneChat, Chat: ImportChat{Kind: "single"},
+		Messages: []ImportMessage{beeperMsg("bm-dinner", base+3500, "<p>Dinner?</p>")}})
+	put(t, s, text(phoneChat, "3EB0Z0004", base+4000, "only under the number"))
+
+	// The number arrives for the LID: an alias, never a new chat.
+	if err := s.Alias(net, lidChat, phoneChat); err != nil {
+		t.Fatalf("Alias: %v", err)
+	}
+
+	p, err := s.Chats(net, 0, "", 200)
+	if err != nil || len(p.Items) != 1 || p.Items[0].ID != phoneChat {
+		t.Fatalf("Chats = %+v, %v; want the phone chat alone", p.Items, err)
+	}
+	got := all(t, s, phoneChat)
+	if g := ids(got); !slices.Equal(g, []string{"3EB0Z0001", "3EB0Z0002", "3EB0Z0003", "3EB0Z0004"}) {
+		t.Fatalf("the merged chat holds %v", g)
+	}
+	if len(got[0].Reactions) != 1 {
+		t.Errorf("the moved line's reactions = %+v", got[0].Reactions)
+	}
+	if !got[1].Edited {
+		t.Errorf("the clashing line lost its edit")
+	}
+	if lines := lineIDs(t, s, []string{"bm-dinner"}); lines["bm-dinner"] != "3EB0Z0003" {
+		t.Errorf("the Beeper line was not taken over: %v", lines)
+	}
+	c := chatOf(t, s, lidChat)
+	if c.ID != phoneChat || c.Title != name || len(c.Participants) != 1 || c.LastMessageID != "3EB0Z0004" {
+		t.Errorf("the merged chat is %+v", c)
+	}
+	if n, err := s.Counts(net); err != nil || n.Chats != 1 || n.Messages != 4 {
+		t.Errorf("Counts = %+v, %v", n, err)
+	}
+	// A line for the LID now lands in the phone chat.
+	put(t, s, text(lidChat, "3EB0Z0005", base+5000, "after"))
+	if got := len(all(t, s, phoneChat)); got != 5 {
+		t.Errorf("after a new LID line the chat holds %d lines", got)
+	}
+}
+
+func TestAnUpdateThatOmitsKindKeepsIt(t *testing.T) {
+	s := openTest(t)
+	photo := text(phoneChat, "3EB0K0001", base, "")
+	photo.Kind, photo.Media = "photo", []Media{{Kind: "photo", HasFile: true}}
+	put(t, s, photo)
+	notice := text(phoneChat, "3EB0K0002", base+1000, "settings changed")
+	notice.Kind, notice.Hidden = "notice", true
+	put(t, s, notice)
+
+	// A read receipt names only the line and when it was seen.
+	for _, id := range []string{"3EB0K0001", "3EB0K0002"} {
+		if _, err := s.PutMessage(net, Message{ID: id, ChatID: phoneChat, TimeMs: base, SeenMs: base + 9000}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got := all(t, s, phoneChat)
+	if got[0].Kind != "photo" || len(got[0].Media) != 1 || got[0].SeenMs != base+9000 {
+		t.Errorf("the photo became %+v", got[0])
+	}
+	if got[1].Kind != "notice" || !got[1].Hidden {
+		t.Errorf("the notice became %+v", got[1])
+	}
+}
+
+func TestAnOlderSchemaMigratesAndANewerIsOutdated(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(dir, testKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	put(t, s, text(phoneChat, "3EB0V0001", base, "kept"))
+	setSchema := func(v string) {
+		t.Helper()
+		if _, err := s.db.Exec(`UPDATE meta SET value = ? WHERE key = 'schema'`, v); err != nil {
+			t.Fatal(err)
+		}
+		s.Close()
+	}
+
+	setSchema("0")
+	if s, err = Open(dir, testKey); err != nil {
+		t.Fatalf("an older store did not open: %v", err)
+	}
+	var v string
+	if err := s.db.QueryRow(`SELECT value FROM meta WHERE key = 'schema'`).Scan(&v); err != nil || v != strconv.Itoa(schemaVersion) {
+		t.Fatalf("after migrating the schema is %q (%v)", v, err)
+	}
+
+	setSchema("99")
+	if _, err := Open(dir, testKey); wire.KindOf(err) != wire.Outdated {
+		t.Fatalf("a newer store gave %v, want outdated", err)
 	}
 }

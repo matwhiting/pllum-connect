@@ -4,6 +4,8 @@ import (
 	"maps"
 	"slices"
 	"testing"
+
+	"github.com/matwhiting/pllum-connect/internal/wire"
 )
 
 func TestAnImportMatchedByNetworkIDAddsNothing(t *testing.T) {
@@ -67,6 +69,30 @@ func TestMatchKey(t *testing.T) {
 	}
 	if MatchKey("hello") == MatchKey("hello there") {
 		t.Errorf("different texts share a key")
+	}
+
+	// A direct line's plain text against Beeper's text.
+	for _, tc := range []struct {
+		direct, beeper string
+		same           bool
+	}{
+		{"Alex <alex@example.com>", "Alex &lt;alex@example.com&gt;", true},
+		{"Alex <alex@example.com>", "<p>Alex &lt;alex@example.com&gt;</p>", true},
+		{"Alex <alex@example.com>", "Alex <alex@example.com>", true},
+		{"Alex <alex@example.com>", "Alex", false},
+		{"Tom & Jerry", "Tom &amp; Jerry", true},
+		{"see <b>this</b>", "<p>see &lt;b&gt;this&lt;/b&gt;</p>", true},
+		{"", "", true},
+	} {
+		if got := sameContent(tc.direct, "text", true, tc.beeper, "text", false); got != tc.same {
+			t.Errorf("sameContent(%q, %q) = %v, want %v", tc.direct, tc.beeper, got, tc.same)
+		}
+		if got := sameContent(tc.beeper, "text", false, tc.direct, "text", true); got != tc.same {
+			t.Errorf("sameContent the other way (%q, %q) = %v", tc.beeper, tc.direct, got)
+		}
+	}
+	if sameContent("", "photo", true, "", "video", false) {
+		t.Errorf("a photo matched a video")
 	}
 }
 
@@ -247,5 +273,116 @@ func TestBeeperChatsAndLineIDsMapBack(t *testing.T) {
 	want := map[string]string{"bm-matched": "3EB0B0001", "bm-only": "beeper:bm-only", "bm-lost": "beeper:bm-lost"}
 	if !maps.Equal(lines, want) {
 		t.Fatalf("LineIDs = %v, want %v", lines, want)
+	}
+}
+
+func TestAnAddressInAnglesStillMatches(t *testing.T) {
+	s := openTest(t)
+	// WhatsApp's text is plain; Beeper's is HTML with the brackets escaped.
+	put(t, s, mine(phoneChat, "3EB0E0001", base, "Write to Alex <alex@example.com>"))
+	in := beeperMsg("bm-addr", base+700, "Write to Alex &lt;alex@example.com&gt;")
+	in.FromMe = true
+	other := beeperMsg("bm-other", base+800, "Write to Sam")
+	other.FromMe = true
+	r := importOne(t, s, ImportBatch{BeeperChatID: "bc-1", ChatID: phoneChat, Chat: ImportChat{Kind: "single"},
+		Messages: []ImportMessage{in, other}})
+	if r != (ImportResult{Matched: 1, Added: 1}) {
+		t.Fatalf("import = %+v, want the address line matched", r)
+	}
+
+	// And the other way round: the import first, the direct line after.
+	later := beeperMsg("bm-addr2", base+60_000, "Ask &lt;sam@example.com&gt; too")
+	importOne(t, s, ImportBatch{BeeperChatID: "bc-1", ChatID: phoneChat, Chat: ImportChat{Kind: "single"},
+		Messages: []ImportMessage{later}})
+	direct := text(phoneChat, "3EB0E0002", base+60_400, "Ask <sam@example.com> too")
+	direct.SenderID = "beeper-sender"
+	if put(t, s, direct) {
+		t.Fatalf("the direct address line was added beside its import")
+	}
+	if got := ids(all(t, s, phoneChat)); !slices.Equal(got, []string{"3EB0E0001", "beeper:bm-other", "3EB0E0002"}) {
+		t.Fatalf("the chat holds %v", got)
+	}
+}
+
+func TestATakeOverTakesTheDirectSide(t *testing.T) {
+	s := openTest(t)
+	// Beeper got the side wrong; the network ID still ties the lines.
+	in := beeperMsg("bm-side", base, "on my way")
+	in.NetworkID = "3EB0G0001"
+	importOne(t, s, ImportBatch{BeeperChatID: "bc-1", ChatID: phoneChat, Chat: ImportChat{Kind: "single"},
+		Messages: []ImportMessage{in}})
+	if put(t, s, mine(phoneChat, "3EB0G0001", base+100, "on my way")) {
+		t.Fatalf("added beside its import")
+	}
+	got := all(t, s, phoneChat)
+	if len(got) != 1 || !got[0].FromMe {
+		t.Fatalf("the line is %+v, want his", got)
+	}
+	if c := chatOf(t, s, phoneChat); !c.LastFromMe || c.Unread != 0 {
+		t.Fatalf("the chat is %+v", c)
+	}
+}
+
+func TestTwoBeeperIDsForOneLineBothMap(t *testing.T) {
+	s := openTest(t)
+	put(t, s, text(phoneChat, "3EB0J0001", base, "held directly"))
+	// Beeper split one person into two chats; both place into one.
+	for _, b := range []struct{ chat, msg string }{{"bc-lid", "bm-1"}, {"bc-phone", "bm-2"}} {
+		m := beeperMsg(b.msg, base+60_000, "held directly")
+		m.NetworkID = "3EB0J0001"
+		if r := importOne(t, s, ImportBatch{BeeperChatID: b.chat, ChatID: phoneChat, Chat: ImportChat{Kind: "single"},
+			Messages: []ImportMessage{m}}); r != (ImportResult{Matched: 1}) {
+			t.Fatalf("import from %s = %+v", b.chat, r)
+		}
+	}
+	// A line only Beeper has, copied from both chats, shows once.
+	importOne(t, s, ImportBatch{BeeperChatID: "bc-lid", ChatID: phoneChat, Chat: ImportChat{Kind: "single"},
+		Messages: []ImportMessage{beeperMsg("bm-3", base+90_000, "only in beeper")}})
+	twice := ImportBatch{BeeperChatID: "bc-phone", ChatID: phoneChat, Chat: ImportChat{Kind: "single"},
+		Messages: []ImportMessage{beeperMsg("bm-4", base+90_500, "only in beeper")}}
+	if r := importOne(t, s, twice); r != (ImportResult{Matched: 1}) {
+		t.Fatalf("the second copy = %+v, want matched", r)
+	}
+	if r := importOne(t, s, twice); r != (ImportResult{Skipped: 1}) {
+		t.Fatalf("the second copy again = %+v, want skipped", r)
+	}
+	// Within one Beeper chat, two alike lines are two lines.
+	r := importOne(t, s, ImportBatch{BeeperChatID: "bc-lid", ChatID: phoneChat, Chat: ImportChat{Kind: "single"},
+		Messages: []ImportMessage{beeperMsg("bm-5", base+120_000, "ok"), beeperMsg("bm-6", base+120_500, "ok")}})
+	if r != (ImportResult{Added: 2}) {
+		t.Fatalf("two alike lines = %+v", r)
+	}
+
+	lines := lineIDs(t, s, []string{"bm-1", "bm-2", "bm-3", "bm-4"})
+	want := map[string]string{"bm-1": "3EB0J0001", "bm-2": "3EB0J0001", "bm-3": "beeper:bm-3", "bm-4": "beeper:bm-3"}
+	if !maps.Equal(lines, want) {
+		t.Fatalf("LineIDs = %v, want %v", lines, want)
+	}
+	if chats := beeperChats(t, s); chats["bc-lid"] != phoneChat || chats["bc-phone"] != phoneChat {
+		t.Fatalf("BeeperChats = %v", chats)
+	}
+	if got := len(all(t, s, phoneChat)); got != 4 {
+		t.Fatalf("the chat holds %d lines, want 4", got)
+	}
+}
+
+func TestAnImportWithAnUnknownKindIsRefused(t *testing.T) {
+	s := openTest(t)
+	bad := beeperMsg("bm-bad", base, "x")
+	bad.Kind = "hologram"
+	_, err := s.Import(net, ImportBatch{BeeperChatID: "bc-1", ChatID: phoneChat, Chat: ImportChat{Kind: "single"},
+		Messages: []ImportMessage{beeperMsg("bm-good", base, "fine"), bad}})
+	if wire.KindOf(err) != wire.BadRequest {
+		t.Fatalf("an unknown kind gave %v, want badRequest", err)
+	}
+	if _, ok, _ := s.Chat(net, phoneChat); ok {
+		t.Fatalf("a refused batch wrote a chat")
+	}
+	for _, k := range []string{"", "text", "photo", "video", "voiceNote", "sticker", "file", "notice"} {
+		m := beeperMsg("bm-"+k, base, "fine")
+		m.Kind = k
+		if _, err := s.Import(net, ImportBatch{BeeperChatID: "bc-2", Messages: []ImportMessage{m}}); err != nil {
+			t.Errorf("kind %q was refused: %v", k, err)
+		}
 	}
 }

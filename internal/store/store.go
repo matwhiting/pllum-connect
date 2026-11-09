@@ -12,9 +12,9 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 
 	"github.com/ncruces/go-sqlite3"
 	"github.com/ncruces/go-sqlite3/driver"
@@ -170,13 +170,10 @@ func (s *Store) Close() error {
 	return s.db.Close()
 }
 
-var umaskOnce sync.Once
-
-// privateFolder makes dir 0700 and, once per process, sets the umask so that
-// every file the helper makes (SQLite's write-ahead log and shared-memory
-// files among them, which the driver makes 0666 less the umask) is 0600.
+// privateFolder makes dir 0700. The helper's main sets the umask to 077
+// before anything runs, so a file the driver makes later (0666 less the
+// umask: a write-ahead log made again, say) is 0600 too.
 func privateFolder(dir string) error {
-	umaskOnce.Do(func() { syscall.Umask(0o077) })
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
@@ -261,23 +258,36 @@ func (s *Store) migrate() error {
 		if err := tx.QueryRow(`SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'meta'`).Scan(&hasMeta); err != nil {
 			return err
 		}
+		version := 0 // a new store
 		if hasMeta > 0 {
 			var v string
 			err := tx.QueryRow(`SELECT value FROM meta WHERE key = 'schema'`).Scan(&v)
 			switch {
-			case err == nil && v != schemaVersion:
-				// A newer helper's store: this helper is out of date.
-				return &wire.Error{Kind: wire.Outdated}
-			case err != nil && !errors.Is(err, sql.ErrNoRows):
+			case err == nil:
+				if version, err = strconv.Atoi(v); err != nil {
+					return errInternal
+				}
+			case !errors.Is(err, sql.ErrNoRows):
 				return err
 			}
+		}
+		if version > schemaVersion {
+			// A newer helper's store: this helper is out of date.
+			return &wire.Error{Kind: wire.Outdated}
 		}
 		for _, stmt := range schema {
 			if _, err := tx.Exec(stmt); err != nil {
 				return err
 			}
 		}
-		_, err := tx.Exec(`INSERT OR IGNORE INTO meta (key, value) VALUES ('schema', ?)`, schemaVersion)
+		if hasMeta > 0 && version < schemaVersion {
+			for _, stmt := range upgrades {
+				if _, err := tx.Exec(stmt); err != nil {
+					return err
+				}
+			}
+		}
+		_, err := tx.Exec(`INSERT OR REPLACE INTO meta (key, value) VALUES ('schema', ?)`, strconv.Itoa(schemaVersion))
 		return err
 	})
 }
@@ -354,7 +364,8 @@ func (s *Store) ChatFor(network, jid string) (chatID string, ok bool) {
 // Alias makes alias another name for chatID (itself resolved through its own
 // alias), so lines for either land in the one chat. A chat's ID never changes.
 func (s *Store) Alias(network, alias, chatID string) error {
-	if network == "" || alias == "" || chatID == "" {
+	if network == "" || alias == "" || chatID == "" ||
+		strings.HasPrefix(alias, unplacedPrefix) || strings.HasPrefix(chatID, unplacedPrefix) {
 		return errBadRequest
 	}
 	return s.write(func(tx *sql.Tx) error {
@@ -370,9 +381,231 @@ func (s *Store) Alias(network, alias, chatID string) error {
 			return err
 		}
 		// Aliases that led to alias now lead to its chat.
-		_, err = tx.Exec(`UPDATE aliases SET chat_id = ? WHERE network = ? AND chat_id = ?`, target, network, alias)
-		return err
+		if _, err := tx.Exec(`UPDATE aliases SET chat_id = ? WHERE network = ? AND chat_id = ?`,
+			target, network, alias); err != nil {
+			return err
+		}
+		var held int
+		if err := tx.QueryRow(`SELECT count(*) FROM chats WHERE network = ? AND chat_id = ?`,
+			network, alias).Scan(&held); err != nil {
+			return err
+		}
+		if held == 0 {
+			return nil
+		}
+		// The alias was a chat of its own: its lines join the target, or reads
+		// through the alias would never reach them.
+		return mergeChat(tx, network, alias, target)
 	})
+}
+
+// mergeChat moves every line, reaction, member and mapping of chat from into
+// chat into, folding in lines into already holds, and deletes from.
+func mergeChat(tx *sql.Tx, network, from, into string) error {
+	if _, err := tx.Exec(`INSERT OR IGNORE INTO chats
+			(network, chat_id, kind, title, phone, muted, placed, read_only, beeper_chat_id,
+			 history_complete, read_through_ms, last_activity_ms)
+			SELECT network, ?, kind, title, phone, muted, placed, read_only, beeper_chat_id,
+			 history_complete, read_through_ms, last_activity_ms
+			FROM chats WHERE network = ? AND chat_id = ?`, into, network, from); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`UPDATE chats AS t SET
+			title = COALESCE(t.title, f.title),
+			phone = COALESCE(t.phone, f.phone),
+			beeper_chat_id = COALESCE(t.beeper_chat_id, f.beeper_chat_id),
+			history_complete = MAX(t.history_complete, f.history_complete),
+			read_through_ms = MAX(t.read_through_ms, f.read_through_ms),
+			last_activity_ms = MAX(t.last_activity_ms, f.last_activity_ms)
+		FROM (SELECT * FROM chats WHERE network = ?1 AND chat_id = ?2) AS f
+		WHERE t.network = ?1 AND t.chat_id = ?3`, network, from, into); err != nil {
+		return err
+	}
+	if err := execAll(tx, []any{into, network, from},
+		`INSERT OR IGNORE INTO participants (network, chat_id, participant_id, name, phone, is_self, position)
+			SELECT network, ?, participant_id, name, phone, is_self, position FROM participants
+			WHERE network = ? AND chat_id = ?`,
+		`UPDATE beeper_chats SET chat_id = ? WHERE network = ? AND chat_id = ?`,
+		`UPDATE outgoing SET chat_id = ? WHERE network = ? AND chat_id = ?`,
+	); err != nil {
+		return err
+	}
+	if err := execAll(tx, []any{network, from}, `DELETE FROM participants WHERE network = ? AND chat_id = ?`); err != nil {
+		return err
+	}
+
+	rows, err := tx.Query(`SELECT rid FROM messages WHERE network = ? AND chat_id = ? ORDER BY rid`, network, from)
+	if err != nil {
+		return err
+	}
+	var rids []int64
+	for rows.Next() {
+		var rid int64
+		if err := rows.Scan(&rid); err != nil {
+			rows.Close()
+			return err
+		}
+		rids = append(rids, rid)
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return err
+	}
+	for _, rid := range rids {
+		if err := mergeLine(tx, network, from, into, rid); err != nil {
+			return err
+		}
+	}
+
+	// Reactions to lines neither chat holds yet go too.
+	if err := execAll(tx, []any{into, network, from},
+		`UPDATE OR IGNORE reactions SET chat_id = ? WHERE network = ? AND chat_id = ?`); err != nil {
+		return err
+	}
+	if err := execAll(tx, []any{network, from},
+		`DELETE FROM reactions WHERE network = ? AND chat_id = ?`,
+		`DELETE FROM chats WHERE network = ? AND chat_id = ?`,
+	); err != nil {
+		return err
+	}
+	if err := resolveReplies(tx, network, into); err != nil {
+		return err
+	}
+	return refresh(tx, network, into)
+}
+
+// execAll runs each statement with the same arguments.
+func execAll(tx *sql.Tx, args []any, stmts ...string) error {
+	for _, q := range stmts {
+		if _, err := tx.Exec(q, args...); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// mergeLine moves line rid of chat from into chat into. A line into already
+// holds under the same ID is folded in; a direct line takes over its Beeper
+// copy there; a Beeper line joins the line into holds for its message. Any
+// other line moves as it is.
+func mergeLine(tx *sql.Tx, network, from, into string, rid int64) error {
+	m, media, networkID, err := loadLine(tx, rid)
+	if err != nil {
+		return err
+	}
+	m.ChatID = into
+
+	var keep int64
+	err = tx.QueryRow(`SELECT rid FROM messages WHERE network = ? AND chat_id = ? AND msg_id = ?`,
+		network, into, m.ID).Scan(&keep)
+	switch {
+	case err == nil:
+		if m.Source != SourceBeeper {
+			if err := updateLine(tx, keep, m, media); err != nil {
+				return err
+			}
+		}
+		return foldLine(tx, network, from, into, rid, keep, m.ID)
+	case !errors.Is(err, sql.ErrNoRows):
+		return err
+	}
+
+	if m.Source != SourceBeeper {
+		brid, oldID, err := beeperLineFor(tx, network, m)
+		if err != nil {
+			return err
+		}
+		if brid != 0 {
+			if err := takeOver(tx, network, brid, oldID, m, media); err != nil {
+				return err
+			}
+			return foldLine(tx, network, from, into, rid, brid, m.ID)
+		}
+	} else {
+		var beeperChatID string
+		err := tx.QueryRow(`SELECT beeper_chat_id FROM beeper_ids WHERE rid = ? ORDER BY beeper_id LIMIT 1`, rid).Scan(&beeperChatID)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+		// The line into holds for one of its Beeper messages, else the line
+		// it is by network ID or content.
+		err = tx.QueryRow(`SELECT m.rid FROM beeper_ids AS b JOIN messages AS m ON m.rid = b.rid
+				WHERE m.network = ? AND m.chat_id = ? AND b.beeper_id IN (SELECT beeper_id FROM beeper_ids WHERE rid = ?)
+				ORDER BY m.rid LIMIT 1`, network, into, rid).Scan(&keep)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+		if keep == 0 {
+			if keep, err = matchBeeperCopy(tx, network, into, beeperCopy{
+				beeperChatID: beeperChatID, networkID: networkID, fromMe: m.FromMe,
+				timeMs: m.TimeMs, text: m.Text, mediaKind: mediaKindOf(m.Kind, m.Media),
+			}); err != nil {
+				return err
+			}
+		}
+		if keep != 0 {
+			return foldLine(tx, network, from, into, rid, keep, m.ID)
+		}
+	}
+
+	if _, err := tx.Exec(`UPDATE messages SET chat_id = ? WHERE rid = ?`, into, rid); err != nil {
+		return err
+	}
+	_, err = tx.Exec(`UPDATE OR IGNORE reactions SET chat_id = ? WHERE network = ? AND chat_id = ? AND msg_id = ?`,
+		into, network, from, m.ID)
+	return err
+}
+
+// foldLine folds line fromRid (ID fromID, in chat from) into line toRid of
+// chat into: its Beeper IDs, reactions and the replies to it go to toRid, and
+// it is deleted.
+func foldLine(tx *sql.Tx, network, from, into string, fromRid, toRid int64, fromID string) error {
+	var toID string
+	if err := tx.QueryRow(`SELECT msg_id FROM messages WHERE rid = ?`, toRid).Scan(&toID); err != nil {
+		return err
+	}
+	for _, q := range []struct {
+		sql  string
+		args []any
+	}{
+		{`UPDATE OR IGNORE beeper_ids SET rid = ? WHERE rid = ?`, []any{toRid, fromRid}},
+		{`UPDATE messages SET beeper_id = COALESCE(beeper_id, (SELECT beeper_id FROM messages WHERE rid = ?)) WHERE rid = ?`,
+			[]any{fromRid, toRid}},
+		{`UPDATE OR IGNORE reactions SET chat_id = ?, msg_id = ? WHERE network = ? AND chat_id = ? AND msg_id = ?`,
+			[]any{into, toID, network, from, fromID}},
+		{`DELETE FROM reactions WHERE network = ? AND chat_id = ? AND msg_id = ?`, []any{network, from, fromID}},
+		{`UPDATE messages SET reply_to = ? WHERE network = ? AND chat_id IN (?, ?) AND reply_to = ?`,
+			[]any{toID, network, from, into, fromID}},
+		{`DELETE FROM messages WHERE rid = ?`, []any{fromRid}},
+	} {
+		if _, err := tx.Exec(q.sql, q.args...); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// loadLine reads one stored line whole, with its media as stored and the
+// network ID a Beeper copy named.
+func loadLine(tx *sql.Tx, rid int64) (m Message, media any, networkID string, err error) {
+	var name, text, reply, mj, beeper, nid sql.NullString
+	var seen sql.NullInt64
+	err = tx.QueryRow(`SELECT chat_id, msg_id, sender_id, sender_name, from_me, ts_ms, text, kind,
+			hidden, deleted, edited, reply_to, media_json, raw, source, beeper_id, network_id, seen_ms
+			FROM messages WHERE rid = ?`, rid).Scan(&m.ChatID, &m.ID, &m.SenderID, &name, &m.FromMe, &m.TimeMs,
+		&text, &m.Kind, &m.Hidden, &m.Deleted, &m.Edited, &reply, &mj, &m.Raw, &m.Source, &beeper, &nid, &seen)
+	if err != nil {
+		return m, nil, "", err
+	}
+	m.SenderName, m.Text, m.ReplyTo, m.BeeperID, m.SeenMs = name.String, text.String, reply.String, beeper.String, seen.Int64
+	if mj.Valid {
+		media = mj.String
+		if err := json.Unmarshal([]byte(mj.String), &m.Media); err != nil {
+			return m, nil, "", err
+		}
+	}
+	return m, media, nid.String, nil
 }
 
 // PutChat writes what a network knows about a chat, making it if new.
@@ -438,8 +671,8 @@ func (s *Store) PutMessage(network string, m Message) (added bool, err error) {
 		strings.HasPrefix(m.ChatID, unplacedPrefix) || strings.HasPrefix(m.ID, beeperPrefix) {
 		return false, errBadRequest
 	}
-	if m.Kind == "" {
-		m.Kind = "text"
+	if m.Kind != "" && !lineKinds[m.Kind] {
+		return false, errBadRequest
 	}
 	if m.Source == "" {
 		m.Source = SourceLive
@@ -495,20 +728,21 @@ func insertLine(tx *sql.Tx, network string, m Message, media any) error {
 			(network, chat_id, msg_id, sender_id, sender_name, from_me, ts_ms, text, kind,
 			 hidden, deleted, edited, reply_to, media_json, raw, source, seen_ms)
 			VALUES (?, ?, ?, ?, NULLIF(?, ''), ?, ?, ?, ?, ?, ?, ?, NULLIF(?, ''), ?, ?, ?, NULLIF(?, 0))`,
-		network, m.ChatID, m.ID, m.SenderID, m.SenderName, m.FromMe, m.TimeMs, lineText(m), m.Kind,
+		network, m.ChatID, m.ID, m.SenderID, m.SenderName, m.FromMe, m.TimeMs, lineText(m), kindOr(m.Kind),
 		m.Hidden, m.Deleted, m.Edited, m.ReplyTo, media, nilIfEmpty(m.Raw), m.Source, m.SeenMs)
 	return err
 }
 
 // updateLine folds a later copy of a line into the one held. Nothing it
-// lacks erases what is there: text, media, raw, a reply and a name are kept
-// when the copy has none; deleted and edited stay set once set.
+// lacks erases what is there: a kind, text, media, raw, a reply and a name
+// are kept when the copy has none (a read receipt names only the line);
+// hidden, deleted and edited stay set once set.
 func updateLine(tx *sql.Tx, rid int64, m Message, media any) error {
 	_, err := tx.Exec(`UPDATE messages SET
 			text = CASE WHEN ? THEN NULL WHEN ? <> '' THEN ? ELSE text END,
-			kind = ?,
+			kind = COALESCE(NULLIF(?, ''), kind),
 			sender_name = COALESCE(NULLIF(?, ''), sender_name),
-			hidden = ?,
+			hidden = hidden OR ?,
 			deleted = deleted OR ?,
 			edited = edited OR ?,
 			reply_to = COALESCE(NULLIF(?, ''), reply_to),
@@ -530,17 +764,19 @@ func updateLine(tx *sql.Tx, rid int64, m Message, media any) error {
 	return err
 }
 
-// takeOver gives the Beeper line rid the direct line's ID and content. Its
-// Beeper ID stays, and its reactions and the replies to it follow the new ID.
+// takeOver gives the Beeper line rid the direct line's ID, side and content.
+// Its Beeper IDs stay, and its reactions and the replies to it follow the new
+// ID. The direct line is the truth: Beeper may have had the side wrong.
 func takeOver(tx *sql.Tx, network string, rid int64, oldID string, m Message, media any) error {
 	_, err := tx.Exec(`UPDATE messages SET
 			msg_id = ?,
 			source = ?,
+			from_me = ?,
 			sender_id = COALESCE(NULLIF(?, ''), sender_id),
 			sender_name = COALESCE(NULLIF(?, ''), sender_name),
 			ts_ms = ?,
 			text = CASE WHEN ? THEN NULL WHEN ? <> '' THEN ? ELSE text END,
-			kind = ?,
+			kind = COALESCE(NULLIF(?, ''), kind),
 			hidden = ?,
 			deleted = deleted OR ?,
 			edited = edited OR ?,
@@ -549,7 +785,7 @@ func takeOver(tx *sql.Tx, network string, rid int64, oldID string, m Message, me
 			raw = COALESCE(?, raw),
 			seen_ms = NULLIF(MAX(COALESCE(seen_ms, 0), ?), 0)
 		WHERE rid = ?`,
-		m.ID, m.Source, m.SenderID, m.SenderName, m.TimeMs,
+		m.ID, m.Source, m.FromMe, m.SenderID, m.SenderName, m.TimeMs,
 		m.Deleted, m.Text, m.Text,
 		m.Kind, m.Hidden, m.Deleted, m.Edited, m.ReplyTo, media, nilIfEmpty(m.Raw), m.SeenMs,
 		rid)

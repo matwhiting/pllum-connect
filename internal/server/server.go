@@ -78,7 +78,7 @@ type server struct {
 	ctx      context.Context
 	deps     Deps
 	out      *lineWriter
-	ready    bool // hello agreed; touched only by Serve's loop
+	ready    bool         // hello agreed; touched only by Serve's loop
 	store    *store.Store // set by hello, before any request can read it
 	networks map[string]network.Network
 	order    []network.Network

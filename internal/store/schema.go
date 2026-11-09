@@ -1,8 +1,8 @@
 package store
 
-// schemaVersion is the version written to meta. A store from a newer helper
-// is refused rather than guessed at.
-const schemaVersion = "1"
+// schemaVersion is the version written to meta. An older store is brought up
+// to it; a store from a newer helper is refused rather than guessed at.
+const schemaVersion = 1
 
 // schema makes every table. Every key starts with network, so each network
 // keeps to its own rows. Chats and messages have an integer rid, stable for
@@ -96,6 +96,19 @@ var schema = []string{
 	`CREATE INDEX IF NOT EXISTS messages_network_id ON messages (network, chat_id, network_id)`,
 	`CREATE INDEX IF NOT EXISTS messages_all_time ON messages (network, ts_ms)`,
 
+	// Every Beeper message a line carries, and the Beeper chat it came from.
+	// messages.beeper_id is the first of them; one line can carry several when
+	// Beeper held the same message twice. Keyed by rid, so a line keeps them
+	// through a takeover or a move to another chat.
+	`CREATE TABLE IF NOT EXISTS beeper_ids (
+		rid            INTEGER NOT NULL REFERENCES messages (rid) ON DELETE CASCADE,
+		network        TEXT    NOT NULL,
+		beeper_id      TEXT    NOT NULL,
+		beeper_chat_id TEXT    NOT NULL DEFAULT '',
+		PRIMARY KEY (rid, beeper_id)
+	)`,
+	`CREATE INDEX IF NOT EXISTS beeper_ids_id ON beeper_ids (network, beeper_id)`,
+
 	`CREATE TABLE IF NOT EXISTS reactions (
 		network   TEXT    NOT NULL,
 		chat_id   TEXT    NOT NULL,
@@ -142,6 +155,13 @@ var schema = []string{
 		INSERT INTO messages_fts (messages_fts, rowid, text) VALUES ('delete', old.rid, old.text);
 		INSERT INTO messages_fts (rowid, text) VALUES (new.rid, new.text);
 	END`,
+}
+
+// upgrades bring a store of an older version up to schemaVersion, after
+// schema has run. Each must be safe to run again.
+var upgrades = []string{
+	`INSERT OR IGNORE INTO beeper_ids (rid, network, beeper_id)
+		SELECT rid, network, beeper_id FROM messages WHERE beeper_id IS NOT NULL`,
 }
 
 // visible is the SQL test for a line that shows: not hidden, not deleted, and

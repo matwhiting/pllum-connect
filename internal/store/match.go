@@ -48,20 +48,51 @@ func MatchKey(text string) string {
 	return strings.Join(strings.Fields(s), " ")
 }
 
-// sameContent reports whether two copies carry the same content: equal match
-// keys, or both keys empty with the same media kind.
-func sameContent(textA, mediaKindA, textB, mediaKindB string) bool {
-	a, b := MatchKey(textA), MatchKey(textB)
-	if a != "" || b != "" {
-		return a == b
+// sameContent reports whether two copies carry the same content: the same
+// non-empty match key, or no text on either side and the same media kind.
+//
+// WhatsApp's own text is plain, so a direct line's text is read as escaped
+// text: "Alex <alex@example.com>" keeps its address, as Beeper's escaped HTML
+// does. Only when the Beeper text itself holds a tag (plain text that looks
+// like one, or real markup) is the direct text also read as it is, tags
+// stripped alike on both sides.
+func sameContent(textA, mediaKindA string, directA bool, textB, mediaKindB string, directB bool) bool {
+	if directB && !directA {
+		textA, mediaKindA, directA, textB, mediaKindB, directB = textB, mediaKindB, directB, textA, mediaKindA, directA
 	}
-	return mediaKindA == mediaKindB
+	var a []string // the first copy's keys, direct when either is
+	b := MatchKey(textB)
+	switch {
+	case directA && !directB:
+		a = []string{MatchKey(html.EscapeString(textA))}
+		if tagRE.MatchString(textB) {
+			a = append(a, MatchKey(textA))
+		}
+	default:
+		a = []string{MatchKey(textA)}
+	}
+	anyText := b != ""
+	for _, x := range a {
+		if x != "" && x == b {
+			return true
+		}
+		anyText = anyText || x != ""
+	}
+	return !anyText && mediaKindA == mediaKindB
 }
 
 // mediaKindOf is a line's first attachment's kind, else its own kind.
 func mediaKindOf(kind string, media []Media) string {
 	if len(media) > 0 && media[0].Kind != "" {
 		return media[0].Kind
+	}
+	return kindOr(kind)
+}
+
+// kindOr is a line's kind, text when it names none.
+func kindOr(kind string) string {
+	if kind == "" {
+		return "text"
 	}
 	return kind
 }
@@ -75,28 +106,25 @@ func storedMediaKind(kind string, mediaJSON sql.NullString) string {
 	return mediaKindOf(kind, media)
 }
 
-// candidate is a stored line that may be another copy of an incoming one.
-type candidate struct {
-	rid   int64
-	id    string
-	ts    int64
-	text  sql.NullString
-	kind  string
-	media sql.NullString
-}
+// candidateColumns are what nearestMatch reads of each stored line.
+const candidateColumns = `rid, msg_id, ts_ms, text, kind, media_json, source`
 
-// nearestMatch picks, from rows of (rid, msg_id, ts_ms, text, kind,
-// media_json), the line with the same content nearest in time to ts; ties go
-// to the earlier-stored line. rid is 0 when none matches.
-func nearestMatch(rows *sql.Rows, ts int64, text, mediaKind string) (rid int64, id string, err error) {
+// nearestMatch picks, from rows of candidateColumns, the line with the same
+// content as the incoming copy nearest in time to ts; ties go to the
+// earlier-stored line. rid is 0 when none matches.
+func nearestMatch(rows *sql.Rows, ts int64, text, mediaKind string, direct bool) (rid int64, id string, err error) {
 	defer rows.Close()
 	best := int64(-1)
 	for rows.Next() {
-		var c candidate
-		if err := rows.Scan(&c.rid, &c.id, &c.ts, &c.text, &c.kind, &c.media); err != nil {
+		var c struct {
+			rid, ts          int64
+			id, kind, source string
+			text, media      sql.NullString
+		}
+		if err := rows.Scan(&c.rid, &c.id, &c.ts, &c.text, &c.kind, &c.media, &c.source); err != nil {
 			return 0, "", err
 		}
-		if !sameContent(c.text.String, storedMediaKind(c.kind, c.media), text, mediaKind) {
+		if !sameContent(c.text.String, storedMediaKind(c.kind, c.media), c.source != SourceBeeper, text, mediaKind, direct) {
 			continue
 		}
 		d := c.ts - ts
@@ -123,24 +151,38 @@ func beeperLineFor(tx *sql.Tx, network string, m Message) (rid int64, oldID stri
 	if !errors.Is(err, sql.ErrNoRows) {
 		return 0, "", err
 	}
-	rows, err := tx.Query(`SELECT rid, msg_id, ts_ms, text, kind, media_json FROM messages
+	rows, err := tx.Query(`SELECT `+candidateColumns+` FROM messages
 			WHERE network = ? AND chat_id = ? AND source = 'beeper' AND from_me = ?
 			AND ts_ms BETWEEN ? AND ?`,
 		network, m.ChatID, m.FromMe, m.TimeMs-matchWindowMs, m.TimeMs+matchWindowMs)
 	if err != nil {
 		return 0, "", err
 	}
-	return nearestMatch(rows, m.TimeMs, m.Text, mediaKindOf(m.Kind, m.Media))
+	return nearestMatch(rows, m.TimeMs, m.Text, mediaKindOf(m.Kind, m.Media), true)
 }
 
-// directLineFor finds the line an imported Beeper message is: the line named
-// by its network ID, else a line not yet matched to any Beeper message, on
-// the same side, within the time window, with the same content. rid is 0 when
-// none.
-func directLineFor(tx *sql.Tx, network, chat string, m ImportMessage) (rid int64, err error) {
-	if m.NetworkID != "" {
-		err = tx.QueryRow(`SELECT rid FROM messages WHERE network = ? AND chat_id = ? AND msg_id = ?`,
-			network, chat, m.NetworkID).Scan(&rid)
+// beeperCopy is one Beeper message, as matchBeeperCopy compares it.
+type beeperCopy struct {
+	beeperChatID string // the Beeper chat it was copied from
+	networkID    string
+	fromMe       bool
+	timeMs       int64
+	text         string
+	mediaKind    string
+}
+
+// matchBeeperCopy finds the line a Beeper message is: the line its network ID
+// names (or a Beeper line naming the same network ID), else a line on the
+// same side, within the time window, with the same content, that no other
+// message of the same Beeper chat already holds. Within one Beeper chat two
+// alike messages are two lines; across Beeper chats (Beeper can split one
+// person into two) the same message is one line. rid is 0 when none.
+func matchBeeperCopy(tx *sql.Tx, network, chat string, c beeperCopy) (rid int64, err error) {
+	if c.networkID != "" {
+		err = tx.QueryRow(`SELECT rid FROM messages
+				WHERE network = ?1 AND chat_id = ?2 AND (msg_id = ?3 OR (source = 'beeper' AND network_id = ?3))
+				ORDER BY msg_id = ?3 DESC, rid LIMIT 1`,
+			network, chat, c.networkID).Scan(&rid)
 		if err == nil {
 			return rid, nil
 		}
@@ -148,13 +190,13 @@ func directLineFor(tx *sql.Tx, network, chat string, m ImportMessage) (rid int64
 			return 0, err
 		}
 	}
-	rows, err := tx.Query(`SELECT rid, msg_id, ts_ms, text, kind, media_json FROM messages
-			WHERE network = ? AND chat_id = ? AND beeper_id IS NULL AND from_me = ?
-			AND ts_ms BETWEEN ? AND ?`,
-		network, chat, m.FromMe, m.TimeMs-matchWindowMs, m.TimeMs+matchWindowMs)
+	rows, err := tx.Query(`SELECT `+candidateColumns+` FROM messages AS m
+			WHERE network = ? AND chat_id = ? AND from_me = ? AND ts_ms BETWEEN ? AND ?
+			AND NOT EXISTS (SELECT 1 FROM beeper_ids AS b WHERE b.rid = m.rid AND b.beeper_chat_id = ?)`,
+		network, chat, c.fromMe, c.timeMs-matchWindowMs, c.timeMs+matchWindowMs, c.beeperChatID)
 	if err != nil {
 		return 0, err
 	}
-	rid, _, err = nearestMatch(rows, m.TimeMs, m.Text, importMediaKind(m))
+	rid, _, err = nearestMatch(rows, c.timeMs, c.text, c.mediaKind, false)
 	return rid, err
 }

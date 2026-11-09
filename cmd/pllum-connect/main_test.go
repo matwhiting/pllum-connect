@@ -73,6 +73,27 @@ func TestASecondCopyOnTheSameFolderExitsLocked(t *testing.T) {
 	if perm := info.Mode().Perm(); perm != 0o700 {
 		t.Errorf("the data folder is %o, want 700", perm)
 	}
+	// hello opened the store: every file in the folder is his alone.
+	entries, err := os.ReadDir(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	files := 0
+	for _, e := range entries {
+		fi, err := e.Info()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !fi.IsDir() {
+			files++
+			if perm := fi.Mode().Perm(); perm != 0o600 {
+				t.Errorf("%s is %o, want 600", e.Name(), perm)
+			}
+		}
+	}
+	if files < 2 {
+		t.Errorf("the folder holds %d files, want the lock and the store", files)
+	}
 
 	second := exec.Command(bin, "--data", data)
 	var secondOut, secondErr bytes.Buffer
