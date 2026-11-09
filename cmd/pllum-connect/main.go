@@ -71,7 +71,7 @@ func run(args []string) int {
 	deps := server.Deps{
 		Dir: dir,
 		Open: func(key [32]byte) (*store.Store, error) {
-			return &store.Store{}, nil
+			return store.Open(dir, key)
 		},
 		Networks: func(st *store.Store, dir string, key [32]byte, emit network.Emit) []network.Network {
 			return nil

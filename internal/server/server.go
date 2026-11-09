@@ -79,6 +79,7 @@ type server struct {
 	deps     Deps
 	out      *lineWriter
 	ready    bool // hello agreed; touched only by Serve's loop
+	store    *store.Store // set by hello, before any request can read it
 	networks map[string]network.Network
 	order    []network.Network
 	inFlight sync.WaitGroup
@@ -131,6 +132,9 @@ func (s *server) handleLine(l line) (stop bool) {
 		return true
 	}
 	h, ok := methods[req.Method]
+	if !ok {
+		h, ok = s.readMethod(req.Method)
+	}
 	if !ok {
 		s.fail(req.ID, wire.UnknownMethod)
 		return false
@@ -252,6 +256,7 @@ func (s *server) open(key [32]byte) (nets []network.Network, err error) {
 	if err != nil {
 		return nil, err
 	}
+	s.store = st
 	if s.deps.Networks == nil {
 		return nil, nil
 	}
@@ -277,6 +282,9 @@ func (s *server) stop(cancel context.CancelFunc) {
 			stopNetwork(n)
 		}
 		s.inFlight.Wait()
+		if s.store != nil {
+			s.store.Close()
+		}
 		close(done)
 	}()
 	select {
@@ -644,4 +652,151 @@ func nullable(s string) any {
 		return nil
 	}
 	return s
+}
+
+// readMethod is the handler for a read or Beeper method: these are answered
+// from the store for every network, so the network itself is only named.
+func (s *server) readMethod(name string) (handler, bool) {
+	r, ok := reads[name]
+	if !ok {
+		return nil, false
+	}
+	return func(ctx context.Context, n network.Network, params json.RawMessage) (any, error) {
+		return r(s.store, n.Name(), params)
+	}, true
+}
+
+// readHandler answers one read or Beeper method from the store.
+type readHandler func(st *store.Store, network string, params json.RawMessage) (any, error)
+
+// reads are the methods answered from the store.
+var reads = map[string]readHandler{
+	"chats": func(st *store.Store, network string, params json.RawMessage) (any, error) {
+		var p struct {
+			SinceMs int64  `json:"sinceMs"`
+			Cursor  string `json:"cursor"`
+			Limit   int    `json:"limit"`
+		}
+		if err := decode(params, &p); err != nil {
+			return nil, err
+		}
+		page, err := st.Chats(network, p.SinceMs, p.Cursor, p.Limit)
+		if err != nil {
+			return nil, err
+		}
+		r := map[string]any{"items": page.Items}
+		if page.Cursor != "" {
+			r["cursor"] = page.Cursor
+		}
+		return r, nil
+	},
+	"chat": func(st *store.Store, network string, params json.RawMessage) (any, error) {
+		chatID, err := chatIDOf(params)
+		if err != nil {
+			return nil, err
+		}
+		c, ok, err := st.Chat(network, chatID)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			return map[string]any{"chat": nil}, nil
+		}
+		return map[string]any{"chat": c}, nil
+	},
+	"messages": func(st *store.Store, network string, params json.RawMessage) (any, error) {
+		var p struct {
+			ChatID string `json:"chatID"`
+			Before string `json:"before"`
+			Limit  int    `json:"limit"`
+		}
+		if err := decode(params, &p); err != nil {
+			return nil, err
+		}
+		if p.ChatID == "" {
+			return nil, badRequest
+		}
+		page, err := st.Messages(network, p.ChatID, p.Before, p.Limit)
+		if err != nil {
+			return nil, err
+		}
+		r := map[string]any{"items": page.Items, "hasMore": page.HasMore}
+		if page.OldestCursor != "" {
+			r["oldestCursor"] = page.OldestCursor
+		}
+		return r, nil
+	},
+	"search": func(st *store.Store, network string, params json.RawMessage) (any, error) {
+		var p struct {
+			Text     *string  `json:"text"`
+			ChatIDs  []string `json:"chatIDs"`
+			FromMe   *bool    `json:"fromMe"`
+			SenderID string   `json:"senderID"`
+			AfterMs  int64    `json:"afterMs"`
+			BeforeMs int64    `json:"beforeMs"`
+			Limit    int      `json:"limit"`
+			Cursor   string   `json:"cursor"`
+		}
+		if err := decode(params, &p); err != nil {
+			return nil, err
+		}
+		q := store.Query{ChatIDs: p.ChatIDs, FromMe: p.FromMe, SenderID: p.SenderID,
+			AfterMs: p.AfterMs, BeforeMs: p.BeforeMs, Limit: p.Limit, Cursor: p.Cursor}
+		if p.Text != nil {
+			q.Text = *p.Text
+		}
+		page, err := st.Search(network, q)
+		if err != nil {
+			return nil, err
+		}
+		r := map[string]any{"items": page.Items}
+		if page.Cursor != "" {
+			r["cursor"] = page.Cursor
+		}
+		return r, nil
+	},
+	"findChats": func(st *store.Store, network string, params json.RawMessage) (any, error) {
+		var p struct {
+			Query string `json:"query"`
+			Limit int    `json:"limit"`
+		}
+		if err := decode(params, &p); err != nil {
+			return nil, err
+		}
+		items, err := st.FindChats(network, p.Query, p.Limit)
+		if err != nil {
+			return nil, err
+		}
+		return map[string]any{"items": items}, nil
+	},
+	"import": func(st *store.Store, network string, params json.RawMessage) (any, error) {
+		var p store.ImportBatch
+		if err := decode(params, &p); err != nil {
+			return nil, err
+		}
+		return st.Import(network, p)
+	},
+	"beeperChats": func(st *store.Store, network string, _ json.RawMessage) (any, error) {
+		m, err := st.BeeperChats(network)
+		if err != nil {
+			return nil, err
+		}
+		return map[string]any{"map": m}, nil
+	},
+	"lineIDs": func(st *store.Store, network string, params json.RawMessage) (any, error) {
+		var p struct {
+			BeeperIDs []string `json:"beeperIDs"`
+		}
+		if err := decode(params, &p); err != nil {
+			return nil, err
+		}
+		m, err := st.LineIDs(network, p.BeeperIDs)
+		if err != nil {
+			return nil, err
+		}
+		return map[string]any{"map": m}, nil
+	},
+	"counts": func(st *store.Store, network string, _ json.RawMessage) (any, error) {
+		return st.Counts(network)
+	},
 }

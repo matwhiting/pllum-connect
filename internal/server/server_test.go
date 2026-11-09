@@ -137,6 +137,13 @@ type harness struct {
 
 func start(t *testing.T, fake *fakeNetwork) *harness {
 	t.Helper()
+	return startWith(t, fake, nil)
+}
+
+// startWith is start with the store open gives; a nil open gives an empty
+// store that holds nothing.
+func startWith(t *testing.T, fake *fakeNetwork, open func(dir string, key [32]byte) (*store.Store, error)) *harness {
+	t.Helper()
 	inR, inW := io.Pipe()
 	outR, outW := io.Pipe()
 	h := &harness{
@@ -146,10 +153,14 @@ func start(t *testing.T, fake *fakeNetwork) *harness {
 		done:   make(chan struct{}),
 		opened: make(chan [32]byte, 4),
 	}
+	dir := t.TempDir()
 	deps := Deps{
-		Dir: t.TempDir(),
+		Dir: dir,
 		Open: func(key [32]byte) (*store.Store, error) {
 			h.opened <- key
+			if open != nil {
+				return open(dir, key)
+			}
 			return &store.Store{}, nil
 		},
 		Networks: func(st *store.Store, dir string, key [32]byte, emit network.Emit) []network.Network {
