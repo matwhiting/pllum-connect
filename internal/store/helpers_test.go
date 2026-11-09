@@ -150,3 +150,5 @@ func beeperChats(t *testing.T, s *Store) map[string]string {
 	}
 	return m
 }
+
+func ptr[T any](v T) *T { return &v }

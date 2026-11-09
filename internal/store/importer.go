@@ -183,8 +183,9 @@ func importLine(tx *sql.Tx, network, chat, beeperChatID string, m ImportMessage)
 	}
 
 	rid, err := matchBeeperCopy(tx, network, chat, beeperCopy{
-		beeperChatID: beeperChatID, networkID: m.NetworkID, fromMe: m.FromMe,
+		beeperChatIDs: []string{beeperChatID}, networkID: m.NetworkID, fromMe: m.FromMe,
 		timeMs: m.TimeMs, text: m.Text, mediaKind: importMediaKind(m),
+		hasMedia: len(m.Media) > 0, deleted: m.Deleted,
 	})
 	if err != nil {
 		return skipped, err

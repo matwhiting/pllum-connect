@@ -158,7 +158,7 @@ func TestLastMessageIDSkipsHiddenDeletedAndEmpty(t *testing.T) {
 	photo.Media = []Media{{Kind: "photo", Width: 640, Height: 480, HasFile: true}}
 	put(t, s, photo)
 	notice := text(phoneChat, "3EB0L0003", base+3000, "disappearing messages on")
-	notice.Kind, notice.Hidden = "notice", true
+	notice.Kind, notice.Hidden = "notice", ptr(true)
 	put(t, s, notice)
 	gone := text(phoneChat, "3EB0L0004", base+4000, "")
 	gone.Deleted = true
@@ -196,7 +196,7 @@ func TestUnreadCountsIncomingAfterHisReadMarker(t *testing.T) {
 	}
 	put(t, s, mine(phoneChat, "3EB0U0100", base+5000, "mine"))
 	hidden := text(phoneChat, "3EB0U0101", base+6000, "notice")
-	hidden.Hidden = true
+	hidden.Hidden = ptr(true)
 	put(t, s, hidden)
 
 	if c := chatOf(t, s, phoneChat); c.Unread != 4 {
@@ -252,6 +252,10 @@ func TestAliasingAChatThatHoldsLinesMergesIt(t *testing.T) {
 		Participants: []Participant{{ID: lidChat, Name: name}}}); err != nil {
 		t.Fatal(err)
 	}
+	done := true
+	if err := s.PutChat(net, ChatInfo{ID: lidChat, HistoryComplete: &done}); err != nil {
+		t.Fatal(err)
+	}
 	put(t, s, text(lidChat, "3EB0Z0001", base+1000, "only under the lid"))
 	clash := text(lidChat, "3EB0Z0002", base+2000, "the same line, edited")
 	clash.Edited = true
@@ -293,6 +297,9 @@ func TestAliasingAChatThatHoldsLinesMergesIt(t *testing.T) {
 	if c.ID != phoneChat || c.Title != name || len(c.Participants) != 1 || c.LastMessageID != "3EB0Z0004" {
 		t.Errorf("the merged chat is %+v", c)
 	}
+	if c.HistoryComplete {
+		t.Errorf("the merged chat is complete though only one side was")
+	}
 	if n, err := s.Counts(net); err != nil || n.Chats != 1 || n.Messages != 4 {
 		t.Errorf("Counts = %+v, %v", n, err)
 	}
@@ -309,7 +316,7 @@ func TestAnUpdateThatOmitsKindKeepsIt(t *testing.T) {
 	photo.Kind, photo.Media = "photo", []Media{{Kind: "photo", HasFile: true}}
 	put(t, s, photo)
 	notice := text(phoneChat, "3EB0K0002", base+1000, "settings changed")
-	notice.Kind, notice.Hidden = "notice", true
+	notice.Kind, notice.Hidden = "notice", ptr(true)
 	put(t, s, notice)
 
 	// A read receipt names only the line and when it was seen.
@@ -322,7 +329,7 @@ func TestAnUpdateThatOmitsKindKeepsIt(t *testing.T) {
 	if got[0].Kind != "photo" || len(got[0].Media) != 1 || got[0].SeenMs != base+9000 {
 		t.Errorf("the photo became %+v", got[0])
 	}
-	if got[1].Kind != "notice" || !got[1].Hidden {
+	if got[1].Kind != "notice" || !*got[1].Hidden {
 		t.Errorf("the notice became %+v", got[1])
 	}
 }

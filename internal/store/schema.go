@@ -2,7 +2,7 @@ package store
 
 // schemaVersion is the version written to meta. An older store is brought up
 // to it; a store from a newer helper is refused rather than guessed at.
-const schemaVersion = 1
+const schemaVersion = 2 // 2 added beeper_ids
 
 // schema makes every table. Every key starts with network, so each network
 // keeps to its own rows. Chats and messages have an integer rid, stable for
@@ -160,8 +160,11 @@ var schema = []string{
 // upgrades bring a store of an older version up to schemaVersion, after
 // schema has run. Each must be safe to run again.
 var upgrades = []string{
-	`INSERT OR IGNORE INTO beeper_ids (rid, network, beeper_id)
-		SELECT rid, network, beeper_id FROM messages WHERE beeper_id IS NOT NULL`,
+	// 1 → 2: each line's Beeper ID, with its chat's (first) Beeper chat.
+	`INSERT OR IGNORE INTO beeper_ids (rid, network, beeper_id, beeper_chat_id)
+		SELECT m.rid, m.network, m.beeper_id, COALESCE(c.beeper_chat_id, '')
+		FROM messages AS m LEFT JOIN chats AS c ON c.network = m.network AND c.chat_id = m.chat_id
+		WHERE m.beeper_id IS NOT NULL`,
 }
 
 // visible is the SQL test for a line that shows: not hidden, not deleted, and

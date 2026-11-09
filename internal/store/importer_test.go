@@ -386,3 +386,155 @@ func TestAnImportWithAnUnknownKindIsRefused(t *testing.T) {
 		}
 	}
 }
+
+func TestAReceiptForABeeperOnlyLineOnlyMarksItSeen(t *testing.T) {
+	s := openTest(t)
+	in := beeperMsg("bm-r", base, "sent from my phone")
+	in.FromMe = true
+	in.NetworkID = "3EB0R0001"
+	importOne(t, s, ImportBatch{BeeperChatID: "bc-1", ChatID: phoneChat, Chat: ImportChat{Kind: "single"},
+		Messages: []ImportMessage{in}})
+
+	// A read receipt names the line by its WhatsApp ID and nothing else.
+	added, err := s.PutMessage(net, Message{ID: "3EB0R0001", ChatID: phoneChat, TimeMs: base + 50_000, SeenMs: base + 60_000})
+	if err != nil || added {
+		t.Fatalf("the receipt: added %v, %v", added, err)
+	}
+	got := all(t, s, phoneChat)
+	if len(got) != 1 || !got[0].FromMe || got[0].TimeMs != base || got[0].Text != "sent from my phone" ||
+		got[0].SeenMs != base+60_000 || *got[0].Hidden {
+		t.Fatalf("after the receipt the line is %+v", got[0])
+	}
+	if c := chatOf(t, s, phoneChat); !c.LastFromMe || c.Unread != 0 {
+		t.Fatalf("after the receipt the chat is %+v", c)
+	}
+
+	// A receipt for a line the store has never seen adds nothing.
+	added, err = s.PutMessage(net, Message{ID: "3EB0R0099", ChatID: phoneChat, SeenMs: base + 60_000})
+	if err != nil || added {
+		t.Fatalf("a receipt for an unknown line: added %v, %v", added, err)
+	}
+	if got := len(all(t, s, phoneChat)); got != 1 {
+		t.Fatalf("a receipt made a line: %d lines", got)
+	}
+	if c := chatOf(t, s, phoneChat); c.HistoryFromMs != base {
+		t.Fatalf("historyFromMs moved to %d", c.HistoryFromMs)
+	}
+
+	// The full line, when it comes, still takes the Beeper line over.
+	if put(t, s, mine(phoneChat, "3EB0R0001", base+300, "sent from my phone")) {
+		t.Fatalf("the direct line was added beside its import")
+	}
+	if got := all(t, s, phoneChat); len(got) != 1 || got[0].ID != "3EB0R0001" || got[0].SeenMs != base+60_000 {
+		t.Fatalf("after the direct line: %+v", got)
+	}
+}
+
+func TestAHiddenLineCanBeShownAgain(t *testing.T) {
+	s := openTest(t)
+	placeholder := text(phoneChat, "3EB0H0001", base, "")
+	placeholder.Hidden = ptr(true) // could not be decrypted yet
+	put(t, s, placeholder)
+	put(t, s, text(phoneChat, "3EB0H0000", base-1000, "before"))
+	if _, err := s.PutMessage(net, Message{ID: "3EB0H0001", ChatID: phoneChat, SeenMs: base + 1}); err != nil {
+		t.Fatal(err)
+	}
+	if got := all(t, s, phoneChat); !*got[1].Hidden {
+		t.Fatalf("an update that says nothing of hidden showed the line")
+	}
+	decrypted := text(phoneChat, "3EB0H0001", base, "now readable")
+	decrypted.Hidden = ptr(false)
+	put(t, s, decrypted)
+	got := all(t, s, phoneChat)
+	if *got[1].Hidden || got[1].Text != "now readable" {
+		t.Fatalf("the decrypted line is %+v", got[1])
+	}
+	if c := chatOf(t, s, phoneChat); c.LastMessageID != "3EB0H0001" {
+		t.Fatalf("lastMessageID = %q", c.LastMessageID)
+	}
+}
+
+func TestAStoreFromBeforeBeeperIDsGetsThem(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(dir, testKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	put(t, s, text(phoneChat, "3EB0O0001", base, "matched"))
+	importOne(t, s, ImportBatch{BeeperChatID: "bc-1", ChatID: phoneChat, Chat: ImportChat{Kind: "single"},
+		Messages: []ImportMessage{beeperMsg("bm-1", base+100, "matched"), beeperMsg("bm-2", base+9000, "copied")}})
+	// As a store made at schema 1 is once reopened: beeper_ids made, empty.
+	if _, err := s.db.Exec(`DELETE FROM beeper_ids`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(`UPDATE meta SET value = '1' WHERE key = 'schema'`); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+
+	s, err = Open(dir, testKey)
+	if err != nil {
+		t.Fatalf("reopening: %v", err)
+	}
+	defer s.Close()
+	want := map[string]string{"bm-1": "3EB0O0001", "bm-2": "beeper:bm-2"}
+	if got := lineIDs(t, s, []string{"bm-1", "bm-2"}); !maps.Equal(got, want) {
+		t.Fatalf("LineIDs after the upgrade = %v, want %v", got, want)
+	}
+}
+
+func TestAnAliasedBeeperLineKeepsEveryBeeperChatApart(t *testing.T) {
+	s := openTest(t)
+	// The phone chat: a direct "ok" holding a message of Beeper chat bc-b.
+	put(t, s, text(phoneChat, "3EB0X0001", base, "ok"))
+	importOne(t, s, ImportBatch{BeeperChatID: "bc-b", ChatID: phoneChat, Chat: ImportChat{Kind: "single"},
+		Messages: []ImportMessage{beeperMsg("bm-9", base+100, "ok")}})
+	// The LID chat: one Beeper line carrying a message of bc-a and another of bc-b.
+	importOne(t, s, ImportBatch{BeeperChatID: "bc-a", ChatID: lidChat, Chat: ImportChat{Kind: "single"},
+		Messages: []ImportMessage{beeperMsg("bm-1", base+500, "ok")}})
+	importOne(t, s, ImportBatch{BeeperChatID: "bc-b", ChatID: lidChat, Chat: ImportChat{Kind: "single"},
+		Messages: []ImportMessage{beeperMsg("bm-2", base+600, "ok")}})
+
+	if err := s.Alias(net, lidChat, phoneChat); err != nil {
+		t.Fatal(err)
+	}
+	// bm-2 and bm-9 are two messages of bc-b, so they stay two lines.
+	if got := ids(all(t, s, phoneChat)); !slices.Equal(got, []string{"3EB0X0001", "beeper:bm-1"}) {
+		t.Fatalf("the merged chat holds %v", got)
+	}
+	want := map[string]string{"bm-9": "3EB0X0001", "bm-1": "beeper:bm-1", "bm-2": "beeper:bm-1"}
+	if got := lineIDs(t, s, []string{"bm-1", "bm-2", "bm-9"}); !maps.Equal(got, want) {
+		t.Fatalf("LineIDs = %v, want %v", got, want)
+	}
+}
+
+func TestAnEmptyOrDeletedLineIsNeverMatchedByContent(t *testing.T) {
+	s := openTest(t)
+	gone := beeperMsg("bm-gone", base, "")
+	gone.Deleted = true
+	importOne(t, s, ImportBatch{BeeperChatID: "bc-1", ChatID: phoneChat, Chat: ImportChat{Kind: "single"},
+		Messages: []ImportMessage{gone}})
+	revoked := text(phoneChat, "3EB0Y0001", base+500, "")
+	revoked.Deleted = true
+	revoked.SenderID = "beeper-sender"
+	if !put(t, s, revoked) {
+		t.Fatalf("a deleted direct line took over a deleted Beeper line")
+	}
+	gone2 := beeperMsg("bm-gone2", base+600, "")
+	gone2.Deleted = true
+	if r := importOne(t, s, ImportBatch{BeeperChatID: "bc-2", ChatID: phoneChat, Chat: ImportChat{Kind: "single"},
+		Messages: []ImportMessage{gone2}}); r != (ImportResult{Added: 1}) {
+		t.Fatalf("a deleted import = %+v, want added", r)
+	}
+
+	// A photo with no caption still matches a photo with no caption.
+	photo := text(phoneChat, "3EB0Y0002", base+60_000, "")
+	photo.Kind, photo.Media = "photo", []Media{{Kind: "photo", HasFile: true}}
+	put(t, s, photo)
+	in := beeperMsg("bm-photo", base+60_400, "")
+	in.Kind, in.Media = "photo", []ImportMedia{{Kind: "photo"}}
+	if r := importOne(t, s, ImportBatch{BeeperChatID: "bc-1", ChatID: phoneChat, Chat: ImportChat{Kind: "single"},
+		Messages: []ImportMessage{in}}); r != (ImportResult{Matched: 1}) {
+		t.Fatalf("the captionless photo = %+v, want matched", r)
+	}
+}

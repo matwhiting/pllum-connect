@@ -15,7 +15,7 @@ func TestSearchFindsWordsAndHisOwnLinesWithNoWords(t *testing.T) {
 	photo.Kind, photo.Media = "photo", []Media{{Kind: "photo", HasFile: true}}
 	put(t, s, photo)
 	hidden := mine(otherChat, "3EB0S0006", base+6000, "pancake notice")
-	hidden.Hidden = true
+	hidden.Hidden = ptr(true)
 	put(t, s, hidden)
 
 	find := func(q Query) []string {

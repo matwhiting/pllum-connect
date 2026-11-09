@@ -191,12 +191,14 @@ func scanMessage(rows *sql.Rows) (Message, int64, error) {
 	var rid int64
 	var name, text, reply, media, beeper sql.NullString
 	var seen sql.NullInt64
+	var hidden bool
 	err := rows.Scan(&rid, &m.ChatID, &m.ID, &m.SenderID, &name, &m.FromMe, &m.TimeMs, &text, &m.Kind,
-		&m.Hidden, &m.Deleted, &m.Edited, &reply, &media, &seen, &m.Source, &beeper)
+		&hidden, &m.Deleted, &m.Edited, &reply, &media, &seen, &m.Source, &beeper)
 	if err != nil {
 		return m, 0, err
 	}
 	m.SenderName, m.Text, m.ReplyTo, m.SeenMs, m.BeeperID = name.String, text.String, reply.String, seen.Int64, beeper.String
+	m.Hidden = &hidden
 	if media.Valid {
 		if err := json.Unmarshal([]byte(media.String), &m.Media); err != nil {
 			return m, 0, err
@@ -375,7 +377,7 @@ func (m Message) MarshalJSON() ([]byte, error) {
 		"timeMs":     m.TimeMs,
 		"text":       nullable(m.Text),
 		"kind":       m.Kind,
-		"hidden":     m.Hidden,
+		"hidden":     m.Hidden != nil && *m.Hidden,
 		"deleted":    m.Deleted,
 		"edited":     m.Edited,
 		"replyTo":    nullable(m.ReplyTo),

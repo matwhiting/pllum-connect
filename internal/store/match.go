@@ -138,22 +138,37 @@ func nearestMatch(rows *sql.Rows, ts int64, text, mediaKind string, direct bool)
 	return rid, id, rows.Err()
 }
 
-// beeperLineFor finds the line held only in Beeper's copy that a direct line
-// m is: one whose network ID Beeper named as m's ID, else one on the same
-// side within the time window with the same content. rid is 0 when none.
-func beeperLineFor(tx *sql.Tx, network string, m Message) (rid int64, oldID string, err error) {
+// fuzzable is the SQL test for a stored line content may match: not deleted,
+// and holding text or media. An empty or deleted line says nothing about
+// which message it was, so only an ID can match it.
+const fuzzable = `deleted = 0 AND (COALESCE(text, '') <> '' OR media_json IS NOT NULL)`
+
+// beeperLineNaming finds the line held only in Beeper's copy whose network
+// ID Beeper named as m's ID. rid is 0 when none.
+func beeperLineNaming(tx *sql.Tx, network string, m Message) (rid int64, oldID string, err error) {
 	err = tx.QueryRow(`SELECT rid, msg_id FROM messages
 			WHERE network = ? AND chat_id = ? AND source = 'beeper' AND network_id = ?
 			ORDER BY rid LIMIT 1`, network, m.ChatID, m.ID).Scan(&rid, &oldID)
-	if err == nil {
-		return rid, oldID, nil
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, "", nil
 	}
-	if !errors.Is(err, sql.ErrNoRows) {
-		return 0, "", err
+	return rid, oldID, err
+}
+
+// beeperLineFor finds the line held only in Beeper's copy that a direct line
+// m is: the one naming m's ID (beeperLineNaming), else, when m has text or
+// media and is not deleted, one on the same side within the time window with
+// the same content. rid is 0 when none.
+func beeperLineFor(tx *sql.Tx, network string, m Message) (rid int64, oldID string, err error) {
+	if rid, oldID, err = beeperLineNaming(tx, network, m); err != nil || rid != 0 {
+		return rid, oldID, err
+	}
+	if m.Deleted || (m.Text == "" && len(m.Media) == 0) {
+		return 0, "", nil
 	}
 	rows, err := tx.Query(`SELECT `+candidateColumns+` FROM messages
 			WHERE network = ? AND chat_id = ? AND source = 'beeper' AND from_me = ?
-			AND ts_ms BETWEEN ? AND ?`,
+			AND ts_ms BETWEEN ? AND ? AND `+fuzzable,
 		network, m.ChatID, m.FromMe, m.TimeMs-matchWindowMs, m.TimeMs+matchWindowMs)
 	if err != nil {
 		return 0, "", err
@@ -163,18 +178,21 @@ func beeperLineFor(tx *sql.Tx, network string, m Message) (rid int64, oldID stri
 
 // beeperCopy is one Beeper message, as matchBeeperCopy compares it.
 type beeperCopy struct {
-	beeperChatID string // the Beeper chat it was copied from
-	networkID    string
-	fromMe       bool
-	timeMs       int64
-	text         string
-	mediaKind    string
+	beeperChatIDs []string // the Beeper chats it was copied from
+	networkID     string
+	fromMe        bool
+	timeMs        int64
+	text          string
+	mediaKind     string
+	hasMedia      bool
+	deleted       bool
 }
 
 // matchBeeperCopy finds the line a Beeper message is: the line its network ID
 // names (or a Beeper line naming the same network ID), else a line on the
 // same side, within the time window, with the same content, that no other
-// message of the same Beeper chat already holds. Within one Beeper chat two
+// message of the same Beeper chats already holds. Content never matches an
+// empty or deleted line, on either side. Within one Beeper chat two
 // alike messages are two lines; across Beeper chats (Beeper can split one
 // person into two) the same message is one line. rid is 0 when none.
 func matchBeeperCopy(tx *sql.Tx, network, chat string, c beeperCopy) (rid int64, err error) {
@@ -190,10 +208,21 @@ func matchBeeperCopy(tx *sql.Tx, network, chat string, c beeperCopy) (rid int64,
 			return 0, err
 		}
 	}
+	if c.deleted || (c.text == "" && !c.hasMedia) {
+		return 0, nil
+	}
+	args := []any{network, chat, c.fromMe, c.timeMs - matchWindowMs, c.timeMs + matchWindowMs}
+	exclude := "NULL" // no Beeper chat: nothing is excluded
+	if len(c.beeperChatIDs) > 0 {
+		exclude = "?" + strings.Repeat(", ?", len(c.beeperChatIDs)-1)
+		for _, id := range c.beeperChatIDs {
+			args = append(args, id)
+		}
+	}
 	rows, err := tx.Query(`SELECT `+candidateColumns+` FROM messages AS m
-			WHERE network = ? AND chat_id = ? AND from_me = ? AND ts_ms BETWEEN ? AND ?
-			AND NOT EXISTS (SELECT 1 FROM beeper_ids AS b WHERE b.rid = m.rid AND b.beeper_chat_id = ?)`,
-		network, chat, c.fromMe, c.timeMs-matchWindowMs, c.timeMs+matchWindowMs, c.beeperChatID)
+			WHERE network = ? AND chat_id = ? AND from_me = ? AND ts_ms BETWEEN ? AND ? AND `+fuzzable+`
+			AND NOT EXISTS (SELECT 1 FROM beeper_ids AS b WHERE b.rid = m.rid AND b.beeper_chat_id IN (`+exclude+`))`,
+		args...)
 	if err != nil {
 		return 0, err
 	}
