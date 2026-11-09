@@ -103,6 +103,9 @@ type Network interface {
 	Nudge()
 	Send(ctx context.Context, m Outgoing) (messageID string, err error)
 	SendState(messageID string) SendState
+	// SendFor is the message ID of the send kept under the caller's key,
+	// or "" when there is none.
+	SendFor(clientID string) string
 	React(ctx context.Context, chatID, messageID, emoji, transactionID string) error
 	MarkRead(ctx context.Context, chatID, through string) error
 	MarkUnread(ctx context.Context, chatID string) error

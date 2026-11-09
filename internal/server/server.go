@@ -544,15 +544,25 @@ var methods = map[string]handler{
 	"sendStatus": func(ctx context.Context, n network.Network, params json.RawMessage) (any, error) {
 		var p struct {
 			MessageID string `json:"messageID"`
+			ClientID  string `json:"clientID"`
 		}
 		if err := decode(params, &p); err != nil {
 			return nil, err
 		}
-		if p.MessageID == "" {
+		if (p.MessageID == "") == (p.ClientID == "") {
 			return nil, badRequest
 		}
-		st := n.SendState(p.MessageID)
-		r := map[string]any{"state": st.State}
+		r := map[string]any{}
+		id := p.MessageID
+		if p.ClientID != "" {
+			// asked by the caller's key: the send it names, when there is one
+			if id = n.SendFor(p.ClientID); id == "" {
+				return map[string]any{"state": network.SendUnknown}, nil
+			}
+			r["messageID"] = id
+		}
+		st := n.SendState(id)
+		r["state"] = st.State
 		if st.Kind != "" {
 			r["kind"] = wire.KindOf(&wire.Error{Kind: st.Kind})
 		}

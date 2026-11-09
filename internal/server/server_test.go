@@ -87,6 +87,13 @@ func (f *fakeNetwork) SendState(messageID string) network.SendState {
 	return network.SendState{State: network.SendFailed, Kind: wire.Refused}
 }
 
+func (f *fakeNetwork) SendFor(clientID string) string {
+	if clientID == "client-invented" {
+		return "made-id-1"
+	}
+	return ""
+}
+
 func (f *fakeNetwork) React(ctx context.Context, chatID, messageID, emoji, transactionID string) error {
 	if f.onReact != nil {
 		f.onReact(ctx)
@@ -561,6 +568,20 @@ func TestNetworkMethodsReachTheNetwork(t *testing.T) {
 	r = result(t, call("2", "sendStatus", `,"messageID":"made-id-1"`))
 	if r["state"] != "failed" || r["kind"] != "refused" {
 		t.Errorf("sendStatus = %v", r)
+	}
+	// asked by the caller's key: the send it names, with its ID; a key with none is unknown
+	r = result(t, call("2k", "sendStatus", `,"clientID":"client-invented"`))
+	if r["state"] != "failed" || r["kind"] != "refused" || r["messageID"] != "made-id-1" {
+		t.Errorf("sendStatus by key = %v", r)
+	}
+	r = result(t, call("2u", "sendStatus", `,"clientID":"client-other"`))
+	if r["state"] != "unknown" || r["messageID"] != nil {
+		t.Errorf("sendStatus by an unknown key = %v", r)
+	}
+	for _, params := range []string{``, `,"messageID":"made-id-1","clientID":"client-invented"`} {
+		if k := kindOf(t, call("2b", "sendStatus", params)); k != string(wire.BadRequest) {
+			t.Errorf("sendStatus with %q gave %v, want badRequest", params, k)
+		}
 	}
 
 	result(t, call("3", "react", `,"chatID":"chat-a","messageID":"line-b","emoji":"","transactionID":"txn-1"`))

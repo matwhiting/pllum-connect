@@ -1137,3 +1137,27 @@ func TestAClientIDWhoseSendFailedMakesANewSend(t *testing.T) {
 		t.Fatalf("%d sends, want 2", n)
 	}
 }
+
+func TestARepeatedClientIDIsAnsweredWhileTheConnectionIsDown(t *testing.T) {
+	r, c := withAlice(t)
+	release := make(chan struct{})
+	c.with(func() { c.sendBlock = release })
+	m := network.Outgoing{ChatID: aliceJID.String(), Text: "invented", ClientID: "client-invented-down"}
+	id := r.sendOK(m)
+	if got := r.w.SendFor("client-invented-down"); got != id {
+		t.Fatalf("SendFor = %q, want %q", got, id)
+	}
+	if got := r.w.SendFor("client-invented-none"); got != "" {
+		t.Fatalf("SendFor an unknown key = %q", got)
+	}
+	// unlinked mid-send: a new send is notConnected, but the repeat gets the send it made
+	c.dispatch(&events.LoggedOut{})
+	eventually(t, "the state to need a reconnect", func() bool { return r.w.Status().State == network.ReconnectNeeded })
+	if _, err := r.w.Send(context.Background(), network.Outgoing{ChatID: aliceJID.String(), Text: "invented"}); kindOf(err) != wire.NotConnected {
+		t.Fatalf("a new send while unlinked gave %v, want notConnected", err)
+	}
+	if again, err := r.w.Send(context.Background(), m); err != nil || again != id {
+		t.Fatalf("the repeat while unlinked gave %q, %v; want %q", again, err, id)
+	}
+	close(release)
+}

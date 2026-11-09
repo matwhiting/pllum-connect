@@ -171,6 +171,15 @@ func writeErr(err error) error {
 // nothing more: the caller lost the first answer. One whose send failed is
 // done, so the key makes a new send.
 func (w *WhatsApp) Send(ctx context.Context, m network.Outgoing) (string, error) {
+	// a repeat is answered before anything else, so one asked again while
+	// the connection is down still gets the send it made
+	if m.ClientID != "" {
+		if chat, ok := w.st.ChatFor(Name, m.ChatID); ok {
+			if id, held, err := w.sentFor(m.ClientID, chat); err != nil || held {
+				return id, err
+			}
+		}
+	}
 	if err := w.writeGate(); err != nil && err != errOffline {
 		return "", err
 	}
@@ -180,9 +189,6 @@ func (w *WhatsApp) Send(ctx context.Context, m network.Outgoing) (string, error)
 	chat, _, err := w.writableChat(m.ChatID)
 	if err != nil {
 		return "", err
-	}
-	if id, held, err := w.sentFor(m.ClientID, chat); err != nil || held {
-		return id, err
 	}
 	req := sendRequest{Text: m.Text, ReplyTo: m.ReplyTo, Kind: "text"}
 	if m.File != "" {
@@ -215,6 +221,16 @@ func (w *WhatsApp) Send(ctx context.Context, m network.Outgoing) (string, error)
 	}
 	w.enqueue(sendJob{id: id, madeMs: now.UnixMilli(), deadline: now.Add(sendWait)})
 	return id, nil
+}
+
+// SendFor is the message ID of the send kept under the caller's key (a
+// failed one included), or "" for none.
+func (w *WhatsApp) SendFor(clientID string) string {
+	o, ok, err := w.st.OutgoingClient(Name, clientID)
+	if err != nil || !ok {
+		return ""
+	}
+	return o.ID
 }
 
 // sentFor is the send already kept under the caller's key, when one is
