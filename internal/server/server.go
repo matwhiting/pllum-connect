@@ -82,6 +82,12 @@ type server struct {
 	networks map[string]network.Network
 	order    []network.Network
 	inFlight sync.WaitGroup
+
+	// Events wait in held until hello's answer is out, so none precedes it.
+	evMu    sync.Mutex
+	evOpen  bool
+	held    []map[string]any
+	evNames map[string]bool // the networks an event may name
 }
 
 // handleLine answers one line, and reports whether the helper should stop.
@@ -170,6 +176,9 @@ func (s *server) hello(id string, params json.RawMessage) {
 		s.fail(id, wire.BadRequest)
 		return
 	}
+	s.evMu.Lock()
+	s.held = nil // anything held by an earlier, failed hello
+	s.evMu.Unlock()
 	var p struct {
 		Protocol *int   `json:"protocol"`
 		StoreKey string `json:"storeKey"`
@@ -214,6 +223,7 @@ func (s *server) hello(id string, params json.RawMessage) {
 		"commit":   commit,
 		"networks": names,
 	})
+	s.releaseEvents(names)
 
 	// Started after hello's answer, so no event comes before it.
 	for _, n := range s.order {
@@ -282,6 +292,9 @@ func stopNetwork(n network.Network) {
 }
 
 func (s *server) answer(id string, result any) {
+	if result == nil {
+		result = wire.Empty
+	}
 	if !s.out.write(wire.Response{ID: id, Result: result}) {
 		s.fail(id, wire.Internal)
 	}
@@ -291,8 +304,40 @@ func (s *server) fail(id string, kind wire.Kind) {
 	s.out.write(wire.Response{ID: id, Error: &wire.ErrorBody{Kind: kind}})
 }
 
-// emit writes one event line; networks call it from any goroutine.
+// emit writes one event line; networks call it from any goroutine. Until
+// hello's answer is out it holds the event back. An event whose "network" is
+// not one of the helper's networks is dropped: networks emit through
+// network.Emit.For, which stamps their name.
 func (s *server) emit(event map[string]any) {
+	s.evMu.Lock()
+	defer s.evMu.Unlock()
+	if !s.evOpen {
+		s.held = append(s.held, event)
+		return
+	}
+	s.writeEvent(event)
+}
+
+// releaseEvents writes the held events, in order, and lets later ones through.
+func (s *server) releaseEvents(names []string) {
+	s.evMu.Lock()
+	defer s.evMu.Unlock()
+	s.evNames = map[string]bool{}
+	for _, n := range names {
+		s.evNames[n] = true
+	}
+	for _, ev := range s.held {
+		s.writeEvent(ev)
+	}
+	s.held = nil
+	s.evOpen = true
+}
+
+// writeEvent writes event if it names one of the networks; s.evMu is held.
+func (s *server) writeEvent(event map[string]any) {
+	if name, _ := event["network"].(string); !s.evNames[name] {
+		return
+	}
 	s.out.write(event)
 }
 

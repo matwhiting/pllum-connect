@@ -13,6 +13,21 @@ import (
 // It is safe to call from any goroutine.
 type Emit func(event map[string]any)
 
+// For is the emit to give the network called name: each event goes out with
+// "network" set to name, whatever the network put there. The server drops an
+// event whose "network" is not one of its networks, so every network is made
+// with its own emit.For(<its Name()>).
+func (e Emit) For(name string) Emit {
+	return func(event map[string]any) {
+		stamped := make(map[string]any, len(event)+1)
+		for k, v := range event {
+			stamped[k] = v
+		}
+		stamped["network"] = name
+		e(stamped)
+	}
+}
+
 // State is a network's connection state, as `status` and the `state` event
 // report it.
 type State string

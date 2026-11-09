@@ -24,7 +24,9 @@ const testKeyHex = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d
 type fakeNetwork struct {
 	mu      sync.Mutex
 	name    string
-	emit    network.Emit
+	emit    network.Emit // the emit stamped with its name, as main gives it
+	rawEmit network.Emit // the server's own emit, unstamped
+	onMade  func(emit network.Emit)
 	started bool
 	stopped bool
 	sent    network.Outgoing
@@ -154,7 +156,11 @@ func start(t *testing.T, fake *fakeNetwork) *harness {
 			if fake == nil {
 				return nil
 			}
-			fake.emit = emit
+			fake.rawEmit = emit
+			fake.emit = emit.For(fake.name)
+			if fake.onMade != nil {
+				fake.onMade(fake.emit)
+			}
 			return []network.Network{fake}
 		},
 	}
@@ -257,6 +263,12 @@ func TestHelloAgreesOnProtocolOne(t *testing.T) {
 		if key[i] != byte(i) {
 			t.Fatalf("the store was opened with the wrong key bytes")
 		}
+	}
+	// Start runs on the read loop after hello's answer is written, so an
+	// answer to a later request proves it has run.
+	h.send(`{"id":"after","method":"status","params":{"network":"whatsapp"}}`)
+	if m := h.next(); m["id"] != "after" {
+		t.Fatalf("got %v, want the status answer", m)
 	}
 	fake.mu.Lock()
 	started := fake.started
@@ -579,5 +591,59 @@ func TestNetworkMethodsReachTheNetwork(t *testing.T) {
 	fake.mu.Unlock()
 	if k := kindOf(t, call("20", "send", `,"chatID":"chat-a","text":"x"`)); k != string(wire.Internal) {
 		t.Errorf("an untyped error gave %s, want internal", k)
+	}
+}
+
+func TestAnEventCarriesItsNetworksName(t *testing.T) {
+	fake := &fakeNetwork{name: "whatsapp", onStart: func(emit network.Emit) {
+		emit(map[string]any{"event": "changed"})
+		emit(map[string]any{"event": "changed", "network": "carrierpigeon"})
+	}}
+	h := start(t, fake)
+	h.hello()
+	for i := 0; i < 2; i++ {
+		if m := h.next(); m["event"] != "changed" || m["network"] != "whatsapp" {
+			t.Fatalf("event %d = %v, want changed for whatsapp", i, m)
+		}
+	}
+}
+
+func TestAnEventNamingNoKnownNetworkIsDropped(t *testing.T) {
+	fake := &fakeNetwork{name: "whatsapp"}
+	h := start(t, fake)
+	h.hello()
+	fake.rawEmit(map[string]any{"event": "changed"})
+	fake.rawEmit(map[string]any{"event": "changed", "network": "carrierpigeon"})
+	h.send(`{"id":"s","method":"status","params":{"network":"whatsapp"}}`)
+	if m := h.next(); m["id"] != "s" {
+		t.Fatalf("got %v, want the status answer with no event before it", m)
+	}
+}
+
+func TestNoEventComesBeforeHellosAnswer(t *testing.T) {
+	fake := &fakeNetwork{name: "whatsapp", onMade: func(emit network.Emit) {
+		emit(map[string]any{"event": "state", "state": "connecting"})
+	}}
+	h := start(t, fake)
+	if m := h.hello(); m["id"] != "h" {
+		t.Fatalf("first line = %v, want hello's answer", m)
+	}
+	if m := h.next(); m["event"] != "state" || m["network"] != "whatsapp" || m["state"] != "connecting" {
+		t.Fatalf("the event held back during hello = %v", m)
+	}
+}
+
+func TestAHandlerWithNoResultAnswersEmpty(t *testing.T) {
+	methods["invented"] = func(context.Context, network.Network, json.RawMessage) (any, error) { return nil, nil }
+	t.Cleanup(func() { delete(methods, "invented") })
+	h := start(t, &fakeNetwork{name: "whatsapp"})
+	h.hello()
+	h.send(`{"id":"n","method":"invented","params":{"network":"whatsapp"}}`)
+	m := h.next()
+	if m["id"] != "n" {
+		t.Fatalf("got %v", m)
+	}
+	if r, ok := m["result"].(map[string]any); !ok || len(r) != 0 {
+		t.Fatalf("got %v, want an empty result", m)
 	}
 }
