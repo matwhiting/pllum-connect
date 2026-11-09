@@ -281,6 +281,11 @@ func (s *Store) migrate() error {
 			}
 		}
 		if hasMeta > 0 && version < schemaVersion {
+			for _, c := range addedColumns {
+				if err := addColumn(tx, c.table, c.column, c.definition); err != nil {
+					return err
+				}
+			}
 			for _, stmt := range upgrades {
 				if _, err := tx.Exec(stmt); err != nil {
 					return err
@@ -290,6 +295,19 @@ func (s *Store) migrate() error {
 		_, err := tx.Exec(`INSERT OR REPLACE INTO meta (key, value) VALUES ('schema', ?)`, strconv.Itoa(schemaVersion))
 		return err
 	})
+}
+
+// addColumn adds a column to a table that lacks it.
+func addColumn(tx *sql.Tx, table, column, definition string) error {
+	var n int
+	if err := tx.QueryRow(`SELECT count(*) FROM pragma_table_info(?) WHERE name = ?`, table, column).Scan(&n); err != nil {
+		return err
+	}
+	if n > 0 {
+		return nil
+	}
+	_, err := tx.Exec(`ALTER TABLE ` + table + ` ADD COLUMN ` + column + ` ` + definition)
+	return err
 }
 
 // write runs fn in one write transaction, one at a time.
@@ -495,6 +513,10 @@ func mergeLine(tx *sql.Tx, network, from, into string, rid int64) error {
 		return err
 	}
 	m.ChatID = into
+	fromEarly, err := rowEarly(tx, rid)
+	if err != nil {
+		return err
+	}
 
 	var keep int64
 	err = tx.QueryRow(`SELECT rid FROM messages WHERE network = ? AND chat_id = ? AND msg_id = ?`,
@@ -502,7 +524,13 @@ func mergeLine(tx *sql.Tx, network, from, into string, rid int64) error {
 	switch {
 	case err == nil:
 		if m.Source != SourceBeeper {
-			if err := updateLine(tx, keep, m, media); err != nil {
+			// A line that shows knows its time and side, so it makes an
+			// early row in into a line; an early row never moves them.
+			keepEarly, err := rowEarly(tx, keep)
+			if err != nil {
+				return err
+			}
+			if err := updateLine(tx, keep, m, media, !fromEarly && (keepEarly || isWhole(m))); err != nil {
 				return err
 			}
 		}
@@ -511,7 +539,20 @@ func mergeLine(tx *sql.Tx, network, from, into string, rid int64) error {
 		return err
 	}
 
-	if m.Source != SourceBeeper {
+	if m.Source != SourceBeeper && fromEarly {
+		// News about a line: it updates the Beeper line naming it, as
+		// PutMessage would, and otherwise moves across still early.
+		brid, _, err := beeperLineNaming(tx, network, m)
+		if err != nil {
+			return err
+		}
+		if brid != 0 {
+			if err := updateLine(tx, brid, m, media, false); err != nil {
+				return err
+			}
+			return foldLine(tx, network, from, into, rid, brid, m.ID)
+		}
+	} else if m.Source != SourceBeeper {
 		brid, oldID, err := beeperLineFor(tx, network, m)
 		if err != nil {
 			return err
@@ -545,6 +586,10 @@ func mergeLine(tx *sql.Tx, network, from, into string, rid int64) error {
 			}
 		}
 		if keep != 0 {
+			// An early row the Beeper line names becomes the line.
+			if err := fillEarly(tx, keep, m, media, networkID, m.ReplyTo); err != nil {
+				return err
+			}
 			return foldLine(tx, network, from, into, rid, keep, m.ID)
 		}
 	}
@@ -554,6 +599,43 @@ func mergeLine(tx *sql.Tx, network, from, into string, rid int64) error {
 	}
 	_, err = tx.Exec(`UPDATE OR IGNORE reactions SET chat_id = ? WHERE network = ? AND chat_id = ? AND msg_id = ?`,
 		into, network, from, m.ID)
+	return err
+}
+
+// rowEarly reports whether row rid is early: news about a line held before
+// the line itself.
+func rowEarly(tx *sql.Tx, rid int64) (bool, error) {
+	var early bool
+	err := tx.QueryRow(`SELECT early FROM messages WHERE rid = ?`, rid).Scan(&early)
+	return early, err
+}
+
+// fillEarly makes the early row rid the line Beeper's copy m is, when Beeper
+// names it: Beeper's time, side, sender, kind, media and text come in, and
+// the row shows. What the early row already knows stays: a revoke keeps it
+// deleted with no text, and an edit keeps its text. A placeholder's hidden
+// gives way to Beeper's, so readable text shows. The row is Beeper's
+// (copied history, never unread) until the line itself lands in it. A row
+// that is not early is left as it is.
+func fillEarly(tx *sql.Tx, rid int64, m Message, media any, networkID, replyTo string) error {
+	_, err := tx.Exec(`UPDATE messages SET
+			early = 0,
+			source = 'beeper',
+			ts_ms = CASE WHEN ?1 > 0 THEN ?1 ELSE ts_ms END,
+			from_me = ?2,
+			sender_id = COALESCE(NULLIF(?3, ''), sender_id),
+			sender_name = COALESCE(sender_name, NULLIF(?4, '')),
+			kind = COALESCE(NULLIF(?5, ''), kind),
+			text = CASE WHEN deleted OR ?6 THEN NULL WHEN edited AND COALESCE(text, '') <> '' THEN text
+				ELSE NULLIF(?7, '') END,
+			hidden = ?8,
+			deleted = deleted OR ?6,
+			reply_to = COALESCE(reply_to, NULLIF(?9, '')),
+			media_json = COALESCE(media_json, ?10),
+			network_id = COALESCE(network_id, NULLIF(?11, ''))
+		WHERE rid = ?12 AND early = 1`,
+		m.TimeMs, m.FromMe, m.SenderID, m.SenderName, m.Kind, m.Deleted, m.Text,
+		m.Hidden != nil && *m.Hidden, replyTo, media, networkID, rid)
 	return err
 }
 
@@ -694,6 +776,11 @@ func (s *Store) PutMessage(network string, m Message) (added bool, err error) {
 	if m.Kind != "" && !lineKinds[m.Kind] {
 		return false, errBadRequest
 	}
+	for _, x := range m.Media {
+		if !mediaKinds[x.Kind] {
+			return false, errBadRequest
+		}
+	}
 	if m.Source == "" {
 		m.Source = SourceLive
 	}
@@ -719,7 +806,10 @@ func (s *Store) PutMessage(network string, m Message) (added bool, err error) {
 			network, chat, m.ID).Scan(&rid)
 		switch {
 		case err == nil:
-			err = updateLine(tx, rid, m, media)
+			if err = updateLine(tx, rid, m, media, isWhole(m)); err == nil && (isWhole(m) || m.Edited) {
+				// The line's text may now be Beeper's copy's.
+				err = absorbBeeperCopy(tx, network, rid)
+			}
 		case errors.Is(err, sql.ErrNoRows):
 			added, err = putNewID(tx, network, m, media)
 		}
@@ -740,10 +830,11 @@ func hasContent(m Message) bool {
 }
 
 // isWhole reports whether m is a line as first sent, not news about one: it
-// has content and is neither an edit nor a revoke. Only a whole line knows
-// its own time and side, and only a whole line takes over a Beeper line.
+// has content and a time, and is neither an edit nor a revoke. Only a whole
+// line knows its own time and side, only a whole line takes over a Beeper
+// line, and only a whole line makes an early row a line that shows.
 func isWhole(m Message) bool {
-	return hasContent(m) && !m.Edited && !m.Deleted
+	return hasContent(m) && m.TimeMs > 0 && !m.Edited && !m.Deleted
 }
 
 // isReceipt reports whether m only says the line was seen.
@@ -758,8 +849,10 @@ func isReceipt(m Message) bool {
 //     is added.
 //   - Else a receipt is dropped: there is nothing to mark.
 //   - Else (an edit, a revoke, a hidden placeholder) the line is kept as it
-//     is known so far, under its ID, so the line itself, arriving later under
-//     the same ID, is folded into it and stays edited, deleted or hidden.
+//     is known so far, under its ID, as an early row: it never shows, counts
+//     or moves the chat, and the line itself, arriving later under the same
+//     ID (or Beeper's copy naming it), lands in it and stays edited, deleted
+//     or hidden.
 func putNewID(tx *sql.Tx, network string, m Message, media any) (added bool, err error) {
 	rid, oldID, err := beeperLineNaming(tx, network, m)
 	if err != nil {
@@ -769,7 +862,7 @@ func putNewID(tx *sql.Tx, network string, m Message, media any) (added bool, err
 	case rid != 0 && isWhole(m):
 		return false, takeOver(tx, network, rid, oldID, m, media)
 	case rid != 0:
-		return false, updateLine(tx, rid, m, media)
+		return false, updateLine(tx, rid, m, media, false)
 	case isWhole(m):
 		if rid, oldID, err = beeperLineLike(tx, network, m); err != nil {
 			return false, err
@@ -786,13 +879,15 @@ func putNewID(tx *sql.Tx, network string, m Message, media any) (added bool, err
 	return true, nil
 }
 
+// insertLine adds m as a new row: a line when it is whole, else an early row.
 func insertLine(tx *sql.Tx, network string, m Message, media any) error {
 	_, err := tx.Exec(`INSERT INTO messages
 			(network, chat_id, msg_id, sender_id, sender_name, from_me, ts_ms, text, kind,
-			 hidden, deleted, edited, reply_to, media_json, raw, source, seen_ms)
-			VALUES (?, ?, ?, ?, NULLIF(?, ''), ?, ?, ?, ?, ?, ?, ?, NULLIF(?, ''), ?, ?, ?, NULLIF(?, 0))`,
+			 hidden, deleted, edited, reply_to, media_json, raw, source, seen_ms, early)
+			VALUES (?, ?, ?, ?, NULLIF(?, ''), ?, ?, ?, ?, ?, ?, ?, NULLIF(?, ''), ?, ?, ?, NULLIF(?, 0), ?)`,
 		network, m.ChatID, m.ID, m.SenderID, m.SenderName, m.FromMe, m.TimeMs, lineText(m), kindOr(m.Kind),
-		m.Hidden != nil && *m.Hidden, m.Deleted, m.Edited, m.ReplyTo, media, nilIfEmpty(m.Raw), m.Source, m.SeenMs)
+		m.Hidden != nil && *m.Hidden, m.Deleted, m.Edited, m.ReplyTo, media, nilIfEmpty(m.Raw), m.Source, m.SeenMs,
+		!isWhole(m))
 	return err
 }
 
@@ -801,40 +896,80 @@ func insertLine(tx *sql.Tx, network string, m Message, media any) error {
 // are kept when the copy has none (a read receipt names only the line), and
 // hidden when it is not given; deleted and edited stay set once set. A
 // deleted line holds no text, and an edited line's text gives way only to a
-// later edit. A whole copy (isWhole) sets the line's time and side; nothing
-// else moves them.
-func updateLine(tx *sql.Tx, rid int64, m Message, media any) error {
-	whole := isWhole(m)
+// later edit. A copy that is not whole never hides a line that has a body
+// (a placeholder arriving after its readable line, or for a Beeper line).
+//
+// whole says the copy knows the line's own time and side (isWhole, for a
+// network's update): only then do time, side, sender and source move, and an
+// early row becomes a line that shows.
+func updateLine(tx *sql.Tx, rid int64, m Message, media any, whole bool) error {
 	_, err := tx.Exec(`UPDATE messages SET
-			ts_ms = CASE WHEN ? AND ? > 0 THEN ? ELSE ts_ms END,
-			from_me = CASE WHEN ? THEN ? ELSE from_me END,
-			sender_id = CASE WHEN ? AND ? <> '' THEN ? ELSE sender_id END,
-			text = CASE WHEN ? OR deleted THEN NULL WHEN ? <> '' AND (? OR edited = 0) THEN ? ELSE text END,
-			kind = COALESCE(NULLIF(?, ''), kind),
-			sender_name = COALESCE(NULLIF(?, ''), sender_name),
-			hidden = COALESCE(?, hidden),
-			deleted = deleted OR ?,
-			edited = edited OR ?,
-			reply_to = COALESCE(NULLIF(?, ''), reply_to),
-			media_json = COALESCE(?, media_json),
-			raw = COALESCE(?, raw),
-			seen_ms = NULLIF(MAX(COALESCE(seen_ms, 0), ?), 0)
-		WHERE rid = ?`,
-		whole, m.TimeMs, m.TimeMs,
-		whole, m.FromMe,
-		whole, m.SenderID, m.SenderID,
-		m.Deleted, m.Text, m.Edited, m.Text,
+			ts_ms = CASE WHEN ?1 AND ?2 > 0 THEN ?2 ELSE ts_ms END,
+			from_me = CASE WHEN ?1 THEN ?3 ELSE from_me END,
+			sender_id = CASE WHEN ?1 AND ?4 <> '' THEN ?4 ELSE sender_id END,
+			source = CASE WHEN ?1 THEN ?5 ELSE source END,
+			early = CASE WHEN ?1 THEN 0 ELSE early END,
+			text = CASE WHEN ?6 OR deleted THEN NULL WHEN ?7 <> '' AND (?8 OR edited = 0) THEN ?7 ELSE text END,
+			kind = COALESCE(NULLIF(?9, ''), kind),
+			sender_name = COALESCE(NULLIF(?10, ''), sender_name),
+			hidden = CASE WHEN ?11 IS NULL THEN hidden WHEN ?11 = 0 THEN 0
+				WHEN ?1 THEN 1 WHEN `+hasBody+` THEN hidden ELSE 1 END,
+			deleted = deleted OR ?6,
+			edited = edited OR ?8,
+			reply_to = COALESCE(NULLIF(?12, ''), reply_to),
+			media_json = COALESCE(?13, media_json),
+			raw = COALESCE(?14, raw),
+			seen_ms = NULLIF(MAX(COALESCE(seen_ms, 0), ?15), 0)
+		WHERE rid = ?16`,
+		whole, m.TimeMs, m.FromMe, m.SenderID, m.Source,
+		m.Deleted, m.Text, m.Edited,
 		m.Kind,
 		m.SenderName,
 		m.Hidden,
-		m.Deleted,
-		m.Edited,
 		m.ReplyTo,
 		media,
 		nilIfEmpty(m.Raw),
 		m.SeenMs,
 		rid)
 	return err
+}
+
+// absorbBeeperCopy folds into the direct line rid a line held only in
+// Beeper's copy that is the same message by side, time and content, when
+// the direct line has just become matchable (its original landed in an
+// early row, or an edit made its text Beeper's). A Beeper line from a Beeper
+// chat the line already carries a message of is a different message.
+func absorbBeeperCopy(tx *sql.Tx, network string, rid int64) error {
+	m, _, _, err := loadLine(tx, rid)
+	if err != nil {
+		return err
+	}
+	early, err := rowEarly(tx, rid)
+	if err != nil {
+		return err
+	}
+	kind := mediaKindOf(m.Kind, m.Media)
+	if early || m.Source == SourceBeeper || !matchable(m.Text, kind, m.Deleted) {
+		return nil
+	}
+	rows, err := tx.Query(`SELECT `+candidateColumns+` FROM messages AS m
+			WHERE network = ? AND chat_id = ? AND source = 'beeper' AND from_me = ? AND rid <> ?
+			AND ts_ms BETWEEN ? AND ? AND `+fuzzable+`
+			AND NOT EXISTS (SELECT 1 FROM beeper_ids AS b WHERE b.rid = m.rid AND b.beeper_chat_id IN (
+				SELECT beeper_chat_id FROM beeper_ids WHERE rid = ?))`,
+		network, m.ChatID, m.FromMe, rid, m.TimeMs-matchWindowMs, m.TimeMs+matchWindowMs, rid)
+	if err != nil {
+		return err
+	}
+	brid, oldID, err := nearestMatch(rows, m.TimeMs, m.Text, kind, true)
+	if err != nil || brid == 0 {
+		return err
+	}
+	if _, err := tx.Exec(`UPDATE messages SET seen_ms = NULLIF(MAX(COALESCE(seen_ms, 0),
+			COALESCE((SELECT seen_ms FROM messages WHERE rid = ?), 0)), 0) WHERE rid = ?`, brid, rid); err != nil {
+		return err
+	}
+	return foldLine(tx, network, m.ChatID, m.ChatID, brid, rid, oldID)
 }
 
 // takeOver gives the Beeper line rid the direct line's ID, side and content.
@@ -910,7 +1045,8 @@ func (s *Store) SetReaction(network, chatID, msgID string, r Reaction) error {
 
 // refresh recomputes a chat's derived values: its last visible line, its
 // unread count and the oldest line it holds. Activity only moves forward.
-// Lines only in Beeper's copy are history, and never count as unread.
+// Lines only in Beeper's copy are history, and never count as unread. Early
+// rows are not lines yet, and count for none of these.
 func refresh(tx *sql.Tx, network, chat string) error {
 	var lastID sql.NullString
 	var lastFromMe bool
@@ -929,7 +1065,7 @@ func refresh(tx *sql.Tx, network, chat string) error {
 		return err
 	}
 	var oldest sql.NullInt64
-	if err := tx.QueryRow(`SELECT MIN(ts_ms) FROM messages WHERE network = ? AND chat_id = ? AND ts_ms > 0`,
+	if err := tx.QueryRow(`SELECT MIN(ts_ms) FROM messages WHERE network = ? AND chat_id = ? AND early = 0 AND ts_ms > 0`,
 		network, chat).Scan(&oldest); err != nil {
 		return err
 	}

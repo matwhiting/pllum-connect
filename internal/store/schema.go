@@ -2,7 +2,7 @@ package store
 
 // schemaVersion is the version written to meta. An older store is brought up
 // to it; a store from a newer helper is refused rather than guessed at.
-const schemaVersion = 2 // 2 added beeper_ids
+const schemaVersion = 3 // 2 added beeper_ids; 3 added messages.early
 
 // schema makes every table. Every key starts with network, so each network
 // keeps to its own rows. Chats and messages have an integer rid, stable for
@@ -68,6 +68,10 @@ var schema = []string{
 	// source is 'live', 'sync' or 'beeper'. beeper_id is the Beeper message
 	// this line was matched to or copied from. network_id is the network's
 	// own ID a Beeper copy named, kept so the direct line can take it over.
+	// early is 1 for a row made by news about a line (an edit, a revoke, a
+	// placeholder) before the line itself: it is kept so the line lands in
+	// it, and never shows, counts or moves the chat until a whole copy of
+	// the line (with its time and side) has landed.
 	`CREATE TABLE IF NOT EXISTS messages (
 		rid         INTEGER PRIMARY KEY,
 		network     TEXT    NOT NULL,
@@ -89,6 +93,7 @@ var schema = []string{
 		beeper_id   TEXT,
 		network_id  TEXT,
 		seen_ms     INTEGER,
+		early       INTEGER NOT NULL DEFAULT 0,
 		UNIQUE (network, chat_id, msg_id)
 	)`,
 	`CREATE INDEX IF NOT EXISTS messages_time ON messages (network, chat_id, ts_ms)`,
@@ -165,6 +170,15 @@ var upgrades = []string{
 		SELECT m.rid, m.network, m.beeper_id, COALESCE(c.beeper_chat_id, '')
 		FROM messages AS m LEFT JOIN chats AS c ON c.network = m.network AND c.chat_id = m.chat_id
 		WHERE m.beeper_id IS NOT NULL`,
+	// 2 → 3 (after addedColumns): a row a revoke or edit made at time 0
+	// before its line was a schema-2 early row.
+	`UPDATE messages SET early = 1 WHERE source <> 'beeper' AND ts_ms = 0`,
+}
+
+// addedColumns are columns added to a table after it first shipped, added to
+// an older store before upgrades run (ALTER TABLE has no IF NOT EXISTS).
+var addedColumns = []struct{ table, column, definition string }{
+	{"messages", "early", "INTEGER NOT NULL DEFAULT 0"}, // 3
 }
 
 // hasBody is the SQL test for a line holding text or media: media entries,
@@ -175,6 +189,9 @@ const hasBody = `(COALESCE(text, '') <> '' OR media_json IS NOT NULL
 // mediaKinds are the kinds of line that are media.
 var mediaKinds = map[string]bool{"photo": true, "video": true, "voiceNote": true, "sticker": true, "file": true}
 
-// visible is the SQL test for a line that shows: not hidden, not deleted, and
-// with a body.
-const visible = `hidden = 0 AND deleted = 0 AND ` + hasBody
+// visible is the SQL test for a line that shows: not early, not hidden, not
+// deleted, and with a body.
+const visible = `early = 0 AND hidden = 0 AND deleted = 0 AND ` + hasBody
+
+// listed is the SQL test for a line Messages lists: any line but an early one.
+const listed = `early = 0`

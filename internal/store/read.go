@@ -258,7 +258,8 @@ func (s *Store) reactions(network, chat, msgID string) ([]Reaction, error) {
 // Messages is a page of a chat's lines, oldest first within the page, from
 // the newest back: before is the previous page's OldestCursor, or empty for
 // the newest page. HasMore is false only on the page holding the oldest line.
-// An unknown chat is notFound.
+// Early rows (news about a line not yet held) are not lines, and are left
+// out. An unknown chat is notFound.
 func (s *Store) Messages(network, chatID, before string, limit int) (MessagePage, error) {
 	if err := s.ready(); err != nil {
 		return MessagePage{}, err
@@ -277,7 +278,7 @@ func (s *Store) Messages(network, chatID, before string, limit int) (MessagePage
 	if !ok {
 		return MessagePage{}, errNotFound
 	}
-	q := `SELECT ` + messageColumns + ` FROM messages WHERE network = ? AND chat_id = ?`
+	q := `SELECT ` + messageColumns + ` FROM messages WHERE network = ? AND chat_id = ? AND ` + listed
 	args := []any{network, c.ID}
 	if before != "" {
 		ms, rid, err := decodeCursor(before)

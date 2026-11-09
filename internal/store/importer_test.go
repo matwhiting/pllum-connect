@@ -568,9 +568,9 @@ func TestAKindlessHiddenPlaceholderIsKeptUntilItDecrypts(t *testing.T) {
 	if err != nil || !added {
 		t.Fatalf("the placeholder: added %v, %v", added, err)
 	}
-	got := all(t, s, phoneChat)
-	if len(got) != 1 || !*got[0].Hidden || got[0].Kind != "text" {
-		t.Fatalf("the placeholder is %+v", got)
+	// Kept as an early row (fix round 4): it shows nowhere until it decrypts.
+	if got := all(t, s, phoneChat); len(got) != 0 {
+		t.Fatalf("the placeholder is listed: %+v", got)
 	}
 	decrypted := text(phoneChat, "3EB0P0001", base, "now readable")
 	decrypted.Hidden = ptr(false)

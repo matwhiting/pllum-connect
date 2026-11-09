@@ -99,6 +99,11 @@ func (s *Store) Import(network string, in ImportBatch) (ImportResult, error) {
 		if !lineKinds[kindOr(m.Kind)] {
 			return r, errBadRequest
 		}
+		for _, x := range m.Media {
+			if !mediaKinds[x.Kind] {
+				return r, errBadRequest
+			}
+		}
 	}
 	err := s.write(func(tx *sql.Tx) error {
 		r = ImportResult{}
@@ -182,6 +187,19 @@ func importLine(tx *sql.Tx, network, chat, beeperChatID string, m ImportMessage)
 		return skipped, err
 	}
 
+	media := make([]Media, 0, len(m.Media))
+	for _, x := range m.Media {
+		media = append(media, Media{Kind: x.Kind, Width: x.Width, Height: x.Height})
+	}
+	mj, err := mediaJSON(media)
+	if err != nil {
+		return skipped, err
+	}
+	var replyTo string
+	if m.ReplyToBeeperID != "" {
+		replyTo = beeperPrefix + m.ReplyToBeeperID // resolveReplies points it at its line
+	}
+
 	rid, err := matchBeeperCopy(tx, network, chat, beeperCopy{
 		beeperChatIDs: []string{beeperChatID}, networkID: m.NetworkID, fromMe: m.FromMe,
 		timeMs: m.TimeMs, text: m.Text, mediaKind: importMediaKind(m),
@@ -191,6 +209,14 @@ func importLine(tx *sql.Tx, network, chat, beeperChatID string, m ImportMessage)
 		return skipped, err
 	}
 	if rid != 0 {
+		// An early row the copy names (news about a line WhatsApp has not
+		// sent yet, perhaps never will) becomes the line.
+		if err := fillEarly(tx, rid, Message{
+			FromMe: m.FromMe, SenderID: m.SenderID, SenderName: m.SenderName, TimeMs: m.TimeMs,
+			Text: m.Text, Kind: m.Kind, Hidden: &m.Hidden, Deleted: m.Deleted,
+		}, mj, m.NetworkID, replyTo); err != nil {
+			return skipped, err
+		}
 		var lineID string
 		if err := tx.QueryRow(`UPDATE messages SET
 				beeper_id = COALESCE(beeper_id, ?),
@@ -205,21 +231,9 @@ func importLine(tx *sql.Tx, network, chat, beeperChatID string, m ImportMessage)
 		return matched, addReactions(tx, network, chat, lineID, m.Reactions)
 	}
 
-	media := make([]Media, 0, len(m.Media))
-	for _, x := range m.Media {
-		media = append(media, Media{Kind: x.Kind, Width: x.Width, Height: x.Height})
-	}
-	mj, err := mediaJSON(media)
-	if err != nil {
-		return skipped, err
-	}
 	var text any
 	if m.Text != "" && !m.Deleted {
 		text = m.Text
-	}
-	var replyTo any
-	if m.ReplyToBeeperID != "" {
-		replyTo = beeperPrefix + m.ReplyToBeeperID // resolveReplies points it at its line
 	}
 	lineID := beeperPrefix + m.BeeperID
 	if err := tx.QueryRow(`INSERT INTO messages
@@ -228,7 +242,7 @@ func importLine(tx *sql.Tx, network, chat, beeperChatID string, m ImportMessage)
 			VALUES (?, ?, ?, ?, NULLIF(?, ''), ?, ?, ?, ?, ?, ?, 0, ?, ?, 'beeper', ?, NULLIF(?, ''))
 			RETURNING rid`,
 		network, chat, lineID, m.SenderID, m.SenderName, m.FromMe, m.TimeMs, text, kindOr(m.Kind),
-		m.Hidden, m.Deleted, replyTo, mj, m.BeeperID, m.NetworkID).Scan(&rid); err != nil {
+		m.Hidden, m.Deleted, nullable(replyTo), mj, m.BeeperID, m.NetworkID).Scan(&rid); err != nil {
 		return skipped, err
 	}
 	if err := carryBeeperID(tx, network, rid, m.BeeperID, beeperChatID); err != nil {
@@ -404,10 +418,10 @@ func (s *Store) Counts(network string) (Counts, error) {
 	err := s.db.QueryRow(`SELECT
 			(SELECT count(*) FROM chats WHERE network = ?1),
 			(SELECT count(*) FROM chats WHERE network = ?1 AND placed = 0),
-			(SELECT count(*) FROM messages WHERE network = ?1),
+			(SELECT count(*) FROM messages WHERE network = ?1 AND early = 0),
 			(SELECT count(*) FROM messages WHERE network = ?1 AND beeper_id IS NOT NULL),
 			(SELECT count(*) FROM messages WHERE network = ?1 AND beeper_id IS NOT NULL AND source <> 'beeper'),
-			(SELECT MIN(ts_ms) FROM messages WHERE network = ?1 AND ts_ms > 0)`, network).
+			(SELECT MIN(ts_ms) FROM messages WHERE network = ?1 AND early = 0 AND ts_ms > 0)`, network).
 		Scan(&c.Chats, &c.UnplacedChats, &c.Messages, &c.Imported, &c.Matched, &oldest)
 	if err != nil {
 		return Counts{}, dbErr(err)

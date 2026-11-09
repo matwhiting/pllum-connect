@@ -138,10 +138,11 @@ func nearestMatch(rows *sql.Rows, ts int64, text, mediaKind string, direct bool)
 	return rid, id, rows.Err()
 }
 
-// fuzzable is the SQL test for a stored line content may match: not deleted,
-// and with a body (text, media, or a media kind). An empty or deleted line
-// says nothing about which message it was, so only an ID can match it.
-const fuzzable = `deleted = 0 AND ` + hasBody
+// fuzzable is the SQL test for a stored line content may match: not early,
+// not deleted, and with a body (text, media, or a media kind). An empty or
+// deleted line says nothing about which message it was, and an early row
+// has no time or side of its own yet, so only an ID can match them.
+const fuzzable = `early = 0 AND deleted = 0 AND ` + hasBody
 
 // matchable reports the same of an incoming copy, given its media kind
 // (mediaKindOf, which falls back to the line's own kind).
