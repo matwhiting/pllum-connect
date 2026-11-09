@@ -3,6 +3,7 @@ package whatsapp
 import (
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"sort"
 	"sync"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/appstate"
 	"go.mau.fi/whatsmeow/proto/waAdv"
 	"go.mau.fi/whatsmeow/proto/waCommon"
 	"go.mau.fi/whatsmeow/proto/waE2E"
@@ -71,6 +73,38 @@ type fakeClient struct {
 	downloadErr error                                 // when set, every download fails with it
 	receipts    []string                              // protocol receipts sent: "<type> <id>"
 	onReceipt   func()                                // runs as a protocol receipt is sent
+
+	// The writer's half (waWriter).
+	idN         int
+	sent        []sentMessage
+	sendErr     error         // when set, SendMessage fails with it
+	sendBlock   chan struct{} // when set, SendMessage waits for it or its context
+	onSend      func(sentMessage)
+	sendReturns int
+	uploads     []upload
+	marks       []markRead
+	patches     []appstate.PatchInfo
+	files       map[string][]byte // downloads by direct path
+	fetches     []string          // direct paths asked for
+	retries     []string          // media retry receipts: message IDs
+	onRetry     func(info *types.MessageInfo, mediaKey []byte)
+	logouts     int
+}
+
+type sentMessage struct {
+	to  types.JID
+	msg *waE2E.Message
+	id  string
+}
+
+type upload struct {
+	data []byte
+	kind whatsmeow.MediaType
+}
+
+type markRead struct {
+	ids          []string
+	chat, sender types.JID
 }
 
 func newFakeClient(dev *wastore.Device) *fakeClient {
@@ -78,7 +112,140 @@ func newFakeClient(dev *wastore.Device) *fakeClient {
 		dev:     dev,
 		parser:  whatsmeow.NewClient(dev, waLog.Noop),
 		history: map[string]*waHistorySync.HistorySync{},
+		files:   map[string][]byte{},
 	}
+}
+
+// BuildReaction is whatsmeow's own, from a client that never connects.
+func (f *fakeClient) BuildReaction(chat, sender types.JID, id types.MessageID, reaction string) *waE2E.Message {
+	return f.parser.BuildReaction(chat, sender, id, reaction)
+}
+
+// GenerateMessageID makes invented IDs in turn.
+func (f *fakeClient) GenerateMessageID() types.MessageID {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.idN++
+	return fmt.Sprintf("3EB0F%016d", f.idN)
+}
+
+// SendMessage keeps what was sent, then waits, fails or is acknowledged at
+// base plus a minute.
+func (f *fakeClient) SendMessage(ctx context.Context, to types.JID, m *waE2E.Message, extra ...whatsmeow.SendRequestExtra) (whatsmeow.SendResponse, error) {
+	sm := sentMessage{to: to, msg: proto.Clone(m).(*waE2E.Message)}
+	if len(extra) == 1 {
+		sm.id = extra[0].ID
+	}
+	f.mu.Lock()
+	f.sent = append(f.sent, sm)
+	on, block := f.onSend, f.sendBlock
+	f.mu.Unlock()
+	if on != nil {
+		on(sm)
+	}
+	defer func() {
+		f.mu.Lock()
+		f.sendReturns++
+		f.mu.Unlock()
+	}()
+	if block != nil {
+		select {
+		case <-block:
+		case <-ctx.Done():
+			return whatsmeow.SendResponse{}, ctx.Err()
+		}
+	}
+	f.mu.Lock()
+	err := f.sendErr
+	f.mu.Unlock()
+	if err != nil {
+		return whatsmeow.SendResponse{}, err
+	}
+	return whatsmeow.SendResponse{ID: sm.id, Timestamp: time.UnixMilli(base + 60_000)}, nil
+}
+
+func (f *fakeClient) Upload(ctx context.Context, data []byte, kind whatsmeow.MediaType) (whatsmeow.UploadResponse, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.uploads = append(f.uploads, upload{data: data, kind: kind})
+	n := len(f.uploads)
+	return whatsmeow.UploadResponse{
+		URL: fmt.Sprintf("https://invented.example/u/%d", n), DirectPath: fmt.Sprintf("/v/up-%d", n),
+		MediaKey: []byte("invented-media-key-32-bytes-long"), FileSHA256: []byte("sha"), FileEncSHA256: []byte("enc"),
+		FileLength: uint64(len(data)),
+	}, nil
+}
+
+func (f *fakeClient) MarkRead(ctx context.Context, ids []types.MessageID, ts time.Time, chat, sender types.JID, extra ...types.ReceiptType) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.marks = append(f.marks, markRead{ids: append([]string(nil), ids...), chat: chat, sender: sender})
+	return nil
+}
+
+func (f *fakeClient) SendAppState(ctx context.Context, patch appstate.PatchInfo) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.patches = append(f.patches, patch)
+	return nil
+}
+
+// Download gives the file filed under the part's direct path, else 404.
+func (f *fakeClient) Download(ctx context.Context, m whatsmeow.DownloadableMessage) ([]byte, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.fetches = append(f.fetches, m.GetDirectPath())
+	if b, ok := f.files[m.GetDirectPath()]; ok {
+		return append([]byte(nil), b...), nil
+	}
+	return nil, whatsmeow.ErrMediaDownloadFailedWith404
+}
+
+func (f *fakeClient) SendMediaRetryReceipt(ctx context.Context, info *types.MessageInfo, mediaKey []byte) error {
+	f.mu.Lock()
+	f.retries = append(f.retries, info.ID)
+	on := f.onRetry
+	f.mu.Unlock()
+	if on != nil {
+		on(info, mediaKey)
+	}
+	return nil
+}
+
+// Logout does what whatsmeow's does once WhatsApp agrees: disconnect and
+// delete the device.
+func (f *fakeClient) Logout(ctx context.Context) error {
+	f.mu.Lock()
+	f.logouts++
+	f.connected = false
+	f.mu.Unlock()
+	return f.dev.Delete(ctx)
+}
+
+// writes is everything the fake was asked to write, as one count.
+func (f *fakeClient) writes() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.sent) + len(f.uploads) + len(f.marks) + len(f.patches) + len(f.retries) + f.logouts
+}
+
+// with runs fn under the fake's lock, to set what it does next.
+func (f *fakeClient) with(fn func()) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	fn()
+}
+
+func (f *fakeClient) uploadList() []upload {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]upload(nil), f.uploads...)
+}
+
+func (f *fakeClient) sentMessages() []sentMessage {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]sentMessage(nil), f.sent...)
 }
 
 func (f *fakeClient) AddEventHandlerWithSuccessStatus(h whatsmeow.EventHandlerWithSuccessStatus) uint32 {

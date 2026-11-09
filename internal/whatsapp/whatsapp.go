@@ -2,7 +2,9 @@
 // links by QR code, writes every message, receipt and chat change into the
 // store before WhatsApp is told it arrived, downloads the link-time history,
 // and keeps the connection's state for Pllum. Reads are the server's, from
-// the store; writes (sending, reacting, marking) come in a later step.
+// the store. Writes (sending, reacting, marking, muting, fetching media and
+// unlinking) go through waWriter only, and each send is kept in the store's
+// outbox under the ID made for it before it is sent.
 //
 // Nothing here logs: whatsmeow gets waLog.Noop for its client and its store,
 // and every error returned carries only a fixed kind.
@@ -71,6 +73,9 @@ type waClient interface {
 	DownloadHistorySync(ctx context.Context, notif *waE2E.HistorySyncNotification, synchronousStorage bool) (*waHistorySync.HistorySync, error)
 	ParseWebMessage(chatJID types.JID, webMsg *waWeb.WebMessageInfo) (*events.Message, error)
 	SendProtocolMessageReceipt(ctx context.Context, id types.MessageID, msgType types.ReceiptType) error
+	// BuildReaction only builds a message; SendMessage sends it.
+	BuildReaction(chat, sender types.JID, id types.MessageID, reaction string) *waE2E.Message
+	waWriter
 }
 
 // clock is the time the adapter's timers run on; tests move a fake one.
@@ -126,6 +131,15 @@ type WhatsApp struct {
 	cmu      sync.Mutex
 	cLast    time.Time
 	cPending bool
+
+	smu      sync.Mutex
+	queue    []sendJob     // sends waiting to go, in the order they were made
+	sendKick chan struct{} // wakes the sender
+
+	mediaCap int64 // the most the media folder holds, in bytes
+	mmu      sync.Mutex
+	mlocks   map[string]*sync.Mutex             // one fetch of a file at a time
+	mretry   map[string]chan *events.MediaRetry // media retries waiting for his phone
 }
 
 var _ network.Network = (*WhatsApp)(nil)
@@ -147,6 +161,10 @@ func New(st *store.Store, dir string, key [32]byte, emit network.Emit) *WhatsApp
 		tries:     map[int64]int{},
 		hChats:    map[string]bool{},
 		hFull:     map[string]bool{},
+		sendKick:  make(chan struct{}, 1),
+		mediaCap:  mediaCap,
+		mlocks:    map[string]*sync.Mutex{},
+		mretry:    map[string]chan *events.MediaRetry{},
 	}
 }
 
@@ -229,9 +247,13 @@ func (w *WhatsApp) Start(ctx context.Context) error {
 		// deleted it), the chats are here and a QR scan continues them.
 		w.setState(w.signedOut(), "")
 	}
-	w.worker.Add(1)
+	w.worker.Add(2)
 	go w.historyLoop(w.ctx)
+	go w.sendLoop(w.ctx)
 	w.kickHistory()
+	// A send the last run made and never saw acknowledged goes again, under
+	// the same ID, once connected: WhatsApp keeps one message per ID.
+	w.resendAll()
 	return nil
 }
 
@@ -265,9 +287,6 @@ func (w *WhatsApp) Status() network.Status {
 	return network.Status{State: w.state, SelfChatID: w.selfID}
 }
 
-// Logout belongs to the writes, which come in a later step.
-func (w *WhatsApp) Logout(ctx context.Context) error { return errUnsupported }
-
 // Nudge reconnects now when a linked device is not connected: after the Mac
 // wakes, or after another client took the session.
 func (w *WhatsApp) Nudge() {
@@ -283,39 +302,6 @@ func (w *WhatsApp) Nudge() {
 	if ok && !cli.IsConnected() {
 		go w.connect(cli)
 	}
-}
-
-// Send and the other writes come in a later step.
-func (w *WhatsApp) Send(ctx context.Context, m network.Outgoing) (string, error) {
-	return "", errUnsupported
-}
-
-// SendState knows no sends yet.
-func (w *WhatsApp) SendState(messageID string) network.SendState {
-	return network.SendState{State: network.SendUnknown}
-}
-
-// React comes in a later step.
-func (w *WhatsApp) React(ctx context.Context, chatID, messageID, emoji, transactionID string) error {
-	return errUnsupported
-}
-
-// MarkRead comes in a later step.
-func (w *WhatsApp) MarkRead(ctx context.Context, chatID, through string) error {
-	return errUnsupported
-}
-
-// MarkUnread comes in a later step.
-func (w *WhatsApp) MarkUnread(ctx context.Context, chatID string) error { return errUnsupported }
-
-// SetMuted comes in a later step.
-func (w *WhatsApp) SetMuted(ctx context.Context, chatID string, muted bool) error {
-	return errUnsupported
-}
-
-// Media comes in a later step.
-func (w *WhatsApp) Media(ctx context.Context, chatID, messageID string) (string, error) {
-	return "", errUnsupported
 }
 
 // Stop disconnects, waits for the history worker, and closes the device
@@ -428,6 +414,7 @@ func (w *WhatsApp) setState(s network.State, kind wire.Kind) {
 		return
 	}
 	w.state, w.kind = s, kind
+	w.kickSend() // a send waiting for a connection may go now
 	ev := map[string]any{"event": "state", "state": s}
 	if kind != "" {
 		ev["kind"] = string(kind)
@@ -490,6 +477,8 @@ func (w *WhatsApp) handle(cli waClient, evt any) (ok bool) {
 		return w.done(w.onContact(e))
 	case *events.GroupInfo:
 		return w.done(w.onGroupInfo(e))
+	case *events.MediaRetry:
+		w.mediaRetried(e)
 	}
 	return true
 }

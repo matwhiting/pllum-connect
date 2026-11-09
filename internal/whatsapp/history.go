@@ -71,7 +71,8 @@ func (w *WhatsApp) drainHistory(ctx context.Context) {
 			gone := historyGone(err)
 			// Only a failure while connected that is not the connection's own
 			// counts towards giving the notification up.
-			if !gone && !historyTransient(err) && w.online() && w.failed(id) >= historyTries {
+			counted := !gone && !historyTransient(err) && w.online()
+			if counted && w.failed(id) >= historyTries {
 				gone = true
 			}
 			if gone {
@@ -79,6 +80,15 @@ func (w *WhatsApp) drainHistory(ctx context.Context) {
 					return
 				}
 				continue
+			}
+			if counted {
+				// A wake-up that came in while this try ran (a notification
+				// behind this one, say) would only try the same bad blob again
+				// at once and count it twice: the retry is the next try.
+				select {
+				case <-w.kick:
+				default:
+				}
 			}
 			w.retryHistory()
 			return

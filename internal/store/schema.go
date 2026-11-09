@@ -2,7 +2,7 @@ package store
 
 // schemaVersion is the version written to meta. An older store is brought up
 // to it; a store from a newer helper is refused rather than guessed at.
-const schemaVersion = 4 // 2 added beeper_ids; 3 messages.early; 4 messages.copied
+const schemaVersion = 5 // 2 added beeper_ids; 3 messages.early; 4 messages.copied; 5 the outbox's write
 
 // schema makes every table. Every key starts with network, so each network
 // keeps to its own rows. Chats and messages have an integer rid, stable for
@@ -128,7 +128,11 @@ var schema = []string{
 		PRIMARY KEY (network, chat_id, msg_id, sender_id)
 	)`,
 
-	// The outbox: a send's ID is made and kept here before it is sent.
+	// The outbox: a send's ID is made and kept here before it is sent, with
+	// what to send (request, and message once the network has built it), so
+	// a send cut off by a crash is sent again under the same ID. kind is
+	// what is sent ('message' or 'reaction'); state is 'sending', 'sent' or
+	// 'failed', with the error kind in fail.
 	`CREATE TABLE IF NOT EXISTS outgoing (
 		network TEXT    NOT NULL,
 		msg_id  TEXT    NOT NULL,
@@ -137,8 +141,12 @@ var schema = []string{
 		state   TEXT    NOT NULL,
 		txn     TEXT,
 		made_ms INTEGER NOT NULL,
+		fail    TEXT,
+		request BLOB,
+		message BLOB,
 		PRIMARY KEY (network, msg_id)
 	)`,
+	`CREATE INDEX IF NOT EXISTS outgoing_txn ON outgoing (network, txn)`,
 
 	// History notifications kept before they are acknowledged.
 	`CREATE TABLE IF NOT EXISTS pending_history (
@@ -187,6 +195,9 @@ var upgrades = []string{
 var addedColumns = []struct{ table, column, definition string }{
 	{"messages", "early", "INTEGER NOT NULL DEFAULT 0"},  // 3
 	{"messages", "copied", "INTEGER NOT NULL DEFAULT 0"}, // 4
+	{"outgoing", "fail", "TEXT"},                         // 5
+	{"outgoing", "request", "BLOB"},                      // 5
+	{"outgoing", "message", "BLOB"},                      // 5
 }
 
 // hasBody is the SQL test for a line holding text or media: media entries,

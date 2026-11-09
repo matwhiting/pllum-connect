@@ -171,6 +171,7 @@ func TestNothingReachesStderr(t *testing.T) {
 		items, _ := a["result"].(map[string]any)["items"].([]any)
 		return len(items) == 3
 	})
+	fc.with(func() { fc.files["/v/"+canary] = []byte(canary + " photo bytes") })
 	for i, r := range []struct {
 		method string
 		params map[string]any
@@ -185,6 +186,13 @@ func TestNothingReachesStderr(t *testing.T) {
 		{"send", map[string]any{"chatID": aliceJID.String(), "text": canary}},
 		{"markRead", map[string]any{"chatID": aliceJID.String()}},
 		{"media", map[string]any{"chatID": aliceJID.String(), "messageID": "3EB0C1000000000000003"}},
+		{"react", map[string]any{"chatID": aliceJID.String(), "messageID": "3EB0C1000000000000002", "emoji": "👍", "transactionID": canary}},
+		{"react", map[string]any{"chatID": aliceJID.String(), "messageID": "3EB0C10000000000000FF", "emoji": "👍", "transactionID": canary + "2"}},
+		{"sendStatus", map[string]any{"messageID": canary}},
+		{"markUnread", map[string]any{"chatID": aliceJID.String()}},
+		{"setMuted", map[string]any{"chatID": aliceJID.String(), "muted": true}},
+		{"send", map[string]any{"chatID": aliceJID.String(), "text": canary, "file": "/invented/missing-" + canary}},
+		{"logout", map[string]any{}},
 		{"messages", map[string]any{"chatID": "unknown-" + canary, "limit": 5}},
 	} {
 		r.params["network"] = "whatsapp"
