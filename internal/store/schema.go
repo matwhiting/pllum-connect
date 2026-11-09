@@ -2,7 +2,7 @@ package store
 
 // schemaVersion is the version written to meta. An older store is brought up
 // to it; a store from a newer helper is refused rather than guessed at.
-const schemaVersion = 5 // 2 added beeper_ids; 3 messages.early; 4 messages.copied; 5 the outbox's write
+const schemaVersion = 6 // 2 added beeper_ids; 3 messages.early; 4 messages.copied; 5 the outbox's write; 6 one row per transaction
 
 // schema makes every table. Every key starts with network, so each network
 // keeps to its own rows. Chats and messages have an integer rid, stable for
@@ -146,7 +146,13 @@ var schema = []string{
 		message BLOB,
 		PRIMARY KEY (network, msg_id)
 	)`,
-	`CREATE INDEX IF NOT EXISTS outgoing_txn ON outgoing (network, txn)`,
+	// One outbox row per caller transaction, so two calls racing with the
+	// same transaction send once. A store from before the index keeps only
+	// the newest row's transaction (there are none: nothing wrote it).
+	`DROP INDEX IF EXISTS outgoing_txn`,
+	`UPDATE outgoing SET txn = NULL WHERE txn IS NOT NULL AND rowid NOT IN
+		(SELECT MAX(rowid) FROM outgoing WHERE txn IS NOT NULL GROUP BY network, txn)`,
+	`CREATE UNIQUE INDEX IF NOT EXISTS outgoing_txn_once ON outgoing (network, txn) WHERE txn IS NOT NULL`,
 
 	// History notifications kept before they are acknowledged.
 	`CREATE TABLE IF NOT EXISTS pending_history (

@@ -123,7 +123,7 @@ func TestASchema4StoreGainsTheOutboxsWrite(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, stmt := range []string{
-		`DROP INDEX outgoing_txn`,
+		`DROP INDEX outgoing_txn_once`,
 		`ALTER TABLE outgoing DROP COLUMN fail`,
 		`ALTER TABLE outgoing DROP COLUMN request`,
 		`ALTER TABLE outgoing DROP COLUMN message`,
@@ -146,5 +146,30 @@ func TestASchema4StoreGainsTheOutboxsWrite(t *testing.T) {
 	}
 	if o, ok, err := s.Outgoing(net, "3EB0O0009"); err != nil || !ok || o.Fail != "refused" || string(o.Request) != "r" {
 		t.Fatalf("Outgoing = %+v, %v, %v", o, ok, err)
+	}
+}
+
+func TestATransactionIsKeptOnce(t *testing.T) {
+	s := openTest(t)
+	first := Outgoing{ID: "3EB0O0011", ChatID: phoneChat, Kind: "reaction", Txn: "txn-same", MadeMs: base}
+	if err := s.PutOutgoing(net, first); err != nil {
+		t.Fatal(err)
+	}
+	second := first
+	second.ID = "3EB0O0012"
+	if err := s.PutOutgoing(net, second); err == nil {
+		t.Fatalf("a second row was kept for one transaction")
+	}
+	// Rows with no transaction, and the same transaction on another network, are fine.
+	for i, o := range []Outgoing{
+		{ID: "3EB0O0013", ChatID: phoneChat, Kind: "message", MadeMs: base},
+		{ID: "3EB0O0014", ChatID: phoneChat, Kind: "message", MadeMs: base},
+	} {
+		if err := s.PutOutgoing(net, o); err != nil {
+			t.Fatalf("row %d with no transaction: %v", i, err)
+		}
+	}
+	if err := s.PutOutgoing("other", second); err != nil {
+		t.Fatalf("another network's transaction: %v", err)
 	}
 }

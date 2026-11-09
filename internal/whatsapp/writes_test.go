@@ -3,6 +3,8 @@ package whatsapp
 import (
 	"bytes"
 	"context"
+	"errors"
+	"fmt"
 	"image"
 	"image/color"
 	"image/jpeg"
@@ -130,7 +132,8 @@ func TestTheSentLineHasTheSameID(t *testing.T) {
 }
 
 func TestAFailureBeforeTheServerIsRefused(t *testing.T) {
-	for _, err := range []error{whatsmeow.ErrNotConnected, whatsmeow.ErrRecipientNotOnWhatsApp, whatsmeow.ErrServerReturnedError} {
+	// Only WhatsApp's server turning the message down is refused.
+	for _, err := range []error{whatsmeow.ErrRecipientNotOnWhatsApp, fmt.Errorf("%w 403", whatsmeow.ErrServerReturnedError)} {
 		t.Run(err.Error(), func(t *testing.T) {
 			r, c := withAlice(t)
 			c.with(func() { c.sendErr = err })
@@ -145,15 +148,27 @@ func TestAFailureBeforeTheServerIsRefused(t *testing.T) {
 	}
 }
 
+// attempts waits for the fake's SendMessage to have returned n times.
+func (c *fakeClient) attempts(t *testing.T, n int) {
+	t.Helper()
+	eventually(t, "the send to return", func() bool {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		return c.sendReturns >= n
+	})
+}
+
+// reconnect drops the connection and brings it back, as whatsmeow does.
+func (c *fakeClient) reconnect() {
+	c.dispatch(&events.Disconnected{})
+	c.dispatch(&events.Connected{})
+}
+
 func TestATimeoutStaysSending(t *testing.T) {
 	r, c := withAlice(t)
 	c.with(func() { c.sendErr = whatsmeow.ErrMessageTimedOut })
 	id := r.sendOK(network.Outgoing{ChatID: aliceJID.String(), Text: "invented"})
-	eventually(t, "the send to return", func() bool {
-		c.mu.Lock()
-		defer c.mu.Unlock()
-		return c.sendReturns == 1
-	})
+	c.attempts(t, 1)
 	time.Sleep(20 * time.Millisecond)
 	if st := r.w.SendState(id); st.State != network.SendSending || st.Kind != "" {
 		t.Fatalf("after a timeout the state is %+v, want sending (unclear)", st)
@@ -162,7 +177,123 @@ func TestATimeoutStaysSending(t *testing.T) {
 		t.Fatalf("a send that may not have gone was stored as a line")
 	}
 	if n := len(c.sentMessages()); n != 1 {
-		t.Fatalf("an unclear send was tried %d times in the same run", n)
+		t.Fatalf("an unclear send was tried %d times on one connection", n)
+	}
+	// The next connection sends it again, under the same ID, once.
+	c.with(func() { c.sendErr = nil })
+	c.reconnect()
+	if st := r.settled(id); st.State != network.SendSent {
+		t.Fatalf("after reconnecting the send is %+v", st)
+	}
+	c.dispatch(&events.OfflineSyncCompleted{})
+	time.Sleep(20 * time.Millisecond)
+	sent := c.sentMessages()
+	if len(sent) != 2 || sent[1].id != id {
+		t.Fatalf("sends %d (second ID %q), want the same ID once more", len(sent), sent[len(sent)-1].id)
+	}
+}
+
+func TestADisconnectAndReconnectResendsExactlyOnceUnderTheSameID(t *testing.T) {
+	r, c := withAlice(t)
+	release := make(chan struct{})
+	calls := 0
+	c.with(func() {
+		c.sendBlock = release
+		c.sendErr = &whatsmeow.DisconnectedError{Action: "message send"}
+		c.onSend = func(sentMessage) {
+			c.with(func() {
+				calls++
+				if calls > 1 {
+					c.sendBlock, c.sendErr = nil, nil // the resend is answered
+				}
+			})
+		}
+	})
+	id := r.sendOK(network.Outgoing{ChatID: aliceJID.String(), Text: "invented"})
+	eventually(t, "the send to start", func() bool { return len(c.sentMessages()) == 1 })
+	// The connection drops and comes back while WhatsApp has not answered;
+	// then the first try ends cut off.
+	c.reconnect()
+	close(release)
+	if st := r.settled(id); st.State != network.SendSent {
+		t.Fatalf("the send ended %+v", st)
+	}
+	c.dispatch(&events.OfflineSyncCompleted{})
+	time.Sleep(30 * time.Millisecond)
+	sent := c.sentMessages()
+	if len(sent) != 2 || sent[0].id != id || sent[1].id != id {
+		t.Fatalf("%d sends, want the first and exactly one resend under %q", len(sent), id)
+	}
+}
+
+func TestAResendFailingNotConnectedStaysSendingAndGoesOnTheNextConnection(t *testing.T) {
+	r, c := withAlice(t)
+	c.with(func() { c.sendBlock = make(chan struct{}) })
+	id := r.sendOK(network.Outgoing{ChatID: aliceJID.String(), Text: "invented"})
+	eventually(t, "the send to reach the network", func() bool { return len(c.sentMessages()) == 1 })
+	r.mu.Lock()
+	r.onMake = func(fc *fakeClient) { fc.sendErr = whatsmeow.ErrNotConnected }
+	r.mu.Unlock()
+	r.restart()
+	c2 := r.client()
+	c2.dispatch(&events.Connected{})
+	c2.attempts(t, 1)
+	time.Sleep(20 * time.Millisecond)
+	if st := r.w.SendState(id); st.State != network.SendSending {
+		t.Fatalf("a resend that could not go is %+v, want sending", st)
+	}
+	c2.with(func() { c2.sendErr = nil })
+	c2.reconnect()
+	if st := r.settled(id); st.State != network.SendSent {
+		t.Fatalf("on the next connection the send ended %+v", st)
+	}
+	for _, sm := range c2.sentMessages() {
+		if sm.id != id {
+			t.Fatalf("a resend went under %q, want %q", sm.id, id)
+		}
+	}
+}
+
+func TestAnUploadFailureStaysSendingAndUploadsAgain(t *testing.T) {
+	r, c := withAlice(t)
+	c.with(func() { c.uploadErr = &whatsmeow.DisconnectedError{Action: "upload"} })
+	id := r.sendOK(network.Outgoing{ChatID: aliceJID.String(), File: writeJPEG(t, r.dir, 4, 4), Text: "invented"})
+	time.Sleep(50 * time.Millisecond)
+	if st := r.w.SendState(id); st.State != network.SendSending {
+		t.Fatalf("after a failed upload the send is %+v, want sending", st)
+	}
+	if n := len(c.sentMessages()); n != 0 {
+		t.Fatalf("a message went without its upload")
+	}
+	c.with(func() { c.uploadErr = nil })
+	c.reconnect()
+	if st := r.settled(id); st.State != network.SendSent {
+		t.Fatalf("the send ended %+v", st)
+	}
+	if ups, sent := c.uploadList(), c.sentMessages(); len(ups) != 1 || len(sent) != 1 || sent[0].id != id ||
+		sent[0].msg.GetImageMessage().GetDirectPath() != "/v/up-1" {
+		t.Fatalf("%d uploads and %d sends after reconnecting", len(ups), len(sent))
+	}
+}
+
+func TestAnErrorAfterTheFrameWentOutIsNeverRefused(t *testing.T) {
+	for _, err := range []error{
+		whatsmeow.ErrNotConnected, // retryFrame: the socket gone after the frame went out
+		errors.New("invented socket write failure"),
+		&whatsmeow.DisconnectedError{Action: "message send"},
+		whatsmeow.ErrMessageTimedOut,
+		whatsmeow.ErrIQTimedOut,
+	} {
+		t.Run(err.Error(), func(t *testing.T) {
+			r, c := withAlice(t)
+			c.with(func() { c.sendErr = err })
+			id := r.sendOK(network.Outgoing{ChatID: aliceJID.String(), Text: "invented"})
+			c.attempts(t, 1)
+			time.Sleep(20 * time.Millisecond)
+			if st := r.w.SendState(id); st.State != network.SendSending {
+				t.Fatalf("state %+v, want sending", st)
+			}
+		})
 	}
 }
 
@@ -216,7 +347,7 @@ func TestAResendWhoseRetryIsRefusedIsUnclear(t *testing.T) {
 	id := r.sendOK(network.Outgoing{ChatID: aliceJID.String(), Text: "invented"})
 	eventually(t, "the send to reach the network", func() bool { return len(c.sentMessages()) == 1 })
 	r.mu.Lock()
-	r.onMake = func(fc *fakeClient) { fc.sendErr = whatsmeow.ErrNotConnected }
+	r.onMake = func(fc *fakeClient) { fc.sendErr = whatsmeow.ErrServerReturnedError }
 	r.mu.Unlock()
 	r.restart()
 	r.client().dispatch(&events.Connected{})
@@ -550,7 +681,7 @@ func TestARepeatedTransactionSendsNothing(t *testing.T) {
 	}
 
 	// One refused before it went may be tried again under its transaction.
-	c.with(func() { c.sendErr = whatsmeow.ErrNotConnected })
+	c.with(func() { c.sendErr = whatsmeow.ErrServerReturnedError })
 	if err := r.w.React(ctx, aliceJID.String(), "3EB0A0000000000000001", "😮", "txn-refused"); kindOf(err) != wire.Refused {
 		t.Fatalf("a refused reaction gave %v", err)
 	}
@@ -573,6 +704,35 @@ func TestARepeatedTransactionSendsNothing(t *testing.T) {
 	}
 	if n := len(c.sentMessages()); n != 4 {
 		t.Fatalf("an unclear reaction was sent again (%d sends)", n)
+	}
+	// It goes again, under its own ID, on the next connection.
+	c.reconnect()
+	eventually(t, "the unclear reaction to go again", func() bool { return len(c.sentMessages()) == 5 })
+	if sent := c.sentMessages(); sent[4].id != sent[3].id || sent[4].msg.GetReactionMessage().GetText() != "🎉" {
+		t.Fatalf("the resent reaction was %v under %q", sent[4].msg, sent[4].id)
+	}
+}
+
+func TestTwoReactionsRacingWithOneTransactionSendOnce(t *testing.T) {
+	r, c := withAlice(t)
+	release := make(chan struct{})
+	c.with(func() { c.sendBlock = release })
+	errs := make(chan error, 8)
+	for range 8 {
+		go func() {
+			errs <- r.w.React(context.Background(), aliceJID.String(), "3EB0A0000000000000001", "👍", "txn-race")
+		}()
+	}
+	eventually(t, "one reaction to start", func() bool { return len(c.sentMessages()) >= 1 })
+	time.Sleep(30 * time.Millisecond)
+	close(release)
+	for range 8 {
+		if err := <-errs; err != nil {
+			t.Errorf("React: %v", err)
+		}
+	}
+	if n := len(c.sentMessages()); n != 1 {
+		t.Fatalf("one transaction sent %d reactions", n)
 	}
 }
 
@@ -777,6 +937,11 @@ func TestOnlyTheAllowedWritesExist(t *testing.T) {
 
 func TestLogoutForgetsTheLinkAndKeepsTheChats(t *testing.T) {
 	r, c := withAlice(t)
+	c.with(func() { c.files["/v/invented-kept"] = []byte("invented photo") })
+	r.send(msg(aliceJID, aliceJID, "3EB0A0000000000000009", base+9000, false, photoMsg("/v/invented-kept")))
+	if _, err := r.w.Media(context.Background(), aliceJID.String(), "3EB0A0000000000000009"); err != nil {
+		t.Fatal(err)
+	}
 	if err := r.w.Logout(context.Background()); err != nil {
 		t.Fatalf("Logout: %v", err)
 	}
@@ -789,8 +954,11 @@ func TestLogoutForgetsTheLinkAndKeepsTheChats(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(r.dir, "whatsapp", "linked")); !os.IsNotExist(err) {
 		t.Fatalf("the linked marker is still there (%v)", err)
 	}
-	if got := len(r.messages(aliceJID.String())); got != 1 {
-		t.Fatalf("the chat holds %d lines after Logout", got)
+	if got := len(r.messages(aliceJID.String())); got != 2 {
+		t.Fatalf("the chat holds %d lines after Logout, want both", got)
+	}
+	if _, err := os.Stat(filepath.Join(r.dir, "media")); !os.IsNotExist(err) {
+		t.Fatalf("his photos are still kept after Disconnect (%v)", err)
 	}
 	r.restart()
 	if s := r.w.Status(); s.State != network.NotConnected {
@@ -823,4 +991,72 @@ func TestASendWaitingWhenHeDisconnectsFails(t *testing.T) {
 	if c.writes() != 0 {
 		t.Fatalf("Disconnect after an unlink wrote to WhatsApp")
 	}
+}
+
+func TestALogoutWhoseLocalDeleteFailedIsStillALogout(t *testing.T) {
+	r, c := withAlice(t)
+	// WhatsApp agreed; whatsmeow then could not delete its own store.
+	c.with(func() { c.logoutErr = fmt.Errorf("error deleting data from store: %w", errCutOff) })
+	if err := r.w.Logout(context.Background()); err != nil {
+		t.Fatalf("Logout: %v, want it to count as done", err)
+	}
+	if s := r.w.Status(); s.State != network.NotConnected {
+		t.Fatalf("state %v", s.State)
+	}
+	if _, err := os.Stat(filepath.Join(r.dir, "whatsapp", "linked")); !os.IsNotExist(err) {
+		t.Fatalf("the linked marker is still there")
+	}
+	// The request itself failing changes nothing.
+	r2, c2 := withAlice(t)
+	c2.with(func() { c2.logoutErr = fmt.Errorf("error sending logout request: %w", whatsmeow.ErrIQTimedOut) })
+	if err := r2.w.Logout(context.Background()); err == nil {
+		t.Fatalf("a Logout WhatsApp never answered counted as done")
+	}
+	if s := r2.w.Status(); s.State != network.Live {
+		t.Fatalf("a failed Logout moved the state to %v", s.State)
+	}
+}
+
+func TestAReactionCutOffAcrossAReconnectGoesOnceMore(t *testing.T) {
+	r, c := withAlice(t)
+	release := make(chan struct{})
+	calls := 0
+	c.with(func() {
+		c.sendBlock = release
+		c.sendErr = &whatsmeow.DisconnectedError{Action: "message send"}
+		c.onSend = func(sentMessage) {
+			c.with(func() {
+				calls++
+				if calls > 1 {
+					c.sendBlock, c.sendErr = nil, nil
+				}
+			})
+		}
+	})
+	done := make(chan error, 1)
+	go func() {
+		done <- r.w.React(context.Background(), aliceJID.String(), "3EB0A0000000000000001", "👍", "txn-cut")
+	}()
+	eventually(t, "the reaction to start", func() bool { return len(c.sentMessages()) == 1 })
+	// The connection comes back while the reaction is still being tried:
+	// it is not sent a second time alongside.
+	c.reconnect()
+	time.Sleep(30 * time.Millisecond)
+	if n := len(c.sentMessages()); n != 1 {
+		t.Fatalf("%d sends while the first was still going", n)
+	}
+	close(release)
+	if err := <-done; kindOf(err) != wire.Unclear {
+		t.Fatalf("a reaction cut off gave %v, want unclear", err)
+	}
+	eventually(t, "the reaction to go once more", func() bool { return len(c.sentMessages()) == 2 })
+	time.Sleep(30 * time.Millisecond)
+	sent := c.sentMessages()
+	if len(sent) != 2 || sent[0].id != sent[1].id {
+		t.Fatalf("%d sends, want the same reaction once more", len(sent))
+	}
+	eventually(t, "his reaction to be stored", func() bool {
+		l := r.message(aliceJID.String(), "3EB0A0000000000000001")
+		return len(l.Reactions) == 1 && l.Reactions[0].FromMe
+	})
 }

@@ -340,3 +340,11 @@ func (w *WhatsApp) trimMedia(keep string) {
 		}
 	}
 }
+
+// forgetMedia deletes every kept file: on his Disconnect his photos do not
+// stay behind as plain files.
+func (w *WhatsApp) forgetMedia() {
+	w.mmu.Lock()
+	defer w.mmu.Unlock()
+	_ = os.RemoveAll(w.mediaDir())
+}

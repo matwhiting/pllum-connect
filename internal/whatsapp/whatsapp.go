@@ -17,6 +17,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.mau.fi/whatsmeow"
@@ -132,9 +133,12 @@ type WhatsApp struct {
 	cLast    time.Time
 	cPending bool
 
-	smu      sync.Mutex
-	queue    []sendJob     // sends waiting to go, in the order they were made
-	sendKick chan struct{} // wakes the sender
+	smu       sync.Mutex
+	queue     []sendJob       // sends waiting to go, in the order they were made
+	inflight  map[string]bool // sends being tried now
+	sendKick  chan struct{}   // wakes the sender
+	onlineGen atomic.Int64    // counts each time the state enters catchingUp or live
+	requeue   atomic.Bool     // every send still sending is due to go again
 
 	mediaCap int64 // the most the media folder holds, in bytes
 	mmu      sync.Mutex
@@ -162,6 +166,7 @@ func New(st *store.Store, dir string, key [32]byte, emit network.Emit) *WhatsApp
 		hChats:    map[string]bool{},
 		hFull:     map[string]bool{},
 		sendKick:  make(chan struct{}, 1),
+		inflight:  map[string]bool{},
 		mediaCap:  mediaCap,
 		mlocks:    map[string]*sync.Mutex{},
 		mretry:    map[string]chan *events.MediaRetry{},
@@ -253,7 +258,8 @@ func (w *WhatsApp) Start(ctx context.Context) error {
 	w.kickHistory()
 	// A send the last run made and never saw acknowledged goes again, under
 	// the same ID, once connected: WhatsApp keeps one message per ID.
-	w.resendAll()
+	w.requeue.Store(true)
+	w.kickSend()
 	return nil
 }
 
@@ -414,6 +420,11 @@ func (w *WhatsApp) setState(s network.State, kind wire.Kind) {
 		return
 	}
 	w.state, w.kind = s, kind
+	if s == network.CatchingUp || s == network.Live {
+		// Every send still sending goes again, under its own ID.
+		w.onlineGen.Add(1)
+		w.requeue.Store(true)
+	}
 	w.kickSend() // a send waiting for a connection may go now
 	ev := map[string]any{"event": "state", "state": s}
 	if kind != "" {

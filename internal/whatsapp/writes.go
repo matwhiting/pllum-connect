@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -94,8 +95,9 @@ type sendRequest struct {
 // sendJob is one send waiting for its turn.
 type sendJob struct {
 	id       string
+	madeMs   int64
 	deadline time.Time // zero: it waits for a connection however long it takes
-	resend   bool      // made in an earlier run and never acknowledged
+	resend   bool      // tried before (or in an earlier run) and never acknowledged
 }
 
 // writeGate is nil when writes can go now; offline when he is signed in but
@@ -130,9 +132,20 @@ func (w *WhatsApp) writableChat(chatID string) (string, types.JID, error) {
 	return held, norm(jid), nil
 }
 
-// unclearSend reports whether a write failed in a way that leaves it unknown
-// whether WhatsApp has it: no answer in time, the connection cut off while
-// waiting, or the helper stopping.
+// serverRefused reports whether WhatsApp's server itself turned a message
+// down: it answered the send with an error, or said the recipient is not on
+// WhatsApp. Only these make a send failed and refused; every other failure
+// (the socket, a timeout, an upload, the helper stopping) may have left the
+// message with WhatsApp or never let it go, and the send goes again under
+// its own ID on the next connection.
+func serverRefused(err error) bool {
+	return errors.Is(err, whatsmeow.ErrServerReturnedError) || errors.Is(err, whatsmeow.ErrRecipientNotOnWhatsApp)
+}
+
+// unclearSend reports whether a write that is not a send (a receipt, an app
+// state patch, unlinking) failed in a way that leaves it unknown whether
+// WhatsApp has it: no answer in time, the connection cut off while waiting,
+// or the helper stopping.
 func unclearSend(err error) bool {
 	if errors.Is(err, whatsmeow.ErrMessageTimedOut) || errors.Is(err, whatsmeow.ErrIQTimedOut) ||
 		errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
@@ -191,7 +204,7 @@ func (w *WhatsApp) Send(ctx context.Context, m network.Outgoing) (string, error)
 		MadeMs: now.UnixMilli(), Request: body}); err != nil {
 		return "", err
 	}
-	w.enqueue(sendJob{id: id, deadline: now.Add(sendWait)})
+	w.enqueue(sendJob{id: id, madeMs: now.UnixMilli(), deadline: now.Add(sendWait)})
 	return id, nil
 }
 
@@ -253,15 +266,35 @@ func (w *WhatsApp) kickSend() {
 	}
 }
 
-// resendAll puts every send still sending in line again, oldest first.
-func (w *WhatsApp) resendAll() {
+// requeueSending puts every send still sending back in line, oldest first,
+// except those already in line or being tried now. It runs at start and
+// each time the state enters catchingUp or live.
+func (w *WhatsApp) requeueSending() {
 	rows, err := w.st.OutgoingSending(Name)
 	if err != nil {
-		return // the next start tries again
+		w.requeue.Store(true) // tried again on the next wake-up
+		return
 	}
+	w.smu.Lock()
+	defer w.smu.Unlock()
 	for _, o := range rows {
-		w.enqueue(sendJob{id: o.ID, resend: true})
+		w.queueAgain(o)
 	}
+}
+
+// queueAgain puts a send back in line, in made order, unless it is already
+// in line or being tried; w.smu is held.
+func (w *WhatsApp) queueAgain(o store.Outgoing) {
+	if w.inflight[o.ID] {
+		return
+	}
+	for _, j := range w.queue {
+		if j.id == o.ID {
+			return
+		}
+	}
+	w.queue = append(w.queue, sendJob{id: o.ID, madeMs: o.MadeMs, resend: true})
+	sort.SliceStable(w.queue, func(a, b int) bool { return w.queue[a].madeMs < w.queue[b].madeMs })
 }
 
 // sendLoop sends one waiting send at a time, in order, while connected, and
@@ -275,6 +308,9 @@ func (w *WhatsApp) sendLoop(ctx context.Context) {
 		}
 	}()
 	for ctx.Err() == nil {
+		if w.requeue.Swap(false) {
+			w.requeueSending()
+		}
 		if j, ok := w.nextJob(); ok {
 			w.deliver(ctx, j)
 			continue
@@ -310,7 +346,7 @@ func (w *WhatsApp) nextJob() (sendJob, bool) {
 }
 
 // expire fails each waiting send whose minute is up, and gives the moment
-// the next one's is (zero for none).
+// the next one's is (zero for none). Only a send never tried has a minute.
 func (w *WhatsApp) expire() time.Time {
 	now := w.clock.Now()
 	var next time.Time
@@ -349,22 +385,54 @@ func (w *WhatsApp) deliver(ctx context.Context, j sendJob) {
 	if err != nil || !ok || o.State != store.OutSending {
 		return
 	}
-	_ = w.sendOut(ctx, o, j.resend)
+	_ = w.attempt(ctx, o, j.resend)
+}
+
+// attempt tries one send, never two of the same at once. A send left
+// sending waits for the next time the state enters catchingUp or live; if
+// that happened while this try ran (its requeue skipped the send being
+// tried), it goes back in line now.
+func (w *WhatsApp) attempt(ctx context.Context, o store.Outgoing, resend bool) error {
+	w.smu.Lock()
+	if w.inflight[o.ID] {
+		w.smu.Unlock()
+		return errUnclear
+	}
+	w.inflight[o.ID] = true
+	w.smu.Unlock()
+	gen := w.onlineGen.Load()
+	err := w.sendOut(ctx, o, resend)
+	w.smu.Lock()
+	delete(w.inflight, o.ID)
+	w.smu.Unlock()
+	if ctx.Err() == nil && w.onlineGen.Load() != gen {
+		if cur, ok, rerr := w.st.Outgoing(Name, o.ID); rerr == nil && ok && cur.State == store.OutSending {
+			w.smu.Lock()
+			w.queueAgain(cur)
+			w.smu.Unlock()
+			w.kickSend()
+		}
+	}
+	return err
 }
 
 // sendOut sends one outbox row under its own ID and settles it:
 //   - acknowledged: the line (or reaction) is stored, then the row is sent;
-//   - failed before WhatsApp answered: failed, refused (safe to retry). For
-//     a row an earlier run may already have sent (resend, and its message
-//     built), unclear instead;
-//   - no answer in time, or cut off: it stays sending, and the next start
-//     sends it again under the same ID.
+//   - WhatsApp's server turned it down (serverRefused): failed, refused. For
+//     a row that may already have gone on an earlier try (resend, and its
+//     message built), unclear instead;
+//   - its file is gone or has grown past the limit before it was ever sent:
+//     failed with notFound or tooLarge (nothing went, and it never can);
+//   - anything else (no client, an upload, the socket, a timeout, the
+//     helper stopping, a store write): it stays sending, and goes again
+//     under the same ID the next time the state enters catchingUp or live,
+//     or at the next start.
 //
 // The built message is kept before it is sent, so a resend sends exactly it.
 func (w *WhatsApp) sendOut(ctx context.Context, o store.Outgoing, resend bool) error {
 	cli := w.client()
 	if cli == nil {
-		return errNotConnected
+		return errUnclear
 	}
 	mayHaveGone := resend && len(o.Message) > 0
 	var req sendRequest
@@ -387,15 +455,11 @@ func (w *WhatsApp) sendOut(ctx context.Context, o store.Outgoing, resend bool) e
 		}
 	} else {
 		if m, file, err = w.build(ctx, cli, o.ChatID, req); err != nil {
-			if ctx.Err() != nil {
-				return errUnclear // stopped before sending: the next start builds it again
+			if err == errNotFound || err == errTooLarge {
+				w.fail(o.ID, wire.KindOf(err))
+				return err
 			}
-			kind := wire.KindOf(err)
-			if kind == wire.Internal {
-				kind = wire.Refused
-			}
-			w.fail(o.ID, kind)
-			return &wire.Error{Kind: kind}
+			return errUnclear // nothing sent; built (and uploaded) again next time
 		}
 		b, err := proto.Marshal(m)
 		if err != nil {
@@ -403,13 +467,13 @@ func (w *WhatsApp) sendOut(ctx context.Context, o store.Outgoing, resend bool) e
 			return errInternal
 		}
 		if err := w.st.SetOutgoingMessage(Name, o.ID, b); err != nil {
-			return err // nothing sent; it stays sending
+			return errUnclear // nothing sent
 		}
 	}
 
 	resp, err := cli.SendMessage(ctx, jid, m, whatsmeow.SendRequestExtra{ID: o.ID})
 	if err != nil {
-		if unclearSend(err) {
+		if !serverRefused(err) {
 			return errUnclear
 		}
 		kind := wire.Refused
@@ -431,10 +495,10 @@ func (w *WhatsApp) sendOut(ctx context.Context, o store.Outgoing, resend bool) e
 		_, err = w.st.PutMessage(Name, w.sentLine(o, req, m, ts))
 	}
 	if err != nil {
-		return err // sent, not stored: it stays sending, and the resend is kept once
+		return errUnclear // sent, not stored: it stays sending, and the resend is kept once
 	}
 	if err := w.st.SetOutgoingState(Name, o.ID, store.OutSent, ""); err != nil {
-		return err
+		return errUnclear
 	}
 	if file != nil && req.Kind == "photo" {
 		w.keepMedia(o.ChatID, o.ID, file)
@@ -470,7 +534,7 @@ func (w *WhatsApp) build(ctx context.Context, cli waClient, chat string, req sen
 	}
 	up, err := cli.Upload(ctx, data, kind)
 	if err != nil {
-		return nil, nil, writeErr(err)
+		return nil, nil, errUnclear
 	}
 	var caption *string
 	if req.Text != "" {
@@ -616,7 +680,7 @@ func (w *WhatsApp) React(ctx context.Context, chatID, messageID, emoji, transact
 		if err := w.st.SetOutgoingState(Name, prev.ID, store.OutSending, ""); err != nil {
 			return err
 		}
-		return w.sendOut(w.bg(), prev, false)
+		return w.attempt(w.bg(), prev, false)
 	}
 	cli := w.client()
 	if cli == nil {
@@ -639,9 +703,12 @@ func (w *WhatsApp) React(ctx context.Context, chatID, messageID, emoji, transact
 	o := store.Outgoing{ID: cli.GenerateMessageID(), ChatID: chat, Kind: outReaction, Txn: transactionID,
 		MadeMs: w.clock.Now().UnixMilli(), Request: req, Message: msg}
 	if err := w.st.PutOutgoing(Name, o); err != nil {
+		if _, raced, _ := w.st.OutgoingTxn(Name, transactionID); raced {
+			return nil // another call with this transaction kept it first, and sends it
+		}
 		return err
 	}
-	return w.sendOut(w.bg(), o, false)
+	return w.attempt(w.bg(), o, false)
 }
 
 // MarkRead sends read receipts for the chat's unread lines up to and
@@ -779,9 +846,12 @@ func (w *WhatsApp) SetMuted(ctx context.Context, chatID string, muted bool) erro
 
 // Logout is his Disconnect: WhatsApp is told to unlink Pllum (whatsmeow then
 // deletes the device), the linked marker goes so a restart shows Not
-// connected rather than Reconnect needed, and every send still waiting
-// fails. The chats stay in the store. Linked but offline, nothing changes
-// and the answer is offline: WhatsApp would still list Pllum.
+// connected rather than Reconnect needed, his kept photos (plain files in
+// connect/media) are deleted, and every send still waiting fails. The chats
+// stay in the store. Linked but offline, nothing changes and the answer is
+// offline: WhatsApp would still list Pllum. Once WhatsApp has agreed, a
+// failure to delete whatsmeow's own copy of the device still counts as
+// logged out.
 func (w *WhatsApp) Logout(ctx context.Context) error {
 	w.CancelLogin()
 	w.mu.Lock()
@@ -800,7 +870,10 @@ func (w *WhatsApp) Logout(ctx context.Context) error {
 			return errOffline
 		}
 		if err := cli.Logout(w.bg()); err != nil {
-			return writeErr(err)
+			if !unlinkedAnyway(err) {
+				return writeErr(err)
+			}
+			_ = dev.Delete(context.WithoutCancel(w.bg())) // once more; Start copes if it stays
 		}
 	} else if linked {
 		// WhatsApp already unlinked it: forget it here too.
@@ -823,7 +896,16 @@ func (w *WhatsApp) Logout(ctx context.Context) error {
 		cli.Disconnect()
 	}
 	w.failWaiting()
+	w.forgetMedia()
 	return nil
+}
+
+// unlinkedAnyway reports whether whatsmeow's Logout failed only after
+// WhatsApp agreed to unlink, deleting its own store (client.go, Logout: the
+// request's failure is "error sending logout request", this one "error
+// deleting data from store").
+func unlinkedAnyway(err error) bool {
+	return strings.HasPrefix(err.Error(), "error deleting data from store")
 }
 
 // failWaiting fails every send still sending: notConnected for one never

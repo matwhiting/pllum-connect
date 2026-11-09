@@ -89,6 +89,8 @@ type fakeClient struct {
 	retries     []string          // media retry receipts: message IDs
 	onRetry     func(info *types.MessageInfo, mediaKey []byte)
 	logouts     int
+	uploadErr   error // when set, Upload fails with it
+	logoutErr   error // when set, Logout fails with it (after deleting, for whatsmeow's store-delete failure)
 }
 
 type sentMessage struct {
@@ -167,6 +169,9 @@ func (f *fakeClient) SendMessage(ctx context.Context, to types.JID, m *waE2E.Mes
 func (f *fakeClient) Upload(ctx context.Context, data []byte, kind whatsmeow.MediaType) (whatsmeow.UploadResponse, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.uploadErr != nil {
+		return whatsmeow.UploadResponse{}, f.uploadErr
+	}
 	f.uploads = append(f.uploads, upload{data: data, kind: kind})
 	n := len(f.uploads)
 	return whatsmeow.UploadResponse{
@@ -218,7 +223,11 @@ func (f *fakeClient) Logout(ctx context.Context) error {
 	f.mu.Lock()
 	f.logouts++
 	f.connected = false
+	err := f.logoutErr
 	f.mu.Unlock()
+	if err != nil {
+		return err
+	}
 	return f.dev.Delete(ctx)
 }
 
