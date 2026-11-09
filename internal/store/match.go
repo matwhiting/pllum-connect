@@ -178,7 +178,7 @@ func beeperLineLike(tx *sql.Tx, network string, m Message) (rid int64, oldID str
 		return 0, "", nil
 	}
 	rows, err := tx.Query(`SELECT `+candidateColumns+` FROM messages
-			WHERE network = ? AND chat_id = ? AND source = 'beeper' AND from_me = ?
+			WHERE network = ? AND chat_id = ? AND source = 'beeper' AND msg_id LIKE 'beeper:%' AND from_me = ?
 			AND ts_ms BETWEEN ? AND ? AND `+fuzzable,
 		network, m.ChatID, m.FromMe, m.TimeMs-matchWindowMs, m.TimeMs+matchWindowMs)
 	if err != nil {

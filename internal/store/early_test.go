@@ -154,6 +154,10 @@ func TestABeeperCopyFillsAnEarlyRow(t *testing.T) {
 	if got := lineIDs(t, s, []string{"bm-f1", "bm-f2"}); !maps.Equal(got, want) {
 		t.Fatalf("LineIDs = %v, want %v", got, want)
 	}
+	// counts agrees with the import: both filled rows are matched lines.
+	if n, err := s.Counts(net); err != nil || n.Matched != 2 || n.Imported != 2 || n.Messages != 3 {
+		t.Fatalf("Counts = %+v, %v", n, err)
+	}
 	// Copying again adds nothing; the original arriving after all sets its own time.
 	if r := importOne(t, s, ImportBatch{BeeperChatID: "bc-1", ChatID: phoneChat, Chat: ImportChat{Kind: "single"},
 		Messages: []ImportMessage{a, b}}); r != (ImportResult{Skipped: 2}) {
