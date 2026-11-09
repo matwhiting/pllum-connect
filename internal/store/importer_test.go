@@ -538,3 +538,127 @@ func TestAnEmptyOrDeletedLineIsNeverMatchedByContent(t *testing.T) {
 		t.Fatalf("the captionless photo = %+v, want matched", r)
 	}
 }
+
+func TestARevokeBeforeItsLineStillDeletesIt(t *testing.T) {
+	s := openTest(t)
+	put(t, s, text(phoneChat, "3EB0V0000", base-1000, "earlier"))
+	// The revoke comes live; the line itself is still in pending history.
+	added, err := s.PutMessage(net, Message{ID: "3EB0V0001", ChatID: phoneChat, Deleted: true})
+	if err != nil || !added {
+		t.Fatalf("the revoke: added %v, %v; want a tombstone kept", added, err)
+	}
+	if c := chatOf(t, s, phoneChat); c.HistoryFromMs != base-1000 || c.LastMessageID != "3EB0V0000" {
+		t.Fatalf("the tombstone moved the chat: %+v", c)
+	}
+	if put(t, s, text(phoneChat, "3EB0V0001", base, "regret this")) {
+		t.Fatalf("the line was added beside its tombstone")
+	}
+	got := all(t, s, phoneChat)
+	if len(got) != 2 || got[1].ID != "3EB0V0001" || !got[1].Deleted || got[1].Text != "" || got[1].TimeMs != base {
+		t.Fatalf("the line that arrived after its revoke is %+v", got[len(got)-1])
+	}
+	if c := chatOf(t, s, phoneChat); c.LastMessageID != "3EB0V0000" {
+		t.Fatalf("lastMessageID = %q, want the line before the deleted one", c.LastMessageID)
+	}
+}
+
+func TestAKindlessHiddenPlaceholderIsKeptUntilItDecrypts(t *testing.T) {
+	s := openTest(t)
+	added, err := s.PutMessage(net, Message{ID: "3EB0P0001", ChatID: phoneChat, TimeMs: base, Hidden: ptr(true)})
+	if err != nil || !added {
+		t.Fatalf("the placeholder: added %v, %v", added, err)
+	}
+	got := all(t, s, phoneChat)
+	if len(got) != 1 || !*got[0].Hidden || got[0].Kind != "text" {
+		t.Fatalf("the placeholder is %+v", got)
+	}
+	decrypted := text(phoneChat, "3EB0P0001", base, "now readable")
+	decrypted.Hidden = ptr(false)
+	put(t, s, decrypted)
+	if c := chatOf(t, s, phoneChat); c.LastMessageID != "3EB0P0001" {
+		t.Fatalf("the decrypted line does not show: %+v", c)
+	}
+}
+
+func TestAnEditKeepsTheLinesTimeAndSide(t *testing.T) {
+	s := openTest(t)
+	in := beeperMsg("bm-e", base, "typo")
+	in.FromMe = true
+	in.NetworkID = "3EB0E0001"
+	importOne(t, s, ImportBatch{BeeperChatID: "bc-1", ChatID: phoneChat, Chat: ImportChat{Kind: "single"},
+		Messages: []ImportMessage{in}})
+
+	// An edit of a line held only in Beeper's copy changes its text alone.
+	if added, err := s.PutMessage(net, Message{ID: "3EB0E0001", ChatID: phoneChat, TimeMs: base + 3_600_000,
+		Text: "fixed", Edited: true}); err != nil || added {
+		t.Fatalf("the edit: added %v, %v", added, err)
+	}
+	got := all(t, s, phoneChat)
+	if len(got) != 1 || got[0].TimeMs != base || !got[0].FromMe || got[0].Text != "fixed" || !got[0].Edited {
+		t.Fatalf("after the edit the line is %+v", got[0])
+	}
+	// The original, when history brings it, takes the line over and keeps the edit.
+	orig := mine(phoneChat, "3EB0E0001", base+200, "typo")
+	orig.Source = SourceSync
+	if put(t, s, orig) {
+		t.Fatalf("the original was added beside its edited copy")
+	}
+	got = all(t, s, phoneChat)
+	if len(got) != 1 || got[0].ID != "3EB0E0001" || got[0].Text != "fixed" || !got[0].Edited || got[0].TimeMs != base+200 {
+		t.Fatalf("after the original the line is %+v", got[0])
+	}
+
+	// An edit of a line never held is kept with its own time; the original,
+	// arriving later under the same ID, is the same line and keeps the edit.
+	if added, err := s.PutMessage(net, Message{ID: "3EB0E0002", ChatID: phoneChat, TimeMs: base + 7_200_000,
+		Text: "second, fixed", Edited: true}); err != nil || !added {
+		t.Fatalf("the early edit: added %v, %v", added, err)
+	}
+	if put(t, s, text(phoneChat, "3EB0E0002", base+1000, "second, typo")) {
+		t.Fatalf("the original duplicated its early edit")
+	}
+	got = all(t, s, phoneChat)
+	if len(got) != 2 || got[1].ID != "3EB0E0002" || got[1].Text != "second, fixed" || got[1].TimeMs != base+1000 {
+		t.Fatalf("after the late original: %+v", got)
+	}
+	// An edit of a line already held directly keeps its time too.
+	if _, err := s.PutMessage(net, Message{ID: "3EB0E0002", ChatID: phoneChat, TimeMs: base + 9_000_000,
+		Text: "second, fixed again", Edited: true}); err != nil {
+		t.Fatal(err)
+	}
+	if got := all(t, s, phoneChat); got[1].TimeMs != base+1000 || got[1].Text != "second, fixed again" {
+		t.Fatalf("a second edit moved the line: %+v", got[1])
+	}
+}
+
+func TestACaptionlessMediaLineMatchesByItsKind(t *testing.T) {
+	s := openTest(t)
+	// The direct photo has its media; Beeper's copy names only the kind.
+	photo := text(phoneChat, "3EB0C0001", base, "")
+	photo.Kind, photo.Media = "photo", []Media{{Kind: "photo", HasFile: true}}
+	put(t, s, photo)
+	in := beeperMsg("bm-p1", base+400, "")
+	in.Kind = "photo"
+	if r := importOne(t, s, ImportBatch{BeeperChatID: "bc-1", ChatID: phoneChat, Chat: ImportChat{Kind: "single"},
+		Messages: []ImportMessage{in}}); r != (ImportResult{Matched: 1}) {
+		t.Fatalf("a photo without media entries = %+v, want matched", r)
+	}
+
+	// The other way: Beeper's copy first, then a direct video naming only its kind.
+	vid := beeperMsg("bm-v1", base+60_000, "")
+	vid.Kind, vid.Media = "video", []ImportMedia{{Kind: "video"}}
+	importOne(t, s, ImportBatch{BeeperChatID: "bc-1", ChatID: phoneChat, Chat: ImportChat{Kind: "single"},
+		Messages: []ImportMessage{vid}})
+	direct := text(phoneChat, "3EB0C0002", base+60_300, "")
+	direct.Kind, direct.SenderID = "video", "beeper-sender"
+	if put(t, s, direct) {
+		t.Fatalf("a video without media entries was added beside its Beeper copy")
+	}
+	if got := ids(all(t, s, phoneChat)); !slices.Equal(got, []string{"3EB0C0001", "3EB0C0002"}) {
+		t.Fatalf("the chat holds %v", got)
+	}
+	// A media kind with no media entries still shows.
+	if c := chatOf(t, s, phoneChat); c.LastMessageID != "3EB0C0002" {
+		t.Fatalf("lastMessageID = %q", c.LastMessageID)
+	}
+}

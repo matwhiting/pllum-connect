@@ -185,7 +185,7 @@ func importLine(tx *sql.Tx, network, chat, beeperChatID string, m ImportMessage)
 	rid, err := matchBeeperCopy(tx, network, chat, beeperCopy{
 		beeperChatIDs: []string{beeperChatID}, networkID: m.NetworkID, fromMe: m.FromMe,
 		timeMs: m.TimeMs, text: m.Text, mediaKind: importMediaKind(m),
-		hasMedia: len(m.Media) > 0, deleted: m.Deleted,
+		deleted: m.Deleted,
 	})
 	if err != nil {
 		return skipped, err
@@ -407,7 +407,7 @@ func (s *Store) Counts(network string) (Counts, error) {
 			(SELECT count(*) FROM messages WHERE network = ?1),
 			(SELECT count(*) FROM messages WHERE network = ?1 AND beeper_id IS NOT NULL),
 			(SELECT count(*) FROM messages WHERE network = ?1 AND beeper_id IS NOT NULL AND source <> 'beeper'),
-			(SELECT MIN(ts_ms) FROM messages WHERE network = ?1)`, network).
+			(SELECT MIN(ts_ms) FROM messages WHERE network = ?1 AND ts_ms > 0)`, network).
 		Scan(&c.Chats, &c.UnplacedChats, &c.Messages, &c.Imported, &c.Matched, &oldest)
 	if err != nil {
 		return Counts{}, dbErr(err)

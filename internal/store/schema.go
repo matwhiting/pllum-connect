@@ -167,6 +167,14 @@ var upgrades = []string{
 		WHERE m.beeper_id IS NOT NULL`,
 }
 
+// hasBody is the SQL test for a line holding text or media: media entries,
+// or a media kind alone (Beeper may name a photo without its details).
+const hasBody = `(COALESCE(text, '') <> '' OR media_json IS NOT NULL
+	OR kind IN ('photo', 'video', 'voiceNote', 'sticker', 'file'))`
+
+// mediaKinds are the kinds of line that are media.
+var mediaKinds = map[string]bool{"photo": true, "video": true, "voiceNote": true, "sticker": true, "file": true}
+
 // visible is the SQL test for a line that shows: not hidden, not deleted, and
-// holding text or media.
-const visible = `hidden = 0 AND deleted = 0 AND (COALESCE(text, '') <> '' OR media_json IS NOT NULL)`
+// with a body.
+const visible = `hidden = 0 AND deleted = 0 AND ` + hasBody

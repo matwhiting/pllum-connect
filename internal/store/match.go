@@ -139,9 +139,15 @@ func nearestMatch(rows *sql.Rows, ts int64, text, mediaKind string, direct bool)
 }
 
 // fuzzable is the SQL test for a stored line content may match: not deleted,
-// and holding text or media. An empty or deleted line says nothing about
-// which message it was, so only an ID can match it.
-const fuzzable = `deleted = 0 AND (COALESCE(text, '') <> '' OR media_json IS NOT NULL)`
+// and with a body (text, media, or a media kind). An empty or deleted line
+// says nothing about which message it was, so only an ID can match it.
+const fuzzable = `deleted = 0 AND ` + hasBody
+
+// matchable reports the same of an incoming copy, given its media kind
+// (mediaKindOf, which falls back to the line's own kind).
+func matchable(text, mediaKind string, deleted bool) bool {
+	return !deleted && (text != "" || mediaKinds[mediaKind])
+}
 
 // beeperLineNaming finds the line held only in Beeper's copy whose network
 // ID Beeper named as m's ID. rid is 0 when none.
@@ -156,14 +162,18 @@ func beeperLineNaming(tx *sql.Tx, network string, m Message) (rid int64, oldID s
 }
 
 // beeperLineFor finds the line held only in Beeper's copy that a direct line
-// m is: the one naming m's ID (beeperLineNaming), else, when m has text or
-// media and is not deleted, one on the same side within the time window with
-// the same content. rid is 0 when none.
+// m is: the one naming m's ID (beeperLineNaming), else beeperLineLike.
 func beeperLineFor(tx *sql.Tx, network string, m Message) (rid int64, oldID string, err error) {
 	if rid, oldID, err = beeperLineNaming(tx, network, m); err != nil || rid != 0 {
 		return rid, oldID, err
 	}
-	if m.Deleted || (m.Text == "" && len(m.Media) == 0) {
+	return beeperLineLike(tx, network, m)
+}
+
+// beeperLineLike finds, when m is matchable, the Beeper line on the same side
+// within the time window with the same content. rid is 0 when none.
+func beeperLineLike(tx *sql.Tx, network string, m Message) (rid int64, oldID string, err error) {
+	if !matchable(m.Text, mediaKindOf(m.Kind, m.Media), m.Deleted) {
 		return 0, "", nil
 	}
 	rows, err := tx.Query(`SELECT `+candidateColumns+` FROM messages
@@ -184,7 +194,6 @@ type beeperCopy struct {
 	timeMs        int64
 	text          string
 	mediaKind     string
-	hasMedia      bool
 	deleted       bool
 }
 
@@ -208,7 +217,7 @@ func matchBeeperCopy(tx *sql.Tx, network, chat string, c beeperCopy) (rid int64,
 			return 0, err
 		}
 	}
-	if c.deleted || (c.text == "" && !c.hasMedia) {
+	if !matchable(c.text, c.mediaKind, c.deleted) {
 		return 0, nil
 	}
 	args := []any{network, chat, c.fromMe, c.timeMs - matchWindowMs, c.timeMs + matchWindowMs}
