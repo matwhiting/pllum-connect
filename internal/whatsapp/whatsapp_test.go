@@ -82,6 +82,7 @@ func TestAHistoryNotificationIsKeptBeforeTheAckAndProcessedAfterARestart(t *test
 
 	r.onMake = func(fc *fakeClient) { fc.history["/v/t62.invented-1"] = hs }
 	r.restart()
+	r.send(&events.Connected{})
 	eventually(t, "the leftover notification to be processed", func() bool {
 		_, _, ok, _ := r.st.NextPendingHistory("whatsapp")
 		return !ok
@@ -100,6 +101,7 @@ func TestAHistoryNotificationIsKeptBeforeTheAckAndProcessedAfterARestart(t *test
 	}
 
 	r.restart()
+	r.send(&events.Connected{})
 	time.Sleep(50 * time.Millisecond)
 	if _, _, downloads := r.client().counts(); downloads != 0 {
 		t.Fatalf("a second restart downloaded %d times, want none", downloads)
@@ -706,23 +708,53 @@ func TestAnUnlinkKeepsTheMessagesAndANewLinkContinuesTheSameChats(t *testing.T) 
 	}
 }
 
-func TestALIDChatAndAPhoneChatFoundToBeOneBecomeThePhoneChat(t *testing.T) {
-	r := newRig(t, true)
-	r.live()
-	r.send(textFrom(aliceJID, aliceJID, "3EB0G1000000000000001", base+1000, "an invented by number"))
-	r.send(textFrom(aliceLID, aliceLID, "3EB0G1000000000000002", base+2000, "an invented by LID"))
-	if got := r.chatIDs(); len(got) != 2 {
-		t.Fatalf("before the mapping the chats are %v, want two", got)
-	}
-	if err := r.w.device().LIDs.PutLIDMapping(context.Background(), aliceLID, aliceJID); err != nil {
-		t.Fatal(err)
-	}
-	r.send(textFrom(aliceLID, aliceLID, "3EB0G1000000000000003", base+3000, "an invented by LID again"))
-	if got := r.chatIDs(); !reflect.DeepEqual(got, []string{aliceJID.String()}) {
-		t.Fatalf("after the mapping the chats are %v, want the phone chat", got)
-	}
-	if n := len(r.messages(aliceLID.String())); n != 3 {
-		t.Fatalf("the merged chat holds %d lines, want 3", n)
+func TestTwoChatsFoundToBeOneKeepTheIDGivenFirst(t *testing.T) {
+	for _, c := range []struct {
+		name         string
+		first, later types.JID
+	}{
+		{"LID first", aliceLID, aliceJID},
+		{"number first", aliceJID, aliceLID},
+	} {
+		for _, path := range []string{"live", "history"} {
+			t.Run(c.name+", "+path, func(t *testing.T) {
+				r := newRig(t, true)
+				fc := r.live()
+				r.send(textFrom(c.first, c.first, "3EB0G1000000000000001", base+5000, "an invented first chat"))
+				r.send(textFrom(c.later, c.later, "3EB0G1000000000000002", base+1000, "an invented later chat"))
+				if got := r.chatIDs(); len(got) != 2 {
+					t.Fatalf("before the mapping the chats are %v, want two", got)
+				}
+				switch path {
+				case "live":
+					if err := r.w.device().LIDs.PutLIDMapping(context.Background(), aliceLID, aliceJID); err != nil {
+						t.Fatal(err)
+					}
+					r.send(textFrom(c.later, c.later, "3EB0G1000000000000003", base+3000, "an invented once known"))
+				case "history":
+					fc.history["/v/map"] = &waHistorySync.HistorySync{
+						SyncType: waHistorySync.HistorySync_INITIAL_BOOTSTRAP.Enum(),
+						PhoneNumberToLidMappings: []*waHistorySync.PhoneNumberToLIDMapping{{
+							PnJID: proto.String(aliceJID.String()), LidJID: proto.String(aliceLID.String()),
+						}},
+						Conversations: []*waHistorySync.Conversation{{ID: proto.String(c.later.String()), Messages: []*waHistorySync.HistorySyncMsg{
+							webMsg(c.later, c.later, "3EB0G1000000000000003", base+3000, false, &waE2E.Message{Conversation: proto.String("an invented once known")}),
+						}}},
+					}
+					r.send(historyNotif("3EB0N1000000000000077", "/v/map", base+9000))
+					eventually(t, "the history", func() bool {
+						_, _, ok, _ := r.st.NextPendingHistory("whatsapp")
+						return !ok
+					})
+				}
+				if got := r.chatIDs(); !reflect.DeepEqual(got, []string{c.first.String()}) {
+					t.Fatalf("after the mapping the chats are %v, want the first-made %s", got, c.first)
+				}
+				if n := len(r.messages(c.later.String())); n != 3 {
+					t.Fatalf("the merged chat holds %d lines, want 3", n)
+				}
+			})
+		}
 	}
 }
 
@@ -746,12 +778,13 @@ func TestDevicePropsAskFor730DaysAsPllum(t *testing.T) {
 	r.start()
 	cli := newWhatsmeowClient(r.w.device())
 	if !cli.SynchronousAck || !cli.ManualHistorySyncDownload || !cli.EmitAppStateEventsOnFullSync ||
-		!cli.AutomaticMessageRerequestFromPhone || !cli.EnableAutoReconnect {
+		!cli.AutomaticMessageRerequestFromPhone || !cli.EnableAutoReconnect || !cli.DisableManualHistorySyncReceipt {
 		t.Errorf("the client is set up as %+v", map[string]bool{
 			"SynchronousAck": cli.SynchronousAck, "ManualHistorySyncDownload": cli.ManualHistorySyncDownload,
 			"EmitAppStateEventsOnFullSync":       cli.EmitAppStateEventsOnFullSync,
 			"AutomaticMessageRerequestFromPhone": cli.AutomaticMessageRerequestFromPhone,
 			"EnableAutoReconnect":                cli.EnableAutoReconnect,
+			"DisableManualHistorySyncReceipt":    cli.DisableManualHistorySyncReceipt,
 		})
 	}
 }
@@ -1057,5 +1090,179 @@ func TestAMessageArrivingAsTheAdapterStopsIsNotAcked(t *testing.T) {
 	r.w.Stop()
 	if c.dispatch(textFrom(aliceJID, aliceJID, "3EB0Q3000000000000001", base+1000, "an invented late line")) {
 		t.Fatalf("a line that arrived after Stop was reported handled, so whatsmeow would ack it unstored")
+	}
+}
+
+// retrying reports whether the history worker has a retry due.
+func retrying(r *rig) bool {
+	r.w.mu.Lock()
+	defer r.w.mu.Unlock()
+	return r.w.retrying
+}
+
+func TestAHistoryDownloadThatCannotConnectIsKeptForLater(t *testing.T) {
+	r := newRig(t, true)
+	fc := r.live()
+	fc.history["/v/later"] = &waHistorySync.HistorySync{
+		SyncType: waHistorySync.HistorySync_INITIAL_BOOTSTRAP.Enum(),
+		Conversations: []*waHistorySync.Conversation{{ID: proto.String(aliceJID.String()), Messages: []*waHistorySync.HistorySyncMsg{
+			webMsg(aliceJID, aliceJID, "3EB0K2000000000000001", base+1000, false, &waE2E.Message{Conversation: proto.String("an invented kept line")}),
+		}}},
+	}
+	fc.setDownloadErr(whatsmeow.ErrNotConnected)
+	r.send(historyNotif("3EB0N1000000000000081", "/v/later", base+9000))
+	tries := historyTries + 3
+	for try := 1; try <= tries; try++ {
+		eventually(t, "a download try", func() bool { _, _, d := fc.counts(); return d >= try })
+		eventually(t, "a retry to be due", func() bool { return retrying(r) })
+		r.clock.Advance(historyRetry)
+	}
+	eventually(t, "the last try", func() bool { _, _, d := fc.counts(); return d > tries })
+	eventually(t, "its retry to be due", func() bool { return retrying(r) })
+	if _, _, ok, _ := r.st.NextPendingHistory("whatsapp"); !ok {
+		t.Fatalf("a notification that could not connect was dropped after %d tries", tries+1)
+	}
+
+	// While offline the worker does not try at all.
+	r.send(&events.Disconnected{})
+	_, _, before := fc.counts()
+	r.clock.Advance(historyRetry)
+	time.Sleep(30 * time.Millisecond)
+	if _, _, after := fc.counts(); after != before {
+		t.Fatalf("the worker downloaded %d times while offline", after-before)
+	}
+
+	// Connected again, it goes through.
+	fc.setDownloadErr(nil)
+	r.send(&events.Connected{})
+	eventually(t, "the history to land", func() bool {
+		_, _, ok, _ := r.st.NextPendingHistory("whatsapp")
+		return !ok
+	})
+	if n := len(r.messages(aliceJID.String())); n != 1 {
+		t.Fatalf("the chat holds %d lines, want 1", n)
+	}
+}
+
+func TestABrokenHistoryBlobIsDroppedAfterThreeTries(t *testing.T) {
+	r := newRig(t, true)
+	fc := r.live()
+	fc.setDownloadErr(errCutOff) // not a connection problem: the blob itself is bad
+	r.send(historyNotif("3EB0N1000000000000082", "/v/broken", base+9000))
+	for try := 1; try < historyTries; try++ {
+		eventually(t, "a download try", func() bool { _, _, d := fc.counts(); return d >= try })
+		eventually(t, "a retry to be due", func() bool { return retrying(r) })
+		r.clock.Advance(historyRetry)
+	}
+	eventually(t, "the broken notification to be dropped", func() bool {
+		_, _, ok, _ := r.st.NextPendingHistory("whatsapp")
+		return !ok
+	})
+	if _, _, d := fc.counts(); d != historyTries {
+		t.Fatalf("the broken blob was tried %d times, want %d", d, historyTries)
+	}
+}
+
+func TestTheHistoryReceiptGoesOnlyAfterTheNotificationIsStored(t *testing.T) {
+	r := newRig(t, true)
+	fc := r.live()
+	fc.setDownloadErr(errCutOff)
+	storedFirst := true
+	fc.onReceipt = func() {
+		if _, _, ok, _ := r.st.NextPendingHistory("whatsapp"); !ok {
+			storedFirst = false
+		}
+	}
+	r.send(historyNotif("3EB0N1000000000000091", "/v/receipt", base+9000))
+	if got := fc.sentReceipts(); !reflect.DeepEqual(got, []string{"hist_sync 3EB0N1000000000000091"}) {
+		t.Fatalf("receipts sent: %v, want one history-sync receipt", got)
+	}
+	if !storedFirst {
+		t.Fatalf("the history-sync receipt went before the notification was in the store")
+	}
+
+	// A notification the store cannot keep is not acknowledged at all.
+	r2 := newRig(t, true)
+	fc2 := r2.live()
+	r2.st.Close()
+	if fc2.dispatch(historyNotif("3EB0N1000000000000092", "/v/receipt-2", base+9500)) {
+		t.Fatalf("the unkept notification was reported handled")
+	}
+	if got := fc2.sentReceipts(); len(got) != 0 {
+		t.Fatalf("receipts sent: %v, want none for the unkept notification", got)
+	}
+}
+
+func TestALoginThatLosesItsConnectionIsOffline(t *testing.T) {
+	r := newRig(t, false)
+	r.start()
+	if err := r.w.Login(context.Background(), network.LoginParams{Method: network.LoginQR}); err != nil {
+		t.Fatalf("Login: %v", err)
+	}
+	fc := r.client()
+	// whatsmeow tells of the dropped socket; the QR channel then ends as if timed out.
+	fc.dispatch(&events.Disconnected{})
+	fc.qr <- whatsmeow.QRChannelTimeout
+	eventually(t, "the login's end", func() bool { return r.w.Status().State == network.NotConnected })
+	if last := r.log.lastState(); last["kind"] != "offline" {
+		t.Fatalf("a login that lost its connection ended as %v, want kind offline", last)
+	}
+}
+
+// unlinked is a rig whose device WhatsApp has unlinked.
+func unlinked(t *testing.T) *rig {
+	t.Helper()
+	r := newRig(t, true)
+	r.live()
+	r.send(&events.LoggedOut{Reason: events.ConnectFailureLoggedOut})
+	if err := r.w.device().Delete(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	return r
+}
+
+func TestARelinkThatStopsStillNeedsReconnecting(t *testing.T) {
+	r := unlinked(t)
+	if err := r.w.Login(context.Background(), network.LoginParams{Method: network.LoginQR}); err != nil {
+		t.Fatalf("Login: %v", err)
+	}
+	r.w.CancelLogin()
+	if st := r.w.Status().State; st != network.ReconnectNeeded {
+		t.Fatalf("a cancelled relink leaves the state %q, want reconnectNeeded", st)
+	}
+
+	if err := r.w.Login(context.Background(), network.LoginParams{Method: network.LoginQR}); err != nil {
+		t.Fatalf("Login: %v", err)
+	}
+	r.client().qr <- whatsmeow.QRChannelTimeout
+	eventually(t, "the relink's end", func() bool { return r.w.Status().State != network.Linking })
+	last := r.log.lastState()
+	if last["state"] != network.ReconnectNeeded || last["kind"] != "timeout" {
+		t.Fatalf("a timed-out relink ended as %v, want reconnectNeeded with kind timeout", last)
+	}
+	r.restart()
+	if st := r.w.Status().State; st != network.ReconnectNeeded {
+		t.Fatalf("after a restart the state is %q, want reconnectNeeded", st)
+	}
+}
+
+func TestHistoryIsDoneAfter120SecondsWhenThePhoneSendsNothing(t *testing.T) {
+	r := newRig(t, false)
+	r.start()
+	if err := r.w.Login(context.Background(), network.LoginParams{Method: network.LoginQR}); err != nil {
+		t.Fatalf("Login: %v", err)
+	}
+	fc := r.client()
+	linkDevice(t, fc.dev)
+	fc.qr <- whatsmeow.QRChannelSuccess
+	eventually(t, "connecting after the scan", func() bool { return r.w.Status().State == network.Connecting })
+	r.clock.Advance(119 * time.Second)
+	if h := r.log.named("history"); len(h) != 0 {
+		t.Fatalf("history events before 120 s: %v", h)
+	}
+	r.clock.Advance(time.Second)
+	h := r.log.named("history")
+	if len(h) != 1 || h[0]["done"] != true || h[0]["chats"] != 0 || h[0]["messages"] != 0 {
+		t.Fatalf("120 s after a link with no history the events are %v, want one done with no counts", h)
 	}
 }

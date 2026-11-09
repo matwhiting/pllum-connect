@@ -68,6 +68,9 @@ type fakeClient struct {
 	downloads   int
 	history     map[string]*waHistorySync.HistorySync // by the notification's direct path
 	block       chan struct{}                         // when set, a download waits for it or its context
+	downloadErr error                                 // when set, every download fails with it
+	receipts    []string                              // protocol receipts sent: "<type> <id>"
+	onReceipt   func()                                // runs as a protocol receipt is sent
 }
 
 func newFakeClient(dev *wastore.Device) *fakeClient {
@@ -136,6 +139,12 @@ func (f *fakeClient) DownloadHistorySync(ctx context.Context, notif *waE2E.Histo
 			return nil, ctx.Err()
 		}
 	}
+	f.mu.Lock()
+	failWith := f.downloadErr
+	f.mu.Unlock()
+	if failWith != nil {
+		return nil, failWith
+	}
 	if hs == nil {
 		return nil, whatsmeow.ErrMediaDownloadFailedWith404
 	}
@@ -151,6 +160,31 @@ func (f *fakeClient) DownloadHistorySync(ctx context.Context, notif *waE2E.Histo
 		}
 	}
 	return proto.Clone(hs).(*waHistorySync.HistorySync), nil
+}
+
+func (f *fakeClient) SendProtocolMessageReceipt(ctx context.Context, id types.MessageID, msgType types.ReceiptType) error {
+	f.mu.Lock()
+	on := f.onReceipt
+	f.mu.Unlock()
+	if on != nil {
+		on()
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.receipts = append(f.receipts, string(msgType)+" "+id)
+	return nil
+}
+
+func (f *fakeClient) setDownloadErr(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.downloadErr = err
+}
+
+func (f *fakeClient) sentReceipts() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.receipts...)
 }
 
 func (f *fakeClient) ParseWebMessage(chat types.JID, webMsg *waWeb.WebMessageInfo) (*events.Message, error) {

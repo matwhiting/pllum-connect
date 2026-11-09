@@ -92,3 +92,20 @@ func (s *Store) Raw(network, chatID, msgID string) ([]byte, error) {
 	}
 	return raw, nil
 }
+
+// ChatOrder is the place of a chat (or the chat an alias names) in the order
+// chats were made: a chat made earlier has a lower order. ok is false for a
+// chat the store does not hold.
+func (s *Store) ChatOrder(network, chatID string) (order int64, ok bool) {
+	if s.ready() != nil || chatID == "" {
+		return 0, false
+	}
+	chat, err := resolve(s.db, network, chatID)
+	if err != nil {
+		return 0, false
+	}
+	if err := s.db.QueryRow(`SELECT rid FROM chats WHERE network = ? AND chat_id = ?`, network, chat).Scan(&order); err != nil {
+		return 0, false
+	}
+	return order, true
+}

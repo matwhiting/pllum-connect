@@ -3,6 +3,8 @@ package whatsapp
 import (
 	"context"
 	"errors"
+	"io"
+	"net"
 	"sort"
 
 	"go.mau.fi/whatsmeow"
@@ -11,6 +13,7 @@ import (
 	"go.mau.fi/whatsmeow/types"
 	"google.golang.org/protobuf/proto"
 
+	"github.com/matwhiting/pllum-connect/internal/network"
 	"github.com/matwhiting/pllum-connect/internal/store"
 )
 
@@ -55,16 +58,23 @@ func (w *WhatsApp) drainHistory(ctx context.Context) {
 			}
 			continue
 		}
+		// A download needs the connection; Connected wakes the worker.
 		cli := w.client()
-		if cli == nil {
-			return // not linked: the next client's connect wakes the worker
+		if cli == nil || !w.online() {
+			return
 		}
 		hs, err := cli.DownloadHistorySync(ctx, &notif, true)
 		if err != nil {
 			if ctx.Err() != nil {
 				return
 			}
-			if historyGone(err) || w.failed(id) >= historyTries {
+			gone := historyGone(err)
+			// Only a failure while connected that is not the connection's own
+			// counts towards giving the notification up.
+			if !gone && !historyTransient(err) && w.online() && w.failed(id) >= historyTries {
+				gone = true
+			}
+			if gone {
 				if w.st.DeletePendingHistory(Name, id) != nil {
 					return
 				}
@@ -96,6 +106,38 @@ func historyGone(err error) bool {
 		}
 	}
 	return false
+}
+
+// historyTransient reports whether a download failed for want of a working
+// connection: not connected, an info query cut off or timed out, a network
+// error, a cancelled context, or the media server busy. These never count
+// towards giving a notification up.
+func historyTransient(err error) bool {
+	if errors.Is(err, whatsmeow.ErrNotConnected) || errors.Is(err, whatsmeow.ErrIQTimedOut) ||
+		errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	var disc *whatsmeow.DisconnectedError
+	if errors.As(err, &disc) {
+		return true
+	}
+	var nerr net.Error
+	if errors.As(err, &nerr) {
+		return true
+	}
+	var herr whatsmeow.DownloadHTTPError
+	if errors.As(err, &herr) && herr.Response != nil && (herr.StatusCode >= 500 || herr.StatusCode == 429) {
+		return true
+	}
+	return false
+}
+
+// online reports whether the connection is up: catching up or live.
+func (w *WhatsApp) online() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.state == network.CatchingUp || w.state == network.Live
 }
 
 // failed counts one more failed download of row id in this run.
@@ -332,18 +374,35 @@ func (w *WhatsApp) historyProgress(complete bool) {
 		w.hStop = nil
 	}
 	if !w.hDone {
-		w.hStop = w.clock.AfterFunc(historyQuiet, func() {
-			w.hmu.Lock()
-			if w.hDone {
-				w.hmu.Unlock()
-				return
-			}
-			w.hDone = true
-			ev := w.historyEvent()
-			w.hmu.Unlock()
-			w.emit(ev)
-		})
+		w.hStop = w.clock.AfterFunc(historyQuiet, w.historyQuietEnded)
 	}
+	ev := w.historyEvent()
+	w.hmu.Unlock()
+	w.emit(ev)
+}
+
+// armHistoryQuiet starts the 120 s wait at a new link, so a phone that
+// sends no history still ends in a done history event.
+func (w *WhatsApp) armHistoryQuiet() {
+	w.hmu.Lock()
+	defer w.hmu.Unlock()
+	if w.hStop != nil {
+		w.hStop()
+		w.hStop = nil
+	}
+	if !w.hDone {
+		w.hStop = w.clock.AfterFunc(historyQuiet, w.historyQuietEnded)
+	}
+}
+
+// historyQuietEnded: 120 s with no batch, so the history sync is done.
+func (w *WhatsApp) historyQuietEnded() {
+	w.hmu.Lock()
+	if w.hDone {
+		w.hmu.Unlock()
+		return
+	}
+	w.hDone = true
 	ev := w.historyEvent()
 	w.hmu.Unlock()
 	w.emit(ev)

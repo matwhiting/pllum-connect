@@ -1,6 +1,8 @@
 package whatsapp
 
 import (
+	"context"
+
 	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/proto/waWeb"
 	"go.mau.fi/whatsmeow/types"
@@ -193,6 +195,11 @@ func (w *WhatsApp) ingest(evt *events.Message, source string) (prep, error) {
 		}
 		if err := w.st.PutPendingHistory(Name, blob); err != nil {
 			return prep{}, err
+		}
+		// Only now, with the notification kept, is his phone told it
+		// arrived (whatsmeow's own receipt is off).
+		if cli := w.client(); cli != nil {
+			_ = cli.SendProtocolMessageReceipt(context.WithoutCancel(w.bg()), evt.Info.ID, types.ReceiptTypeHistorySync)
 		}
 		w.kickHistory()
 		return prep{}, nil

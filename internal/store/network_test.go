@@ -102,3 +102,23 @@ func TestLineTimeAndRawAreReadBack(t *testing.T) {
 		t.Fatalf("Raw of a line nothing holds has no error")
 	}
 }
+
+func TestChatOrderIsTheOrderChatsWereMade(t *testing.T) {
+	s := openTest(t)
+	put(t, s, text(lidChat, "3EB0O0001", base+5000, "made first, later time"))
+	put(t, s, text(phoneChat, "3EB0O0002", base+1000, "made second, earlier time"))
+	first, ok1 := s.ChatOrder(net, lidChat)
+	second, ok2 := s.ChatOrder(net, phoneChat)
+	if !ok1 || !ok2 || first >= second {
+		t.Fatalf("ChatOrder = %d (%v), %d (%v); want the first-made chat lower", first, ok1, second, ok2)
+	}
+	if err := s.Alias(net, otherChat, phoneChat); err != nil {
+		t.Fatal(err)
+	}
+	if o, ok := s.ChatOrder(net, otherChat); !ok || o != second {
+		t.Fatalf("ChatOrder through an alias = %d, %v", o, ok)
+	}
+	if _, ok := s.ChatOrder(net, groupChat); ok {
+		t.Fatalf("ChatOrder found a chat nothing holds")
+	}
+}

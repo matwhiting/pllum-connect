@@ -50,6 +50,7 @@ func (w *WhatsApp) Login(ctx context.Context, p network.LoginParams) error {
 		return errInternal
 	}
 	w.loginStop = cancel
+	w.loginLost = false
 	w.setState(network.Linking, "")
 	w.mu.Unlock()
 	w.resetHistoryProgress()
@@ -83,9 +84,18 @@ func (w *WhatsApp) watchLogin(cli waClient, ctx context.Context, qr <-chan whats
 			w.showCode(cli, item)
 		case whatsmeow.QRChannelSuccess.Event:
 			// whatsmeow reconnects as the linked device; Connected follows.
+			// The history sync is done after 120 s even if none comes.
 			w.endLogin(cli, network.Connecting, "", false)
+			w.armHistoryQuiet()
 		case whatsmeow.QRChannelTimeout.Event:
-			w.endLogin(cli, network.NotConnected, wire.Timeout, true)
+			// The channel says timeout for a dropped connection too.
+			kind := wire.Timeout
+			w.mu.Lock()
+			if w.loginLost {
+				kind = wire.Offline
+			}
+			w.mu.Unlock()
+			w.endLogin(cli, network.NotConnected, kind, true)
 		case whatsmeow.QRChannelClientOutdated.Event:
 			w.endLogin(cli, network.Outdated, "", true)
 		case whatsmeow.QRChannelEventPasskeyRequest, whatsmeow.QRChannelEventPasskeyResponse:
@@ -124,6 +134,9 @@ func (w *WhatsApp) endLogin(cli waClient, s network.State, kind wire.Kind, stop 
 	}
 	cancel := w.loginStop
 	w.loginStop = nil
+	if s == network.NotConnected {
+		s = w.signedOut()
+	}
 	w.setState(s, kind)
 	w.mu.Unlock()
 	if stop {
@@ -141,7 +154,7 @@ func (w *WhatsApp) CancelLogin() {
 	}
 	cancel, cli := w.loginStop, w.cli
 	w.loginStop = nil
-	w.setState(network.NotConnected, "")
+	w.setState(w.signedOut(), "")
 	w.mu.Unlock()
 	cancel()
 	cli.Disconnect()

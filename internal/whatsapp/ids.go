@@ -15,8 +15,9 @@ import (
 //     learnt later, only becomes an alias;
 //   - a group is keyed by its own JID.
 //
-// When a LID chat and a number chat turn out to be one person, the LID chat
-// joins the number's (the store merges it, and its ID becomes an alias).
+// When a LID chat and a number chat both exist and turn out to be one
+// person, the chat whose ID was given first keeps it: the later chat merges
+// into it (the store's Alias), and its ID becomes an alias.
 
 // allowedChat reports whether lines in chat are kept: people (by number or
 // LID) and groups. Status, broadcast lists, Channels and bots are not.
@@ -42,13 +43,14 @@ func norm(jid types.JID) types.JID {
 }
 
 // counterpart is the number for a LID, or the LID for a number, when the
-// device knows it; else the empty JID.
-func (w *WhatsApp) counterpart(jid types.JID) types.JID {
+// device knows it; else the empty JID. An error means the device's map could
+// not be read, not that it has no answer.
+func (w *WhatsApp) counterpart(jid types.JID) (types.JID, error) {
 	dev := w.device()
 	if dev == nil || dev.LIDs == nil {
-		return types.EmptyJID
+		return types.EmptyJID, nil
 	}
-	ctx := w.bg()
+	ctx := context.WithoutCancel(w.bg())
 	var other types.JID
 	var err error
 	switch jid.Server {
@@ -57,12 +59,21 @@ func (w *WhatsApp) counterpart(jid types.JID) types.JID {
 	case types.DefaultUserServer:
 		other, err = dev.LIDs.GetLIDForPN(ctx, jid)
 	default:
-		return types.EmptyJID
+		return types.EmptyJID, nil
 	}
-	if err != nil || other.IsEmpty() {
-		return types.EmptyJID
+	if err != nil {
+		return types.EmptyJID, errInternal
 	}
-	return norm(other)
+	if other.IsEmpty() {
+		return types.EmptyJID, nil
+	}
+	return norm(other), nil
+}
+
+// known is counterpart where an unread map only means "not known".
+func (w *WhatsApp) known(jid types.JID) types.JID {
+	other, _ := w.counterpart(jid)
+	return other
 }
 
 // chatID is the store's chat for a chat JID, adding aliases as the device
@@ -70,7 +81,10 @@ func (w *WhatsApp) counterpart(jid types.JID) types.JID {
 func (w *WhatsApp) chatID(jid types.JID) (string, error) {
 	j := norm(jid)
 	id := j.String()
-	other := w.counterpart(j)
+	other, err := w.counterpart(j)
+	if err != nil {
+		return "", err
+	}
 	held, ok := w.st.ChatFor(Name, id)
 	if other.IsEmpty() {
 		if ok {
@@ -78,29 +92,39 @@ func (w *WhatsApp) chatID(jid types.JID) (string, error) {
 		}
 		return id, nil
 	}
-	pn, lid := other, j
-	if j.Server == types.DefaultUserServer {
-		pn, lid = j, other
-	}
 	oheld, ook := w.st.ChatFor(Name, other.String())
 	switch {
 	case ok && ook && held == oheld:
 		return held, nil
 	case ok && ook:
-		// Two chats are one person: the number's chat takes the LID's.
-		pnChat, _ := w.st.ChatFor(Name, pn.String())
-		if err := w.st.Alias(Name, lid.String(), pnChat); err != nil {
-			return "", err
-		}
-		return pnChat, nil
+		return w.merge(held, oheld)
 	case ok:
 		return held, w.st.Alias(Name, other.String(), held)
 	case ook:
 		return oheld, w.st.Alias(Name, id, oheld)
 	default:
 		// A new chat: keyed by the number, the LID an alias.
+		pn, lid := other, j
+		if j.Server == types.DefaultUserServer {
+			pn, lid = j, other
+		}
 		return pn.String(), w.st.Alias(Name, lid.String(), pn.String())
 	}
+}
+
+// merge makes two held chats one: the chat made first keeps its ID, and the
+// later one merges into it.
+func (w *WhatsApp) merge(a, b string) (string, error) {
+	oa, okA := w.st.ChatOrder(Name, a)
+	ob, okB := w.st.ChatOrder(Name, b)
+	if !okA || !okB {
+		return "", errInternal
+	}
+	first, later := a, b
+	if ob < oa {
+		first, later = b, a
+	}
+	return first, w.st.Alias(Name, later, first)
 }
 
 // heldChat is the store's chat for a JID if the store has one; nothing is
@@ -110,7 +134,7 @@ func (w *WhatsApp) heldChat(jid types.JID) (string, bool) {
 	if id, ok := w.st.ChatFor(Name, j.String()); ok {
 		return id, true
 	}
-	if other := w.counterpart(j); !other.IsEmpty() {
+	if other := w.known(j); !other.IsEmpty() {
 		return w.st.ChatFor(Name, other.String())
 	}
 	return "", false
@@ -129,7 +153,8 @@ func (w *WhatsApp) link(lid, pn types.JID) error {
 	case lok && pok && lidChat == pnChat:
 		return nil
 	case lok && pok:
-		return w.st.Alias(Name, lid.String(), pnChat)
+		_, err := w.merge(lidChat, pnChat)
+		return err
 	case lok:
 		return w.st.Alias(Name, pn.String(), lidChat)
 	case pok:
@@ -143,7 +168,7 @@ func (w *WhatsApp) link(lid, pn types.JID) error {
 func (w *WhatsApp) personID(jid types.JID) string {
 	j := norm(jid)
 	if j.Server == types.HiddenUserServer {
-		if pn := w.counterpart(j); !pn.IsEmpty() {
+		if pn := w.known(j); !pn.IsEmpty() {
 			return pn.String()
 		}
 	}
@@ -183,7 +208,7 @@ func (w *WhatsApp) isSelf(jid types.JID) bool {
 func (w *WhatsApp) phoneOf(jid types.JID) string {
 	j := norm(jid)
 	if j.Server == types.HiddenUserServer {
-		j = w.counterpart(j)
+		j = w.known(j)
 	}
 	if j.Server != types.DefaultUserServer || j.User == "" {
 		return ""
@@ -201,7 +226,7 @@ func (w *WhatsApp) titleOf(jid types.JID) string {
 	ctx := context.WithoutCancel(w.bg())
 	j := norm(jid)
 	cands := []types.JID{j}
-	if other := w.counterpart(j); !other.IsEmpty() {
+	if other := w.known(j); !other.IsEmpty() {
 		cands = append(cands, other)
 	}
 	var infos []types.ContactInfo

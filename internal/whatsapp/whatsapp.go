@@ -70,6 +70,7 @@ type waClient interface {
 	IsConnected() bool
 	DownloadHistorySync(ctx context.Context, notif *waE2E.HistorySyncNotification, synchronousStorage bool) (*waHistorySync.HistorySync, error)
 	ParseWebMessage(chatJID types.JID, webMsg *waWeb.WebMessageInfo) (*events.Message, error)
+	SendProtocolMessageReceipt(ctx context.Context, id types.MessageID, msgType types.ReceiptType) error
 }
 
 // clock is the time the adapter's timers run on; tests move a fake one.
@@ -108,6 +109,7 @@ type WhatsApp struct {
 	kind        wire.Kind
 	selfID      string             // his own number's JID: the "message yourself" chat
 	loginStop   context.CancelFunc // set while a QR login runs
+	loginLost   bool               // the login's connection dropped
 	stopCatchUp func() bool
 	replaced    bool // another client took the session: wait for a nudge
 	retrying    bool // a history retry is due
@@ -167,11 +169,14 @@ func setDeviceProps() {
 // newWhatsmeowClient is the real client: it acks a message only once every
 // handler has returned (so it is in the store first), leaves history
 // downloads to the adapter, emits app state on a full sync, asks his phone
-// for a message it could not decrypt, and reconnects by itself.
+// for a message it could not decrypt, and reconnects by itself. The
+// history-sync receipt is the adapter's, sent once the notification is in
+// the store.
 func newWhatsmeowClient(dev *wastore.Device) *whatsmeow.Client {
 	cli := whatsmeow.NewClient(dev, waLog.Noop)
 	cli.SynchronousAck = true
 	cli.ManualHistorySyncDownload = true
+	cli.DisableManualHistorySyncReceipt = true // sent once the notification is stored
 	cli.EmitAppStateEventsOnFullSync = true
 	cli.AutomaticMessageRerequestFromPhone = true
 	cli.EnableAutoReconnect = true
@@ -213,10 +218,10 @@ func (w *WhatsApp) Start(ctx context.Context) error {
 		cli := w.makeClient(dev)
 		w.setState(network.Connecting, "")
 		go w.connect(cli)
-	} else if w.wasLinked() {
-		// WhatsApp unlinked the device in an earlier run (whatsmeow deleted
-		// it): the chats are here, and a QR scan continues them.
-		w.setState(network.ReconnectNeeded, "")
+	} else {
+		// After WhatsApp unlinked the device in an earlier run (whatsmeow
+		// deleted it), the chats are here and a QR scan continues them.
+		w.setState(w.signedOut(), "")
 	}
 	w.worker.Add(1)
 	go w.historyLoop(w.ctx)
@@ -368,6 +373,15 @@ func (w *WhatsApp) markLinked() {
 	if f, err := os.OpenFile(w.linkedMarker(), os.O_WRONLY|os.O_CREATE, 0o600); err == nil {
 		f.Close()
 	}
+}
+
+// signedOut is the state with no linked device: reconnectNeeded when a
+// device was linked here before (WhatsApp unlinked it), else notConnected.
+func (w *WhatsApp) signedOut() network.State {
+	if w.wasLinked() {
+		return network.ReconnectNeeded
+	}
+	return network.NotConnected
 }
 
 // device is the current whatsmeow device.
@@ -529,6 +543,8 @@ func (w *WhatsApp) lost(replaced bool) {
 		w.stopCatchUp = nil
 	}
 	switch w.state {
+	case network.Linking:
+		w.loginLost = true // the QR channel reports it as a timeout
 	case network.Connecting, network.CatchingUp, network.Live, network.Offline:
 		w.setState(network.Offline, "")
 		if replaced {
