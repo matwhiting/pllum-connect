@@ -868,6 +868,96 @@ func TestQRCodesBecomeEventsAndAPasskeyRequestStopsTheLogin(t *testing.T) {
 	})
 }
 
+func TestATimedMuteLapsesAndPllumIsToldToReRead(t *testing.T) {
+	r := newRig(t, true)
+	r.live()
+	r.send(textFrom(aliceJID, aliceJID, "3EB0M2000000000000001", base+1000, "an invented chatterbox"))
+	until := r.clock.Now().Add(8 * time.Hour).UnixMilli()
+	r.send(&events.Mute{JID: aliceJID, Action: &waSyncAction.MuteAction{Muted: proto.Bool(true), MuteEndTimestamp: proto.Int64(until)}})
+	if !r.chat(aliceJID.String()).Muted {
+		t.Fatalf("a mute for eight hours did not mute the chat")
+	}
+	r.clock.Advance(8*time.Hour - time.Second)
+	if !r.chat(aliceJID.String()).Muted {
+		t.Fatalf("the mute lapsed early")
+	}
+	before := len(r.log.named("changed"))
+	r.clock.Advance(time.Second)
+	if r.chat(aliceJID.String()).Muted {
+		t.Fatalf("the mute still read muted after eight hours")
+	}
+	if n := len(r.log.named("changed")); n <= before {
+		t.Fatalf("no changed event when the mute lapsed (%d before, %d after)", before, n)
+	}
+}
+
+func TestAMuteForEverNeverLapsesAndAnUnmuteStopsTheTimer(t *testing.T) {
+	r := newRig(t, true)
+	r.live()
+	r.send(textFrom(aliceJID, aliceJID, "3EB0M2000000000000002", base+1000, "an invented chatterbox"))
+	r.send(&events.Mute{JID: aliceJID, Action: &waSyncAction.MuteAction{Muted: proto.Bool(true), MuteEndTimestamp: proto.Int64(-1)}})
+	r.clock.Advance(24 * 400 * time.Hour)
+	if !r.chat(aliceJID.String()).Muted {
+		t.Fatalf("a mute for ever lapsed")
+	}
+	// A timed mute he then undoes leaves nothing to lapse.
+	until := r.clock.Now().Add(8 * time.Hour).UnixMilli()
+	r.send(&events.Mute{JID: aliceJID, Action: &waSyncAction.MuteAction{Muted: proto.Bool(true), MuteEndTimestamp: proto.Int64(until)}})
+	r.send(&events.Mute{JID: aliceJID, Action: &waSyncAction.MuteAction{Muted: proto.Bool(false)}})
+	r.clock.Advance(time.Hour) // runs any changed left pending by the events above
+	before := len(r.log.named("changed"))
+	r.clock.Advance(8 * time.Hour)
+	if n := len(r.log.named("changed")); n != before {
+		t.Fatalf("a lapse was announced for a mute he had undone (%d before, %d after)", before, n)
+	}
+}
+
+func TestATimedMuteFromHistoryAndAcrossARestartLapses(t *testing.T) {
+	r := newRig(t, true)
+	c := r.live()
+	muteEnd := r.clock.Now().Add(8 * time.Hour).Unix()
+	c.history["/v/mute"] = &waHistorySync.HistorySync{
+		SyncType: waHistorySync.HistorySync_INITIAL_BOOTSTRAP.Enum(),
+		Progress: proto.Uint32(10),
+		Conversations: []*waHistorySync.Conversation{{
+			ID: proto.String(aliceJID.String()), UnreadCount: proto.Uint32(0),
+			LastMsgTimestamp: proto.Uint64(uint64((base + 3000) / 1000)), MuteEndTime: proto.Uint64(uint64(muteEnd)),
+			Messages: []*waHistorySync.HistorySyncMsg{
+				webMsg(aliceJID, aliceJID, "3EB0M2000000000000003", base+3000, false, &waE2E.Message{Conversation: proto.String("an invented line")}),
+			},
+		}},
+	}
+	r.send(historyNotif("3EB0N2000000000000003", "/v/mute", base+9000))
+	eventually(t, "the bootstrap", func() bool {
+		_, _, ok, _ := r.st.NextPendingHistory("whatsapp")
+		return !ok
+	})
+	if !r.chat(aliceJID.String()).Muted {
+		t.Fatalf("a timed mute in history did not mute the chat")
+	}
+	r.clock.Advance(time.Hour) // let the history's changed events go
+	before := len(r.log.named("changed"))
+	r.clock.Advance(7*time.Hour + time.Second)
+	if r.chat(aliceJID.String()).Muted || len(r.log.named("changed")) <= before {
+		t.Fatalf("the history's mute did not lapse with a changed event")
+	}
+
+	// A mute still running when the helper restarts is announced when it ends.
+	until := r.clock.Now().Add(8 * time.Hour).UnixMilli()
+	r.send(&events.Mute{JID: aliceJID, Action: &waSyncAction.MuteAction{Muted: proto.Bool(true), MuteEndTimestamp: proto.Int64(until)}})
+	r.restart()
+	r.client().dispatch(&events.Connected{})
+	r.client().dispatch(&events.OfflineSyncCompleted{})
+	// The restart's clock starts again at the rig's first moment; the mute's end
+	// is read against it, so move it to the mute's own time first.
+	r.clock.Advance(time.Duration(until-r.clock.Now().UnixMilli()-int64(time.Hour/time.Millisecond)) * time.Millisecond)
+	before = len(r.log.named("changed"))
+	r.clock.Advance(time.Hour)
+	if r.chat(aliceJID.String()).Muted || len(r.log.named("changed")) <= before {
+		t.Fatalf("a mute running across a restart did not lapse with a changed event")
+	}
+}
+
 func TestHistoryStoresNamesUnreadMuteAndCompletes(t *testing.T) {
 	r := newRig(t, true)
 	c := r.live()

@@ -280,6 +280,9 @@ func (w *WhatsApp) storeConversation(cli waClient, conv *waHistorySync.Conversat
 	if err := w.st.PutChat(Name, w.chatInfo(chatID, jid, conv)); err != nil {
 		return "", 0, err
 	}
+	if conv.MuteEndTime != nil {
+		w.armMuteTimer()
+	}
 
 	// Every line is worked out first, so the read marker moves before the
 	// lines land and none of them shows unread in between.
@@ -351,8 +354,8 @@ func (w *WhatsApp) chatInfo(chatID string, jid types.JID, conv *waHistorySync.Co
 		if conv.GetMuteEndTime() > 1<<62 {
 			end = -1 // for ever
 		}
-		muted := end != 0 && mutedUntil(true, end, w.clock.Now().UnixMilli())
-		info.Muted = &muted
+		muted, endMs := muteState(end != 0, end, w.clock.Now().UnixMilli())
+		info.Muted, info.MuteEndMs = &muted, endMs
 	}
 	return info
 }

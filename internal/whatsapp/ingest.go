@@ -462,17 +462,29 @@ func (w *WhatsApp) onMute(e *events.Mute) error {
 	if !ok {
 		return nil
 	}
-	muted := mutedUntil(e.Action.GetMuted(), e.Action.GetMuteEndTimestamp(), w.clock.Now().UnixMilli())
-	return w.st.PutChat(Name, store.ChatInfo{ID: chatID, Muted: &muted})
+	muted, endMs := muteState(e.Action.GetMuted(), e.Action.GetMuteEndTimestamp(), w.clock.Now().UnixMilli())
+	if err := w.st.PutChat(Name, store.ChatInfo{ID: chatID, Muted: &muted, MuteEndMs: endMs}); err != nil {
+		return err
+	}
+	w.armMuteTimer()
+	return nil
 }
 
-// mutedUntil reports whether a mute ending at end (seconds or ms; -1 or 0
-// for ever) still holds at now.
-func mutedUntil(muted bool, end, now int64) bool {
+// muteState works out what to store for a mute ending at end (seconds or ms;
+// -1 or 0 for ever) as of now: whether the chat is muted, and when the mute
+// ends in ms (0 for ever or not muted). A mute that has already ended is not
+// muted. The store lapses a timed mute at read time from the end it keeps.
+func muteState(muted bool, end, now int64) (bool, int64) {
 	if !muted {
-		return false
+		return false, 0
 	}
-	return end <= 0 || msOf(end) > now
+	if end <= 0 {
+		return true, 0
+	}
+	if ms := msOf(end); ms > now {
+		return true, ms
+	}
+	return false, 0
 }
 
 // onMarkChatAsRead moves his read marker when he marks a chat read (or

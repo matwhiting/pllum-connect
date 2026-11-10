@@ -63,8 +63,13 @@ func decodeCursor(c string) (ms, rid int64, err error) {
 	return ms, rid, nil
 }
 
-const chatColumns = `rid, chat_id, kind, title, phone, last_activity_ms, last_message_id, last_from_me,
-	unread, muted, read_only, history_from_ms, history_complete`
+// chatColumns are the columns a chat is read by. A chat reads as muted when
+// it is muted and the mute is for ever (mute_end_ms 0) or has not ended yet.
+func (s *Store) chatColumns() string {
+	return `rid, chat_id, kind, title, phone, last_activity_ms, last_message_id, last_from_me,
+	unread, (muted <> 0 AND (mute_end_ms <= 0 OR mute_end_ms > ` + strconv.FormatInt(s.nowMs(), 10) + `)),
+	read_only, history_from_ms, history_complete`
+}
 
 func scanChat(rows interface{ Scan(...any) error }) (Chat, int64, error) {
 	var c Chat
@@ -108,7 +113,7 @@ func (s *Store) Chats(network string, sinceMs int64, cursor string, limit int) (
 	if err != nil {
 		return ChatPage{}, err
 	}
-	q := `SELECT ` + chatColumns + ` FROM chats WHERE network = ? AND last_activity_ms >= ?`
+	q := `SELECT ` + s.chatColumns() + ` FROM chats WHERE network = ? AND last_activity_ms >= ?`
 	args := []any{network, sinceMs}
 	if cursor != "" {
 		ms, rid, err := decodeCursor(cursor)
@@ -170,7 +175,7 @@ func (s *Store) Chat(network, chatID string) (c Chat, ok bool, err error) {
 	if err != nil {
 		return Chat{}, false, dbErr(err)
 	}
-	c, _, err = scanChat(s.db.QueryRow(`SELECT `+chatColumns+` FROM chats WHERE network = ? AND chat_id = ?`, network, chat))
+	c, _, err = scanChat(s.db.QueryRow(`SELECT `+s.chatColumns()+` FROM chats WHERE network = ? AND chat_id = ?`, network, chat))
 	if errors.Is(err, sql.ErrNoRows) {
 		return Chat{}, false, nil
 	}
@@ -386,4 +391,18 @@ func (m Message) MarshalJSON() ([]byte, error) {
 		"reactions":  reactions,
 		"seenMs":     nullableMs(m.SeenMs),
 	})
+}
+
+// NextMuteEnd is the soonest time a timed mute still holding ends, across the
+// network's chats. ok is false when no timed mute is holding.
+func (s *Store) NextMuteEnd(network string) (endMs int64, ok bool, err error) {
+	if err := s.ready(); err != nil {
+		return 0, false, err
+	}
+	var end sql.NullInt64
+	if err := s.db.QueryRow(`SELECT MIN(mute_end_ms) FROM chats
+			WHERE network = ? AND muted <> 0 AND mute_end_ms > ?`, network, s.nowMs()).Scan(&end); err != nil {
+		return 0, false, dbErr(err)
+	}
+	return end.Int64, end.Valid, nil
 }

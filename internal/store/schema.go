@@ -2,7 +2,7 @@ package store
 
 // schemaVersion is the version written to meta. An older store is brought up
 // to it; a store from a newer helper is refused rather than guessed at.
-const schemaVersion = 7 // 2 added beeper_ids; 3 messages.early; 4 messages.copied; 5 the outbox's write; 6 one row per transaction; 7 the caller's send key
+const schemaVersion = 8 // 2 added beeper_ids; 3 messages.early; 4 messages.copied; 5 the outbox's write; 6 one row per transaction; 7 the caller's send key; 8 chats.mute_end_ms
 
 // schema makes every table. Every key starts with network, so each network
 // keeps to its own rows. Chats and messages have an integer rid, stable for
@@ -26,6 +26,7 @@ var schema = []string{
 		last_from_me     INTEGER NOT NULL DEFAULT 0,
 		unread           INTEGER NOT NULL DEFAULT 0,
 		muted            INTEGER NOT NULL DEFAULT 0,
+		mute_end_ms      INTEGER NOT NULL DEFAULT 0,
 		read_only        INTEGER NOT NULL DEFAULT 0,
 		placed           INTEGER NOT NULL DEFAULT 1,
 		beeper_chat_id   TEXT,
@@ -202,12 +203,13 @@ var upgrades = []string{
 // addedColumns are columns added to a table after it first shipped, added to
 // an older store before upgrades run (ALTER TABLE has no IF NOT EXISTS).
 var addedColumns = []struct{ table, column, definition string }{
-	{"messages", "early", "INTEGER NOT NULL DEFAULT 0"},  // 3
-	{"messages", "copied", "INTEGER NOT NULL DEFAULT 0"}, // 4
-	{"outgoing", "fail", "TEXT"},                         // 5
-	{"outgoing", "request", "BLOB"},                      // 5
-	{"outgoing", "message", "BLOB"},                      // 5
-	{"outgoing", "client_id", "TEXT"},                    // 7
+	{"messages", "early", "INTEGER NOT NULL DEFAULT 0"},    // 3
+	{"messages", "copied", "INTEGER NOT NULL DEFAULT 0"},   // 4
+	{"outgoing", "fail", "TEXT"},                           // 5
+	{"outgoing", "request", "BLOB"},                        // 5
+	{"outgoing", "message", "BLOB"},                        // 5
+	{"outgoing", "client_id", "TEXT"},                      // 7
+	{"chats", "mute_end_ms", "INTEGER NOT NULL DEFAULT 0"}, // 8
 }
 
 // lateSchema runs after addedColumns, on every open: what needs a column an

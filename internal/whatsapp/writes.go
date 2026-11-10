@@ -893,6 +893,7 @@ func (w *WhatsApp) SetMuted(ctx context.Context, chatID string, muted bool) erro
 	if err := w.st.PutChat(Name, store.ChatInfo{ID: chat, Muted: &muted}); err != nil {
 		return err
 	}
+	w.armMuteTimer() // a mute for ever or an unmute leaves no end to wait for
 	w.changed()
 	return nil
 }

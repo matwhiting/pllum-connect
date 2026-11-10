@@ -47,6 +47,9 @@ const (
 	// historyQuiet is how long after the last history batch the sync counts
 	// as done when no batch reached 100%.
 	historyQuiet = 120 * time.Second
+	// maxMuteWait is the longest the mute timer sleeps before looking again.
+	maxMuteWait = 72 * time.Hour
+
 	// changedEvery is the least time between two changed events.
 	changedEvery = 500 * time.Millisecond
 	// historyRetry is how long a history download that failed waits before
@@ -133,6 +136,11 @@ type WhatsApp struct {
 	cLast    time.Time
 	cPending bool
 
+	tmu      sync.Mutex
+	muteStop func() bool // the timer for the soonest timed mute's end
+	muteGen  int         // makes a timer that has been replaced do nothing
+	muteOff  bool        // the adapter has stopped: no timer is set again
+
 	smu       sync.Mutex
 	queue     []sendJob       // sends waiting to go, in the order they were made
 	inflight  map[string]bool // sends being tried now
@@ -153,7 +161,7 @@ var _ network.Network = (*WhatsApp)(nil)
 // emit.For("whatsapp"). Nothing connects until Start.
 func New(st *store.Store, dir string, key [32]byte, emit network.Emit) *WhatsApp {
 	setDeviceProps()
-	return &WhatsApp{
+	w := &WhatsApp{
 		st:        st,
 		dir:       dir,
 		key:       key,
@@ -171,6 +179,59 @@ func New(st *store.Store, dir string, key [32]byte, emit network.Emit) *WhatsApp
 		mlocks:    map[string]*sync.Mutex{},
 		mretry:    map[string]chan *events.MediaRetry{},
 	}
+	// A timed mute reads against the adapter's own clock, which tests move.
+	st.SetClock(func() time.Time { return w.clock.Now() })
+	return w
+}
+
+// armMuteTimer sets one timer for the soonest timed mute still to end, so
+// Pllum re-reads the chats when it does: no event comes from WhatsApp when a
+// mute lapses. It is called at start and after anything that writes a mute,
+// and again when the timer fires.
+func (w *WhatsApp) armMuteTimer() {
+	end, ok, err := w.st.NextMuteEnd(Name)
+	w.tmu.Lock()
+	defer w.tmu.Unlock()
+	if w.muteStop != nil {
+		w.muteStop()
+		w.muteStop = nil
+	}
+	w.muteGen++
+	if w.muteOff || err != nil || !ok {
+		return
+	}
+	gen := w.muteGen
+	wait := time.Duration(end-w.clock.Now().UnixMilli()) * time.Millisecond
+	if wait < 0 {
+		wait = 0
+	}
+	// A mute can run to a year: the timer wakes at least every few days, and
+	// only announces a mute that has really ended.
+	wait = min(wait, maxMuteWait)
+	w.muteStop = w.clock.AfterFunc(wait, func() {
+		w.tmu.Lock()
+		stale := gen != w.muteGen
+		w.tmu.Unlock()
+		if stale {
+			return
+		}
+		if w.clock.Now().UnixMilli() >= end {
+			w.changed()
+		}
+		w.armMuteTimer()
+	})
+}
+
+// stopMuteTimer stops the timer and leaves it stopped.
+func (w *WhatsApp) stopMuteTimer() {
+	w.tmu.Lock()
+	defer w.tmu.Unlock()
+	if w.muteStop != nil {
+		w.muteStop()
+		w.muteStop = nil
+	}
+	w.muteGen++
+	w.muteOff = true
 }
 
 var propsOnce sync.Once
@@ -260,6 +321,7 @@ func (w *WhatsApp) Start(ctx context.Context) error {
 	// the same ID, once connected: WhatsApp keeps one message per ID.
 	w.requeue.Store(true)
 	w.kickSend()
+	w.armMuteTimer()
 	return nil
 }
 
@@ -335,6 +397,7 @@ func (w *WhatsApp) Stop() {
 		w.hStop()
 	}
 	w.hmu.Unlock()
+	w.stopMuteTimer()
 
 	if cli != nil {
 		cli.Disconnect()

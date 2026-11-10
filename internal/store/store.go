@@ -15,6 +15,8 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/ncruces/go-sqlite3"
 	"github.com/ncruces/go-sqlite3/driver"
@@ -40,8 +42,27 @@ const unplacedPrefix = "unplaced:"
 // Store is the helper's message store. Its methods are safe to call from any
 // goroutine; writes take turns.
 type Store struct {
-	db  *sql.DB
-	wmu sync.Mutex // one write transaction at a time
+	db    *sql.DB
+	wmu   sync.Mutex                       // one write transaction at a time
+	clock atomic.Pointer[func() time.Time] // what a timed mute is read against; nil is the real time
+}
+
+// SetClock sets the time a timed mute is read against (the adapter's own
+// clock, which tests move). Without it the store reads the real time.
+func (s *Store) SetClock(now func() time.Time) {
+	if now == nil {
+		s.clock.Store(nil)
+		return
+	}
+	s.clock.Store(&now)
+}
+
+// nowMs is the store's time, in milliseconds.
+func (s *Store) nowMs() int64 {
+	if f := s.clock.Load(); f != nil {
+		return (*f)().UnixMilli()
+	}
+	return time.Now().UnixMilli()
 }
 
 // Media is one attachment's details. Width and Height are 0 when unknown.
@@ -117,6 +138,7 @@ type ChatInfo struct {
 	Title           *string
 	Phone           *string
 	Muted           *bool
+	MuteEndMs       int64  // with Muted true: when the mute ends; 0 is for ever. Muted false clears it
 	ReadThroughMs   *int64 // his read marker: incoming lines after it are unread
 	ReadForwardOnly bool   // ReadThroughMs only moves the marker forward, never back
 	HistoryComplete *bool
@@ -460,9 +482,9 @@ func (s *Store) Alias(network, alias, chatID string) error {
 // chat into, folding in lines into already holds, and deletes from.
 func mergeChat(tx *sql.Tx, network, from, into string) error {
 	if _, err := tx.Exec(`INSERT OR IGNORE INTO chats
-			(network, chat_id, kind, title, phone, muted, placed, read_only, beeper_chat_id,
+			(network, chat_id, kind, title, phone, muted, mute_end_ms, placed, read_only, beeper_chat_id,
 			 history_complete, read_through_ms, last_activity_ms)
-			SELECT network, ?, kind, title, phone, muted, placed, read_only, beeper_chat_id,
+			SELECT network, ?, kind, title, phone, muted, mute_end_ms, placed, read_only, beeper_chat_id,
 			 history_complete, read_through_ms, last_activity_ms
 			FROM chats WHERE network = ? AND chat_id = ?`, into, network, from); err != nil {
 		return err
@@ -788,6 +810,7 @@ func (s *Store) PutChat(network string, c ChatInfo) error {
 				title = CASE WHEN ? THEN NULLIF(?, '') ELSE title END,
 				phone = CASE WHEN ? THEN NULLIF(?, '') ELSE phone END,
 				muted = COALESCE(?, muted),
+				mute_end_ms = CASE WHEN ? IS NULL THEN mute_end_ms WHEN ? THEN MAX(?, 0) ELSE 0 END,
 				read_through_ms = CASE WHEN ? THEN MAX(read_through_ms, COALESCE(?, read_through_ms))
 					ELSE COALESCE(?, read_through_ms) END,
 				history_complete = COALESCE(?, history_complete),
@@ -796,7 +819,8 @@ func (s *Store) PutChat(network string, c ChatInfo) error {
 			c.Kind,
 			c.Title != nil, deref(c.Title),
 			c.Phone != nil, deref(c.Phone),
-			c.Muted, c.ReadForwardOnly, c.ReadThroughMs, c.ReadThroughMs, c.HistoryComplete,
+			c.Muted, c.Muted, c.Muted, c.MuteEndMs,
+			c.ReadForwardOnly, c.ReadThroughMs, c.ReadThroughMs, c.HistoryComplete,
 			c.LastActivityMs,
 			network, chat)
 		if err != nil {

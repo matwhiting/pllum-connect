@@ -15,7 +15,7 @@ The contract between Pllum and this helper. Pllum refuses any other protocol ver
 
 **States** (`status` and the `state` event): `notConnected`, `linking`, `connecting`, `catchingUp`, `live`, `offline`, `reconnectNeeded`, `outdated`, `banned`.
 
-**Chat:** `{"id","kind":"single"|"group","title"|null,"phone"|null,"lastActivityMs","lastMessageID"|null,"lastFromMe","unread","muted","readOnly","participants":[{"id","name"|null,"phone"|null,"isSelf"}],"historyFromMs"|null,"historyComplete"}`. `title` is the group's subject, else WhatsApp's name for the person (his phone's contact name, then their push name), else null. `participants` holds at most 64.
+**Chat:** `{"id","kind":"single"|"group","title"|null,"phone"|null,"lastActivityMs","lastMessageID"|null,"lastFromMe","unread","muted","readOnly","participants":[{"id","name"|null,"phone"|null,"isSelf"}],"historyFromMs"|null,"historyComplete"}`. `title` is the group's subject, else WhatsApp's name for the person (his phone's contact name, then their push name), else null. `participants` holds at most 64. `muted` is read against the clock: a mute his phone set until a time reads muted until then and unmuted after, and the helper sends `changed` when it lapses.
 
 **Message:** `{"id","chatID","senderID","senderName"|null,"fromMe","timeMs","text"|null,"kind":"text"|"photo"|"video"|"voiceNote"|"sticker"|"file"|"notice","hidden","deleted","edited","replyTo"|null,"media":[{"kind","width"|null,"height"|null,"hasFile"}],"reactions":[{"emoji","senderID","fromMe"}],"seenMs"|null}`.
 
