@@ -133,13 +133,15 @@ func (w *WhatsApp) writableChat(chatID string) (string, types.JID, error) {
 }
 
 // serverRefused reports whether WhatsApp's server itself turned a message
-// down: it answered the send with an error, or said the recipient is not on
-// WhatsApp. Only these make a send failed and refused; every other failure
+// down: it answered the send with an error, said the recipient is not on
+// WhatsApp, or (for a group send, which fetches the members first) said he is
+// not in the group or that it does not exist. Only these make a send failed and refused; every other failure
 // (the socket, a timeout, an upload, the helper stopping) may have left the
 // message with WhatsApp or never let it go, and the send goes again under
 // its own ID on the next connection.
 func serverRefused(err error) bool {
-	return errors.Is(err, whatsmeow.ErrServerReturnedError) || errors.Is(err, whatsmeow.ErrRecipientNotOnWhatsApp)
+	return errors.Is(err, whatsmeow.ErrServerReturnedError) || errors.Is(err, whatsmeow.ErrRecipientNotOnWhatsApp) ||
+		errors.Is(err, whatsmeow.ErrNotInGroup) || errors.Is(err, whatsmeow.ErrGroupNotFound)
 }
 
 // unclearSend reports whether a write that is not a send (a receipt, an app

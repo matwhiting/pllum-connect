@@ -148,6 +148,31 @@ func TestAFailureBeforeTheServerIsRefused(t *testing.T) {
 	}
 }
 
+func TestASendToAGroupHeHasLeftIsRefusedAndNotResent(t *testing.T) {
+	// whatsmeow's group send fetches the members first; a group he has left
+	// (403) or that is gone (404) comes back wrapped, and nothing went.
+	for _, base := range []error{whatsmeow.ErrNotInGroup, whatsmeow.ErrGroupNotFound} {
+		t.Run(base.Error(), func(t *testing.T) {
+			r, c := withAlice(t)
+			c.with(func() { c.sendErr = fmt.Errorf("invented context: %w", base) })
+			id := r.sendOK(network.Outgoing{ChatID: aliceJID.String(), Text: "invented"})
+			if st := r.settled(id); st.State != network.SendFailed || st.Kind != wire.Refused {
+				t.Fatalf("state %+v, want failed/refused", st)
+			}
+			// It is done: a reconnect does not send it again.
+			c.with(func() { c.sendErr = nil })
+			c.reconnect()
+			time.Sleep(50 * time.Millisecond)
+			if n := len(c.sentMessages()); n != 1 {
+				t.Fatalf("%d sends after a reconnect, want the one refused try", n)
+			}
+			if st := r.w.SendState(id); st.State != network.SendFailed {
+				t.Fatalf("after the reconnect the send is %+v, want still failed", st)
+			}
+		})
+	}
+}
+
 // attempts waits for the fake's SendMessage to have returned n times.
 func (c *fakeClient) attempts(t *testing.T, n int) {
 	t.Helper()
