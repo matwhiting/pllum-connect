@@ -138,14 +138,15 @@ func TestTheReadMethodsAnswerOverTheWire(t *testing.T) {
 	}
 
 	r = result(t, h.call("n1", "counts", nil))
-	wantKeys(t, "counts", r, "chats", "messages", "imported", "matched", "unplacedChats", "oldestMs")
+	wantKeys(t, "counts", r, "chats", "messages", "imported", "matched", "unplacedChats", "oldestMs", "nearMisses")
 	for k, v := range r {
 		if _, ok := v.(float64); !ok {
 			t.Errorf("counts.%s = %v, not a number", k, v)
 		}
 	}
 	if r["chats"] != float64(2) || r["messages"] != float64(3) || r["imported"] != float64(3) ||
-		r["matched"] != float64(1) || r["unplacedChats"] != float64(1) || r["oldestMs"] != float64(base-1000) {
+		r["matched"] != float64(1) || r["unplacedChats"] != float64(1) || r["oldestMs"] != float64(base-1000) ||
+		r["nearMisses"] != float64(0) {
 		t.Fatalf("counts = %v", r)
 	}
 

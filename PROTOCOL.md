@@ -44,7 +44,9 @@ The contract between Pllum and this helper. Pllum refuses any other protocol ver
 | `import` | `beeperChatID`, `chatID`\|null, `chat: {kind, title?, phone?}`, `messages: [ImportMessage]`, `replaces`? | `added`, `matched`, `skipped` |
 | `beeperChats` | — | `map: {beeperChatID: chatID}` |
 | `lineIDs` | `beeperIDs: [String]` (≤1000) | `map: {beeperID: lineID}` |
-| `counts` | — | `chats`, `messages`, `imported`, `matched`, `unplacedChats`, `oldestMs`\|null |
+| `counts` | — | `chats`, `messages`, `imported`, `matched`, `unplacedChats`, `oldestMs`\|null, `nearMisses` (optional) |
+
+`counts.nearMisses` is a measure, a count only: per network, the Beeper-only lines (`source` beeper) in placed chats that have a direct line on the same side (`fromMe`) within 2000 ms, none of which has the same content as the Beeper line under the matcher's `MatchKey` rules. It reads text to compare and returns a number, never text, IDs or JIDs, and changes nothing about matching. A helper that does not send it is read as 0.
 
 `ImportMessage`: `{"beeperID","networkID"|null,"fromMe","senderID"|null,"senderName"|null,"timeMs","text"|null,"kind","hidden","deleted","replyToBeeperID"|null,"media":[{"kind","width","height"}],"reactions":[{"emoji","senderID","fromMe"}]}`. A null `chatID` makes or extends the unplaced chat `unplaced:<beeperChatID>`; `replaces` names an unplaced chat whose rows are dropped once this placed import has them.
 
