@@ -163,17 +163,20 @@ func beeperLineNaming(tx *sql.Tx, network string, m Message) (rid int64, oldID s
 }
 
 // beeperLineFor finds the line held only in Beeper's copy that a direct line
-// m is: the one naming m's ID (beeperLineNaming), else beeperLineLike.
-func beeperLineFor(tx *sql.Tx, network string, m Message) (rid int64, oldID string, err error) {
+// m (stored as self, in another chat) is: the one naming m's ID
+// (beeperLineNaming), else beeperLineLike.
+func beeperLineFor(tx *sql.Tx, network string, m Message, self int64) (rid int64, oldID string, err error) {
 	if rid, oldID, err = beeperLineNaming(tx, network, m); err != nil || rid != 0 {
 		return rid, oldID, err
 	}
-	return beeperLineLike(tx, network, m)
+	return beeperLineLike(tx, network, m, self)
 }
 
 // beeperLineLike finds, when m is matchable, the Beeper line on the same side
-// within the time window with the same content. rid is 0 when none.
-func beeperLineLike(tx *sql.Tx, network string, m Message) (rid int64, oldID string, err error) {
+// within the time window with the same content, else its exact-time twin
+// (beeperTwin; self is m's row when stored, 0 when arriving). rid is 0 when
+// none.
+func beeperLineLike(tx *sql.Tx, network string, m Message, self int64) (rid int64, oldID string, err error) {
 	if !matchable(m.Text, mediaKindOf(m.Kind, m.Media), m.Deleted) {
 		return 0, "", nil
 	}
@@ -184,7 +187,10 @@ func beeperLineLike(tx *sql.Tx, network string, m Message) (rid int64, oldID str
 	if err != nil {
 		return 0, "", err
 	}
-	return nearestMatch(rows, m.TimeMs, m.Text, mediaKindOf(m.Kind, m.Media), true)
+	if rid, oldID, err = nearestMatch(rows, m.TimeMs, m.Text, mediaKindOf(m.Kind, m.Media), true); err != nil || rid != 0 {
+		return rid, oldID, err
+	}
+	return beeperTwin(tx, network, m.ChatID, m.FromMe, m.TimeMs, m.Text, mediaKindOf(m.Kind, m.Media), self)
 }
 
 // beeperCopy is one Beeper message, as matchBeeperCopy compares it.
@@ -196,15 +202,17 @@ type beeperCopy struct {
 	text          string
 	mediaKind     string
 	deleted       bool
+	peers         int // other copies arriving with it at its exact time and side; the twin rule needs none
 }
 
 // matchBeeperCopy finds the line a Beeper message is: the line its network ID
 // names (or a Beeper line naming the same network ID), else a line on the
 // same side, within the time window, with the same content, that no other
-// message of the same Beeper chats already holds. Content never matches an
-// empty or deleted line, on either side. Within one Beeper chat two
-// alike messages are two lines; across Beeper chats (Beeper can split one
-// person into two) the same message is one line. rid is 0 when none.
+// message of the same Beeper chats already holds, else its exact-time twin
+// (directTwin). Content never matches an empty or deleted line, on either
+// side. Within one Beeper chat two alike messages are two lines; across
+// Beeper chats (Beeper can split one person into two) the same message is
+// one line. rid is 0 when none.
 func matchBeeperCopy(tx *sql.Tx, network, chat string, c beeperCopy) (rid int64, err error) {
 	if c.networkID != "" {
 		err = tx.QueryRow(`SELECT rid FROM messages
@@ -236,6 +244,110 @@ func matchBeeperCopy(tx *sql.Tx, network, chat string, c beeperCopy) (rid int64,
 	if err != nil {
 		return 0, err
 	}
-	rid, _, err = nearestMatch(rows, c.timeMs, c.text, c.mediaKind, false)
-	return rid, err
+	if rid, _, err = nearestMatch(rows, c.timeMs, c.text, c.mediaKind, false); err != nil || rid != 0 || c.peers > 0 {
+		return rid, err
+	}
+	return directTwin(tx, network, chat, c.fromMe, c.timeMs, c.text, c.mediaKind, 0)
+}
+
+// The twin rule: a line held only in Beeper's copy and a direct line that
+// carries no Beeper message are one message, whatever their texts say, when
+// they are the only such pair at one exact, non-zero time, in one chat, on
+// one side, and both have text or share a media kind. Beeper and WhatsApp
+// stamp one message with the same millisecond, but their texts can differ
+// (WhatsApp writes a mention as @<number>, Beeper as the name), so where the
+// content match finds nothing, time and uniqueness settle it. It is a
+// fallback only: an ID or content match always comes first.
+
+// beeperOnly is the SQL test for a line held only in Beeper's copy that the
+// twin rule may pair.
+const beeperOnly = `source = 'beeper' AND msg_id LIKE 'beeper:%' AND ` + fuzzable
+
+// directFree is the SQL test for a direct line carrying no Beeper message
+// that the twin rule may pair. It reads the row as messages, unaliased.
+const directFree = `source <> 'beeper' AND ` + fuzzable +
+	` AND NOT EXISTS (SELECT 1 FROM beeper_ids AS x WHERE x.rid = messages.rid)`
+
+// twinLine is one candidate for the twin rule.
+type twinLine struct {
+	rid       int64
+	id        string
+	text      string
+	mediaKind string
+}
+
+// twinsAt reads the lines meeting which (beeperOnly or directFree) at one
+// exact time, chat and side, leaving out the line except: the first, and how
+// many there are (at most 2, which is enough to say it is not the only one).
+func twinsAt(tx *sql.Tx, network, chat string, fromMe bool, ts int64, which string, except int64) (first twinLine, n int, err error) {
+	rows, err := tx.Query(`SELECT rid, msg_id, text, kind, media_json FROM messages
+			WHERE network = ? AND chat_id = ? AND from_me = ? AND ts_ms = ? AND rid <> ? AND `+which+`
+			ORDER BY rid LIMIT 2`, network, chat, fromMe, ts, except)
+	if err != nil {
+		return first, 0, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var l twinLine
+		var text, mj sql.NullString
+		var kind string
+		if err := rows.Scan(&l.rid, &l.id, &text, &kind, &mj); err != nil {
+			return first, 0, err
+		}
+		l.text, l.mediaKind = text.String, storedMediaKind(kind, mj)
+		if n == 0 {
+			first = l
+		}
+		n++
+	}
+	return first, n, rows.Err()
+}
+
+// twinBodies reports whether two lines may be twins by what they hold: both
+// have text (a media line's caption is its text), or they share a media kind.
+func twinBodies(textA, mediaKindA, textB, mediaKindB string) bool {
+	return (MatchKey(textA) != "" && MatchKey(textB) != "") || mediaKindA == mediaKindB
+}
+
+// directTwin finds, by the twin rule, the direct line a Beeper copy is: a
+// copy arriving (self 0), or the stored Beeper-only line self. The copy must
+// be the only Beeper-only line at its time, chat and side, and the direct
+// line the only one there carrying no Beeper message. rid is 0 when none.
+func directTwin(tx *sql.Tx, network, chat string, fromMe bool, ts int64, text, mediaKind string, self int64) (rid int64, err error) {
+	if ts <= 0 {
+		return 0, nil
+	}
+	if _, n, err := twinsAt(tx, network, chat, fromMe, ts, beeperOnly, self); err != nil || n != 0 {
+		return 0, err
+	}
+	d, n, err := twinsAt(tx, network, chat, fromMe, ts, directFree, 0)
+	if err != nil || n != 1 || !twinBodies(text, mediaKind, d.text, d.mediaKind) {
+		return 0, err
+	}
+	return d.rid, nil
+}
+
+// beeperTwin finds, by the twin rule, the Beeper-only line a direct line is:
+// a line arriving (self 0), or the stored line self, which must carry no
+// Beeper message. The direct line must be the only one at its time, chat and
+// side carrying no Beeper message, and the Beeper line the only Beeper-only
+// line there. rid is 0 when none.
+func beeperTwin(tx *sql.Tx, network, chat string, fromMe bool, ts int64, text, mediaKind string, self int64) (rid int64, id string, err error) {
+	if ts <= 0 {
+		return 0, "", nil
+	}
+	if self != 0 {
+		var carries int
+		if err := tx.QueryRow(`SELECT count(*) FROM beeper_ids WHERE rid = ?`, self).Scan(&carries); err != nil || carries > 0 {
+			return 0, "", err
+		}
+	}
+	if _, n, err := twinsAt(tx, network, chat, fromMe, ts, directFree, self); err != nil || n != 0 {
+		return 0, "", err
+	}
+	b, n, err := twinsAt(tx, network, chat, fromMe, ts, beeperOnly, 0)
+	if err != nil || n != 1 || !twinBodies(text, mediaKind, b.text, b.mediaKind) {
+		return 0, "", err
+	}
+	return b.rid, b.id, nil
 }

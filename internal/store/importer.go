@@ -138,8 +138,20 @@ func (s *Store) Import(network string, in ImportBatch) (ImportResult, error) {
 			return err
 		}
 
+		// Copies at one exact time and side: the twin rule pairs only a copy
+		// alone at its time.
+		type moment struct {
+			fromMe bool
+			ms     int64
+		}
+		at := map[moment]int{}
 		for _, m := range in.Messages {
-			outcome, err := importLine(tx, network, target, in.BeeperChatID, m)
+			if m.BeeperID != "" {
+				at[moment{m.FromMe, m.TimeMs}]++
+			}
+		}
+		for _, m := range in.Messages {
+			outcome, err := importLine(tx, network, target, in.BeeperChatID, m, at[moment{m.FromMe, m.TimeMs}]-1)
 			if err != nil {
 				return err
 			}
@@ -176,7 +188,9 @@ const (
 	added
 )
 
-func importLine(tx *sql.Tx, network, chat, beeperChatID string, m ImportMessage) (outcome, error) {
+// importLine carries one copy; peers is how many other copies in its batch
+// share its exact time and side.
+func importLine(tx *sql.Tx, network, chat, beeperChatID string, m ImportMessage, peers int) (outcome, error) {
 	if m.BeeperID == "" {
 		return skipped, nil
 	}
@@ -207,7 +221,7 @@ func importLine(tx *sql.Tx, network, chat, beeperChatID string, m ImportMessage)
 	rid, err := matchBeeperCopy(tx, network, chat, beeperCopy{
 		beeperChatIDs: []string{beeperChatID}, networkID: m.NetworkID, fromMe: m.FromMe,
 		timeMs: m.TimeMs, text: m.Text, mediaKind: importMediaKind(m),
-		deleted: m.Deleted,
+		deleted: m.Deleted, peers: peers,
 	})
 	if err != nil {
 		return skipped, err

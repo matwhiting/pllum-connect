@@ -314,6 +314,12 @@ func (s *Store) migrate() error {
 					return err
 				}
 			}
+			// 8 → 9: Beeper lines left beside their exact-time twin are folded.
+			if version < 9 {
+				if err := foldStoredTwins(tx); err != nil {
+					return err
+				}
+			}
 			// An upgrade can change which rows show, so every chat's derived
 			// values are made again.
 			if err := refreshAll(tx); err != nil {
@@ -630,7 +636,7 @@ func mergeLine(tx *sql.Tx, network, from, into string, rid int64) error {
 			return foldLine(tx, network, from, into, rid, brid, m.ID)
 		}
 	} else if m.Source != SourceBeeper {
-		brid, oldID, err := beeperLineFor(tx, network, m)
+		brid, oldID, err := beeperLineFor(tx, network, m, rid)
 		if err != nil {
 			return err
 		}
@@ -962,7 +968,7 @@ func putNewID(tx *sql.Tx, network string, m Message, media any) (added bool, err
 	case rid != 0:
 		return false, updateLine(tx, rid, m, media, false)
 	case isWhole(m):
-		if rid, oldID, err = beeperLineLike(tx, network, m); err != nil {
+		if rid, oldID, err = beeperLineLike(tx, network, m, 0); err != nil {
 			return false, err
 		}
 		if rid != 0 {
@@ -1035,10 +1041,11 @@ func updateLine(tx *sql.Tx, rid int64, m Message, media any, whole bool) error {
 }
 
 // absorbBeeperCopy folds into the direct line rid a line held only in
-// Beeper's copy that is the same message by side, time and content, when
-// the direct line has just become matchable (its original landed in an
-// early row, or an edit made its text Beeper's). A Beeper line from a Beeper
-// chat the line already carries a message of is a different message.
+// Beeper's copy that is the same message by side, time and content, else its
+// exact-time twin (beeperTwin), when the direct line has just become
+// matchable (its original landed in an early row, or an edit made its text
+// Beeper's). A Beeper line from a Beeper chat the line already carries a
+// message of is a different message.
 func absorbBeeperCopy(tx *sql.Tx, network string, rid int64) error {
 	m, _, _, err := loadLine(tx, rid)
 	if err != nil {
@@ -1062,14 +1069,81 @@ func absorbBeeperCopy(tx *sql.Tx, network string, rid int64) error {
 		return err
 	}
 	brid, oldID, err := nearestMatch(rows, m.TimeMs, m.Text, kind, true)
+	if err == nil && brid == 0 {
+		brid, oldID, err = beeperTwin(tx, network, m.ChatID, m.FromMe, m.TimeMs, m.Text, kind, rid)
+	}
 	if err != nil || brid == 0 {
 		return err
 	}
+	return foldBeeperLine(tx, network, m.ChatID, brid, oldID, rid)
+}
+
+// foldBeeperLine folds the Beeper-only line brid (ID oldID) into the direct
+// line rid of the same chat: what it was seen at, its Beeper IDs, reactions
+// and the replies to it go to rid, and it is deleted.
+func foldBeeperLine(tx *sql.Tx, network, chat string, brid int64, oldID string, rid int64) error {
 	if _, err := tx.Exec(`UPDATE messages SET seen_ms = NULLIF(MAX(COALESCE(seen_ms, 0),
 			COALESCE((SELECT seen_ms FROM messages WHERE rid = ?), 0)), 0) WHERE rid = ?`, brid, rid); err != nil {
 		return err
 	}
-	return foldLine(tx, network, m.ChatID, m.ChatID, brid, rid, oldID)
+	return foldLine(tx, network, chat, chat, brid, rid, oldID)
+}
+
+// foldStoredTwins folds every exact-time twin the store already holds (the
+// twin rule, see directTwin), as absorbBeeperCopy would have had the rule
+// been there when the second line landed. It runs once, in the upgrade to
+// schema 9, and is safe to run again: a folded pair is a pair no more.
+func foldStoredTwins(tx *sql.Tx) error {
+	rows, err := tx.Query(`SELECT rid FROM messages WHERE ts_ms > 0 AND ` + beeperOnly + ` ORDER BY rid`)
+	if err != nil {
+		return err
+	}
+	var rids []int64
+	for rows.Next() {
+		var rid int64
+		if err := rows.Scan(&rid); err != nil {
+			rows.Close()
+			return err
+		}
+		rids = append(rids, rid)
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return err
+	}
+	touched := map[[2]string]bool{}
+	for _, brid := range rids {
+		var network string
+		var b Message
+		var text, mj sql.NullString
+		err := tx.QueryRow(`SELECT network, chat_id, msg_id, from_me, ts_ms, text, kind, media_json
+				FROM messages WHERE rid = ? AND `+beeperOnly, brid).
+			Scan(&network, &b.ChatID, &b.ID, &b.FromMe, &b.TimeMs, &text, &b.Kind, &mj)
+		if errors.Is(err, sql.ErrNoRows) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		drid, err := directTwin(tx, network, b.ChatID, b.FromMe, b.TimeMs, text.String, storedMediaKind(b.Kind, mj), brid)
+		if err != nil {
+			return err
+		}
+		if drid == 0 {
+			continue
+		}
+		if err := foldBeeperLine(tx, network, b.ChatID, brid, b.ID, drid); err != nil {
+			return err
+		}
+		touched[[2]string{network, b.ChatID}] = true
+	}
+	for c := range touched {
+		if err := resolveReplies(tx, c[0], c[1]); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // takeOver gives the Beeper line rid the direct line's ID, time, side and
