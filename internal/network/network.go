@@ -139,6 +139,14 @@ type SignInPager interface {
 	SignIn() meta.SignInPage
 }
 
+// ParticipantAliaser is a network whose people have a second ID: the form
+// Beeper names them by. `chatByParticipant` asks for it when the store has
+// no chat for the ID as given. The answer is false when the ID is not one the
+// network knows.
+type ParticipantAliaser interface {
+	ParticipantAlias(id string) (string, bool)
+}
+
 // OlderPages is a network that can fetch history older than what the store
 // holds. server calls FetchOlder when `messages` reaches the oldest stored
 // line of a chat that is not historyComplete, at most once per chat per 10 s,

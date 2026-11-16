@@ -3,6 +3,7 @@ package instagram
 import (
 	"cmp"
 	"strconv"
+	"strings"
 
 	"go.mau.fi/mautrix-meta/pkg/instameow/slidetypes"
 
@@ -179,4 +180,16 @@ func nameOf(u *slidetypes.User) string {
 		return ""
 	}
 	return cmp.Or(u.FullName, u.Username)
+}
+
+// ParticipantAlias is the participant ID (IGID) of the person Beeper names by
+// FBID, through the people the network has seen; false when the ID is not an
+// FBID it knows. Only digits are asked about, so nothing else reaches the
+// stored values.
+func (g *Instagram) ParticipantAlias(id string) (string, bool) {
+	if id == "" || strings.Trim(id, "0123456789") != "" {
+		return "", false
+	}
+	igid := g.value("user." + id)
+	return igid, igid != ""
 }

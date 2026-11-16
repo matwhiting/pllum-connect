@@ -157,6 +157,14 @@ func (s *server) chatByParticipant(ctx context.Context, n network.Network, param
 	if err != nil {
 		return nil, err
 	}
+	// A direct hit wins; only a miss asks the network for its own form.
+	if pa, can := n.(network.ParticipantAliaser); !ok && can {
+		if alias, found := pa.ParticipantAlias(p.ParticipantID); found && alias != p.ParticipantID {
+			if c, ok, err = s.store.ChatByParticipant(n.Name(), alias); err != nil {
+				return nil, err
+			}
+		}
+	}
 	if !ok {
 		return map[string]any{"chat": nil}, nil
 	}

@@ -46,7 +46,7 @@ The contract between Pllum and this helper. Pllum refuses any other protocol ver
 | `lineIDs` | `beeperIDs: [String]` (≤1000) | `map: {beeperID: lineID}` |
 | `counts` | — | `chats`, `messages`, `imported`, `matched`, `unplacedChats`, `oldestMs`\|null, `nearMisses` (optional) |
 | `signIn` | — | `url`, `donePattern`, `cookieDomain`, `required: [String]`, `optional: [String]`, `userAgent`; `unsupported` for a network with no sign-in page |
-| `chatByParticipant` | `participantID` | `chat: Chat`\|null: the one-to-one with that person (never a group, never an unplaced chat; the most recently active if several) |
+| `chatByParticipant` | `participantID` | `chat: Chat`\|null: the one-to-one with that person (never a group, never an unplaced chat; the most recently active if several). For Instagram it also accepts the person's FBID (Beeper's form), translated through the people the helper has seen |
 | `encryptedHistory` | — | `state`: `noBackup`\|`needsPIN`\|`restored`\|`skipped`; `unsupported` for a network with none |
 | `restoreHistory` | `pin` (a string; `""` skips; missing is `badRequest`) | `{}`; errors `pinWrong` (with `attemptsRemaining`?), `pinLimit`; `unsupported` for a network with none |
 
