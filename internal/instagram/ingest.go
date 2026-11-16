@@ -254,6 +254,7 @@ func (g *Instagram) storeMessage(chat string, m *slidetypes.Message, source stri
 	if added, err = g.st.PutMessage(Name, line); err != nil {
 		return false, err
 	}
+	g.echoed(m, line.ID) // his own message: the send it came from is sent
 	if len(m.SlideEditHistory) > 0 && line.Kind == "text" {
 		if _, err := g.st.PutMessage(Name, store.Message{ID: line.ID, ChatID: chat, Text: line.Text, Edited: true}); err != nil {
 			return added, err

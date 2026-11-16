@@ -10,6 +10,9 @@ const (
 	OutSending = "sending" // made and kept; not yet acknowledged
 	OutSent    = "sent"    // the network acknowledged it
 	OutFailed  = "failed"  // it did not go; Fail says why
+	// OutUnknown: it may have reached the network, and is never sent again
+	// (a Meta send cut off by a restart); a late answer may still settle it.
+	OutUnknown = "unknown"
 )
 
 // Outgoing is one write a network makes, kept under the ID it made before
@@ -66,10 +69,10 @@ func (s *Store) SetOutgoingMessage(network, id string, message []byte) error {
 	})
 }
 
-// SetOutgoingState moves a write to sent or failed (with the error kind), or
-// back to sending.
+// SetOutgoingState moves a write to sent, failed (with the error kind) or
+// unknown, or back to sending.
 func (s *Store) SetOutgoingState(network, id, state, fail string) error {
-	if network == "" || id == "" || (state != OutSending && state != OutSent && state != OutFailed) {
+	if network == "" || id == "" || (state != OutSending && state != OutSent && state != OutFailed && state != OutUnknown) {
 		return errBadRequest
 	}
 	if state != OutFailed {
@@ -256,4 +259,48 @@ func (s *Store) Unread(network, chatID string, throughMs int64) ([]Line, error) 
 		out = append(out, l)
 	}
 	return out, dbErr(rows.Err())
+}
+
+// LineAfter is the line just after msgID in the chat (by time, then by
+// arrival); ok is false when msgID is the newest or not held.
+func (s *Store) LineAfter(network, chatID, msgID string) (Line, bool, error) {
+	if err := s.ready(); err != nil {
+		return Line{}, false, err
+	}
+	chat, err := resolve(s.db, network, chatID)
+	if err != nil {
+		return Line{}, false, dbErr(err)
+	}
+	l, err := scanLine(s.db.QueryRow(`SELECT `+lineColumns+` FROM messages
+			WHERE network = ? AND chat_id = ? AND early = 0 AND (ts_ms, rid) >
+				(SELECT ts_ms, rid FROM messages WHERE network = ? AND chat_id = ? AND msg_id = ? AND early = 0)
+			ORDER BY ts_ms, rid LIMIT 1`, network, chat, network, chat, msgID))
+	if errors.Is(err, sql.ErrNoRows) {
+		return Line{}, false, nil
+	}
+	if err != nil {
+		return Line{}, false, dbErr(err)
+	}
+	return l, true, nil
+}
+
+// OwnReaction is his reaction to a line, if he has one.
+func (s *Store) OwnReaction(network, chatID, msgID string) (string, bool, error) {
+	if err := s.ready(); err != nil {
+		return "", false, err
+	}
+	chat, err := resolve(s.db, network, chatID)
+	if err != nil {
+		return "", false, dbErr(err)
+	}
+	var emoji string
+	err = s.db.QueryRow(`SELECT emoji FROM reactions WHERE network = ? AND chat_id = ? AND msg_id = ? AND from_me = 1
+			LIMIT 1`, network, chat, msgID).Scan(&emoji)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, dbErr(err)
+	}
+	return emoji, true, nil
 }

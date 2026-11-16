@@ -14,6 +14,7 @@ import (
 	"go.mau.fi/mautrix-meta/pkg/instameow"
 	"go.mau.fi/mautrix-meta/pkg/instameow/slidetypes"
 	"go.mau.fi/mautrix-meta/pkg/messagix/cookies"
+	"go.mau.fi/mautrix-meta/pkg/messagix/httpclient"
 	"go.mau.fi/mautrix-meta/pkg/messagix/types"
 	"go.mau.fi/util/jsontime"
 
@@ -154,6 +155,46 @@ type fakeMeta struct {
 	threadInfo  func(igChatID string) (*slidetypes.ThreadInfoResponse, error)
 	messagePage func(igChatID, cursor string) (*slidetypes.PaginateMessagesResponse, error)
 	mailboxN    int
+
+	// The writes (Task A3). threadIDs answers FetchThreadID (nil: the
+	// invented IDs of Alice's chat and the group); errs makes a write (or
+	// FetchThreadID, Upload, Download) fail by its name; files answers
+	// Download by URL; olderThan is the OlderThanMessageID of each
+	// PaginateMessages.
+	threadIDs func(key int64) (*instameow.ThreadIGIDs, error)
+	errs      map[string]error
+	files     map[string]fakeFile
+	olderThan []string
+}
+
+// fakeFile is what a CDN address answers: the bytes, or an HTTP status.
+type fakeFile struct {
+	data   []byte
+	status int
+}
+
+// The invented long thread IDs FetchThreadID gives (the short ones are the
+// chats' IG chat IDs).
+const (
+	aliceLong = "340282366841710300949128100000000011"
+	groupLong = "340282366841710300949128100000000077"
+)
+
+// errFor is the error the test set for name, if any.
+func (m *fakeMeta) errFor(name string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.errs[name]
+}
+
+// setErr makes name fail with err (nil: succeed again).
+func (m *fakeMeta) setErr(name string, err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.errs == nil {
+		m.errs = map[string]error{}
+	}
+	m.errs[name] = err
 }
 
 func newFakeMeta(clock *fakeClock) *fakeMeta {
@@ -179,7 +220,8 @@ func (m *fakeMeta) requests() []call {
 	var out []call
 	for _, c := range m.calls {
 		switch c.name {
-		case "LoadIndex", "PaginateMailbox", "GetThread", "PaginateMessages", "FetchThreadID":
+		case "LoadIndex", "PaginateMailbox", "GetThread", "PaginateMessages", "FetchThreadID",
+			"SendMessage", "SendMedia", "SendReaction", "MarkRead", "MarkReadValidation", "MuteThread", "Upload", "Download":
 			out = append(out, c)
 		}
 	}
@@ -328,6 +370,11 @@ func (c *fakeIG) PaginateMessages(ctx context.Context, req *slidetypes.PaginateM
 	}
 	c.m.record("PaginateMessages", req.ThreadID+" "+cursor)
 	c.m.mu.Lock()
+	if req.OlderThanMessageID != nil {
+		c.m.olderThan = append(c.m.olderThan, *req.OlderThanMessageID)
+	} else {
+		c.m.olderThan = append(c.m.olderThan, "")
+	}
 	f := c.m.messagePage
 	c.m.mu.Unlock()
 	if f == nil {
@@ -342,7 +389,127 @@ func (c *fakeIG) PaginateMessages(ctx context.Context, req *slidetypes.PaginateM
 
 func (c *fakeIG) FetchThreadID(ctx context.Context, threadFBID int64) (*instameow.ThreadIGIDs, error) {
 	c.m.record("FetchThreadID", fmt.Sprint(threadFBID))
-	return nil, errors.New("not in this task")
+	if err := c.m.errFor("FetchThreadID"); err != nil {
+		return nil, c.fail(ctx, err)
+	}
+	c.m.mu.Lock()
+	f := c.m.threadIDs
+	c.m.mu.Unlock()
+	if f != nil {
+		return f(threadFBID)
+	}
+	switch threadFBID {
+	case aliceFBI:
+		return &instameow.ThreadIGIDs{ShortID: aliceThread, LongID: aliceLong}, nil
+	case groupKey:
+		return &instameow.ThreadIGIDs{ShortID: groupChat, LongID: groupLong}, nil
+	}
+	return nil, instameow.ErrThreadNotFound
+}
+
+// sentID is the message ID the fake Meta gives a send with this offline
+// threading ID.
+func sentID(otid string) string { return "mid.$invented-sent-" + otid }
+
+func (c *fakeIG) sent(ctx context.Context, name, otid string) (slidetypes.SentMessage, error) {
+	if err := c.m.errFor(name); err != nil {
+		return slidetypes.SentMessage{}, c.fail(ctx, err)
+	}
+	return slidetypes.SentMessage{ID: sentID(otid), MessageID: sentID(otid), TimestampMS: ms(c.m.clock.Now())}, nil
+}
+
+func (c *fakeIG) SendMessage(ctx context.Context, req *slidetypes.SendTextRequest) (*slidetypes.SendTextResponse, error) {
+	thread, reply := "", ""
+	if req.IGThreadIGID != nil {
+		thread = *req.IGThreadIGID
+	}
+	if req.ReplyToMessageID != nil {
+		reply = *req.ReplyToMessageID
+	}
+	c.m.record("SendMessage", req.OfflineThreadingID+" "+thread+" "+reply+" "+req.Text.Value)
+	msg, err := c.sent(ctx, "SendMessage", req.OfflineThreadingID)
+	if err != nil {
+		return nil, err
+	}
+	return &slidetypes.SendTextResponse{Message: msg}, nil
+}
+
+func (c *fakeIG) SendMedia(ctx context.Context, req *slidetypes.SendMediaRequest) (*slidetypes.SendMediaResponse, error) {
+	reply := ""
+	if req.ReplyToMessageID != nil {
+		reply = *req.ReplyToMessageID
+	}
+	c.m.record("SendMedia", req.OfflineThreadingID+" "+req.ThreadID+" "+req.AttachmentFBID+" "+reply)
+	msg, err := c.sent(ctx, "SendMedia", req.OfflineThreadingID)
+	if err != nil {
+		return nil, err
+	}
+	return &slidetypes.SendMediaResponse{Message: msg}, nil
+}
+
+func (c *fakeIG) SendReaction(ctx context.Context, req *slidetypes.CreateReactionRequest) (*slidetypes.SendReactionResponse, error) {
+	in := req.Input
+	c.m.record("SendReaction", string(in.ReactionStatus)+" "+in.Emoji+" "+in.MessageID+" "+in.ThreadID)
+	if err := c.m.errFor("SendReaction"); err != nil {
+		return nil, c.fail(ctx, err)
+	}
+	return &slidetypes.SendReactionResponse{}, nil
+}
+
+func (c *fakeIG) MarkRead(ctx context.Context, req *slidetypes.MarkReadRequest) (*slidetypes.MarkReadResponse, error) {
+	item := "<nil>"
+	if req.Data.ItemID != nil {
+		item = *req.Data.ItemID
+	}
+	c.m.record("MarkRead", req.Data.MessageID+" "+req.Metadata.IGThreadIGID+" item="+item)
+	if err := c.m.errFor("MarkRead"); err != nil {
+		return nil, c.fail(ctx, err)
+	}
+	return &slidetypes.MarkReadResponse{}, nil
+}
+
+func (c *fakeIG) MarkReadValidation(ctx context.Context, req *slidetypes.MarkReadRequest) (*slidetypes.MarkReadValidationResponse, error) {
+	c.m.record("MarkReadValidation", req.Data.MessageID+" "+req.Metadata.IGThreadIGID+" "+fmt.Sprint(req.Data.MessageTimestampMS.UnixMilli()))
+	if err := c.m.errFor("MarkReadValidation"); err != nil {
+		return nil, c.fail(ctx, err)
+	}
+	return &slidetypes.MarkReadValidationResponse{}, nil
+}
+
+func (c *fakeIG) MuteThread(ctx context.Context, req *slidetypes.MuteThreadRequest) (*slidetypes.MuteThreadResponse, error) {
+	c.m.record("MuteThread", req.ThreadID+" "+fmt.Sprint(req.MuteSeconds)+" otid="+req.OfflineThreadingID)
+	if err := c.m.errFor("MuteThread"); err != nil {
+		return nil, c.fail(ctx, err)
+	}
+	return &slidetypes.MuteThreadResponse{}, nil
+}
+
+// fakeAttachment is the attachment ID the fake Meta gives every upload.
+const fakeAttachment = 5550000000000001
+
+func (c *fakeIG) Upload(ctx context.Context, threadID int64, media *httpclient.MercuryUploadMedia) (*types.MercuryUploadResponse, error) {
+	c.m.record("Upload", fmt.Sprint(threadID)+" "+media.MimeType+" "+fmt.Sprint(len(media.MediaData)))
+	if err := c.m.errFor("Upload"); err != nil {
+		return nil, c.fail(ctx, err)
+	}
+	return &types.MercuryUploadResponse{Payload: types.MediaPayloads{RealMetadata: &types.FileMetadata{ImageID: fakeAttachment}}}, nil
+}
+
+func (c *fakeIG) Download(ctx context.Context, url string) ([]byte, error) {
+	c.m.record("Download", url)
+	if err := c.m.errFor("Download"); err != nil {
+		return nil, err
+	}
+	c.m.mu.Lock()
+	f, ok := c.m.files[url]
+	c.m.mu.Unlock()
+	switch {
+	case !ok:
+		return nil, statusError(404)
+	case f.status != 0 && f.status != 200:
+		return nil, statusError(f.status)
+	}
+	return f.data, nil
 }
 
 func (c *fakeIG) GetOwnFBID() int64 {

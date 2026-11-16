@@ -119,10 +119,12 @@ type Instagram struct {
 	key  [32]byte
 	emit network.Emit
 
-	newClient func(p instameow.ClientParams) igClient
-	clock     clock
-	pace      *meta.Pace
-	diff      *meta.SessionDiff
+	newClient     func(p instameow.ClientParams) igClient
+	newWriter     func(c igClient) igWriter     // the client's writes (writes.go)
+	newDownloader func(c igClient) igDownloader // the client's media downloads (media.go)
+	clock         clock
+	pace          *meta.Pace
+	diff          *meta.SessionDiff
 
 	mu          sync.Mutex
 	started     bool
@@ -141,7 +143,7 @@ type Instagram struct {
 	kind        wire.Kind
 	stopCatchUp func() bool
 	work        sync.WaitGroup
-	busy        atomic.Int32 // sign-ins and inbox reloads still running
+	busy        atomic.Int32 // sign-ins, inbox reloads and sends still running
 
 	vmu    sync.Mutex
 	values map[string]string // the network's own store values, as read or written
@@ -152,6 +154,14 @@ type Instagram struct {
 	cmu      sync.Mutex
 	cLast    time.Time
 	cPending bool
+
+	smu      sync.Mutex
+	queue    []string // sends waiting their turn, oldest first
+	draining bool     // a goroutine is sending them
+
+	mmu      sync.Mutex
+	mlocks   map[string]*sync.Mutex // one fetch per media file at a time
+	mediaCap int64
 }
 
 var (
@@ -173,6 +183,11 @@ func New(st *store.Store, dir string, key [32]byte, emit network.Emit) *Instagra
 		state:  network.NotConnected,
 		values: map[string]string{},
 		locks:  map[string]*sync.Mutex{},
+
+		newWriter:     writerFor,
+		newDownloader: downloaderFor,
+		mlocks:        map[string]*sync.Mutex{},
+		mediaCap:      mediaCap,
 	}
 	g.newClient = func(p instameow.ClientParams) igClient { return instameow.NewClient(p) }
 	// The pace reads the adapter's clock when it runs, so a test's clock,
@@ -191,7 +206,8 @@ func (g *Instagram) Name() string { return Name }
 func (g *Instagram) SignIn() meta.SignInPage { return meta.InstagramPage }
 
 // Start readies the network. It asks nothing of Meta: the cookies live in
-// Pllum's Keychain, and Pllum sends them as a `login` on every start.
+// Pllum's Keychain, and Pllum sends them as a `login` on every start. A send
+// an earlier run left sending becomes unknown, never to be sent again.
 func (g *Instagram) Start(ctx context.Context) error {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -200,6 +216,7 @@ func (g *Instagram) Start(ctx context.Context) error {
 	}
 	g.ctx, g.cancel = context.WithCancel(context.WithoutCancel(ctx))
 	g.started = true
+	g.forgetCutOff()
 	// A rate limit from an earlier run runs to its end, and the next one
 	// doubles from where it got to.
 	if until, step, ok := g.keptRateLimit(); ok {
@@ -396,36 +413,6 @@ func (g *Instagram) Stop() {
 	case <-time.After(2 * time.Second):
 		// A request is stuck; it ends with the process.
 	}
-}
-
-// The writes are Task A3's. Until then Instagram is read-only here.
-
-func (g *Instagram) Send(ctx context.Context, m network.Outgoing) (string, error) {
-	return "", errUnsupported
-}
-
-func (g *Instagram) SendState(messageID string) network.SendState {
-	return network.SendState{State: network.SendUnknown}
-}
-
-func (g *Instagram) SendFor(clientID string) (string, error) { return "", nil }
-
-func (g *Instagram) React(ctx context.Context, chatID, messageID, emoji, transactionID string) error {
-	return errUnsupported
-}
-
-func (g *Instagram) MarkRead(ctx context.Context, chatID, through string) error {
-	return errUnsupported
-}
-
-func (g *Instagram) MarkUnread(ctx context.Context, chatID string) error { return errUnsupported }
-
-func (g *Instagram) SetMuted(ctx context.Context, chatID string, muted bool) error {
-	return errUnsupported
-}
-
-func (g *Instagram) Media(ctx context.Context, chatID, messageID string) (string, error) {
-	return "", errUnsupported
 }
 
 // retire ends the current run, if any: its context, its client's socket,
