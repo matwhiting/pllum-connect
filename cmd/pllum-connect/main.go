@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"syscall"
 
+	"github.com/matwhiting/pllum-connect/internal/instagram"
 	"github.com/matwhiting/pllum-connect/internal/network"
 	"github.com/matwhiting/pllum-connect/internal/quiet"
 	"github.com/matwhiting/pllum-connect/internal/server"
@@ -78,7 +79,10 @@ func run(args []string) int {
 			return store.Open(dir, key)
 		},
 		Networks: func(st *store.Store, dir string, key [32]byte, emit network.Emit) []network.Network {
-			return []network.Network{whatsapp.New(st, dir, key, emit.For(whatsapp.Name))}
+			return []network.Network{
+				whatsapp.New(st, dir, key, emit.For(whatsapp.Name)),
+				instagram.New(st, dir, key, emit.For(instagram.Name)),
+			}
 		},
 	}
 	if err := server.Serve(ctx, os.Stdin, os.Stdout, deps); err != nil {

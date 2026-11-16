@@ -60,10 +60,12 @@ The contract between Pllum and this helper. Pllum refuses any other protocol ver
 
 - `hello`'s `networks` lists `"instagram"` and `"messenger"` when the helper runs them.
 - `signIn`: Pllum shows `url` in a web view with `userAgent`, waits for an address matching `donePattern` (a regular expression on the full URL), reads the `required` and `optional` cookies of `cookieDomain`, and sends them as `login` with `method:"session"`. The helper presents the same user agent to Meta, so the window and the helper look like one browser.
-- Error kind `checkpoint`: Meta wants him to confirm it is him (a challenge, checkpoint or consent page). It is also a `state` `kind`. The helper makes no further requests until he signs in again.
+- Error kind `checkpoint`: Meta wants him to confirm it is him (a challenge, checkpoint or consent page). It is also a `state` `kind`, on state `reconnectNeeded`. The helper makes no further requests until he signs in again.
+- How a `login` with a session ends: `badRequest` at once (and `state` `notConnected` `badRequest`) when a required cookie is missing or empty, before anything is asked of Meta; else `{}`, then `state` `connecting`, and `catchingUp` when the socket subscribes, `live` at its first update or 60 s on. A checkpoint is `reconnectNeeded` with kind `checkpoint`, an ended session `reconnectNeeded`, a suspended account `banned`; any other failure (`rateLimited`, `offline`, `internal`) is `notConnected` with that kind, which a `nudge` retries with the same cookies once the pace allows. The cookies are held in memory only, so Pllum sends `login` on every start.
+- Instagram's IDs: a chat is its thread key in decimal (for a one-to-one, the other person's FBID); a line is Meta's message ID (`mid.$…`) unchanged; a participant is an Instagram user ID (IGID). `selfChatID` is null.
 - Error kinds `pinWrong` and `pinLimit` are `restoreHistory`'s only. `pinWrong` may carry `attemptsRemaining`, an integer: `{"id":"…","error":{"kind":"pinWrong","attemptsRemaining":2}}`. No other error carries it.
 - `status` may carry `encrypted`: `notRegistered`\|`connecting`\|`live`\|`failed` (Messenger only; a network that has no end-to-end encryption leaves it out).
-- Pace: the helper leaves a random 2 to 4 s between requests to Meta. After `rateLimited` it makes none for 15 minutes, then 30, 60, 120 and 240 on each further one (a success starts over); after `checkpoint` or `reconnectNeeded` none until a new `login`.
+- Pace: the helper leaves a random 2 to 4 s between requests to Meta. After `rateLimited` it makes none for 15 minutes, then 30, 60, 120 and 240 on each further one (a success starts over); after `checkpoint`, `reconnectNeeded` or `banned` none until a new `login`. A success during a rate-limit block does not end it.
 
 **Go interface each network implements** (`internal/network`):
 
@@ -72,7 +74,7 @@ type Network interface {
 	Name() string                                     // "whatsapp"
 	Start(ctx context.Context) error                  // connects if signed in; returns at once
 	Status() Status                                   // State, SelfChatID
-	Login(ctx context.Context, p LoginParams) error // LoginParams{Method string; Session map[string]string}
+	Login(ctx context.Context, p LoginParams) error // LoginParams{Method string; Session Session}
 	CancelLogin()
 	Logout(ctx context.Context) error
 	Nudge()
@@ -100,7 +102,9 @@ type EncryptedHistory interface {
 }
 ```
 
-A network without one answers `unsupported` to its method (`OlderPages` is simply not called).
+A network without one answers `unsupported` to its method (`OlderPages` is simply not called). `FetchOlder` sends `changed` itself when it adds lines or finds the start of a chat.
+
+`Session` is `map[string]string` whose `String`, `GoString` and `Format` all give `[session redacted]`, so no `fmt` verb prints a cookie.
 
 Reads (`chats`, `chat`, `messages`, `search`, `findChats`, `chatByParticipant`) and the Beeper calls (`import`, `beeperChats`, `lineIDs`, `counts`) are answered by `server` from `store` for every network; a network only writes into the store.
 

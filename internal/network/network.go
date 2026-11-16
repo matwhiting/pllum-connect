@@ -4,6 +4,7 @@ package network
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/matwhiting/pllum-connect/internal/meta"
 	"github.com/matwhiting/pllum-connect/internal/wire"
@@ -53,9 +54,22 @@ type Status struct {
 
 // LoginParams are `login`'s params besides `network`.
 type LoginParams struct {
-	Method  string            // "qr", or "session" with Session
-	Session map[string]string // cookie name → value, for "session"; nil for "qr"
+	Method  string  // "qr", or "session" with Session
+	Session Session // cookie name → value, for "session"; nil for "qr"
 }
+
+// Session is a website session: cookie name → value. The values sign him in,
+// so it never prints them: every fmt verb, on it or on a struct holding it,
+// gives "[session redacted]".
+type Session map[string]string
+
+const redacted = "[session redacted]"
+
+func (Session) String() string   { return redacted }
+func (Session) GoString() string { return redacted }
+
+// Format covers the verbs String and GoString do not (%d, %x and the rest).
+func (Session) Format(f fmt.State, _ rune) { _, _ = f.Write([]byte(redacted)) }
 
 // The login methods of protocol 1.
 const (

@@ -62,6 +62,10 @@ func TestASecondCopyOnTheSameFolderExitsLocked(t *testing.T) {
 		if !strings.Contains(line, `"result"`) {
 			t.Fatalf("the first copy did not answer hello: %s", line)
 		}
+		// Both networks run: hello lists them, in order.
+		if !strings.Contains(line, `"networks":["whatsapp","instagram"]`) {
+			t.Errorf("hello's networks are not whatsapp and instagram: %s", line)
+		}
 	case <-time.After(10 * time.Second):
 		t.Fatalf("the first copy did not answer hello within 10 s")
 	}

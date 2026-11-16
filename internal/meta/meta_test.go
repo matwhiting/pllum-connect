@@ -4,6 +4,7 @@ import (
 	"context"
 	"regexp"
 	"slices"
+	"sync"
 	"testing"
 	"time"
 
@@ -235,7 +236,7 @@ func TestARateLimitedDuringABlockDoesNotLengthenIt(t *testing.T) {
 }
 
 func TestACheckpointBlocksUntilClear(t *testing.T) {
-	for _, kind := range []wire.Kind{wire.Checkpoint, ReconnectNeeded} {
+	for _, kind := range []wire.Kind{wire.Checkpoint, ReconnectNeeded, Banned} {
 		c := newClock()
 		p := c.pace()
 		p.Fail(kind)
@@ -295,7 +296,7 @@ func TestPaceWaitsTwoToFourSeconds(t *testing.T) {
 
 	// The default Rand stays in the range too, without sleeping for real.
 	c := newClock()
-	p := &Pace{Sleep: c.Sleep}
+	p := &Pace{Now: c.Now, Sleep: c.Sleep}
 	for range 200 {
 		if err := p.Wait(context.Background()); err != nil {
 			t.Fatal(err)
@@ -324,5 +325,94 @@ func TestPaceWaitStopsWhenTheContextEnds(t *testing.T) {
 	start := time.Now()
 	if err := (&Pace{}).Wait(ctx); err == nil || time.Since(start) > time.Second {
 		t.Errorf("the real Wait did not stop when its context ended (%v)", err)
+	}
+}
+
+func TestTwoWaitsAtOnceGoAtLeastTwoSecondsApart(t *testing.T) {
+	// A clock that does not move while they sleep: each Wait's sleep is the
+	// time from now its request goes.
+	start := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	var mu sync.Mutex
+	var goes []time.Time
+	p := &Pace{
+		Now:  func() time.Time { return start },
+		Rand: func() float64 { return 0 }, // the shortest gap, 2 s
+		Sleep: func(_ context.Context, d time.Duration) error {
+			mu.Lock()
+			goes = append(goes, start.Add(d))
+			mu.Unlock()
+			return nil
+		},
+	}
+	var wg sync.WaitGroup
+	for range 2 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := p.Wait(context.Background()); err != nil {
+				t.Error(err)
+			}
+		}()
+	}
+	wg.Wait()
+	if len(goes) != 2 {
+		t.Fatalf("%d waits ended, want 2", len(goes))
+	}
+	slices.SortFunc(goes, func(a, b time.Time) int { return a.Compare(b) })
+	if gap := goes[1].Sub(goes[0]); gap < MinGap {
+		t.Errorf("two requests %v apart, want at least %v", gap, MinGap)
+	}
+	if goes[0].Sub(start) < MinGap {
+		t.Errorf("the first request went %v after the call, want at least %v", goes[0].Sub(start), MinGap)
+	}
+
+	// A third, after both, goes 2 s after the second; one long after them
+	// goes 2 s after its own call.
+	c := newClock()
+	q := c.pace()
+	for range 3 {
+		if err := q.Wait(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i, d := range c.slept {
+		if d != MinGap {
+			t.Errorf("sequential wait %d slept %v, want %v", i, d, MinGap)
+		}
+	}
+	c.now = c.now.Add(time.Hour)
+	c.slept = nil
+	if err := q.Wait(context.Background()); err != nil || len(c.slept) != 1 || c.slept[0] != MinGap {
+		t.Errorf("a wait after an hour slept %v (%v), want %v", c.slept, err, MinGap)
+	}
+}
+
+func TestASuccessDuringARateLimitDoesNotLiftIt(t *testing.T) {
+	c := newClock()
+	p := c.pace()
+	p.Fail(wire.RateLimited)
+	c.now = c.now.Add(time.Minute)
+	p.Succeed() // a request sent before the block, answered during it
+	if k, blocked := p.Blocked(); !blocked || k != wire.RateLimited {
+		t.Fatalf("a success lifted the block: Blocked = %q, %v", k, blocked)
+	}
+	c.now = c.now.Add(15 * time.Minute)
+	if _, blocked := p.Blocked(); blocked {
+		t.Fatalf("the block did not end at its own time")
+	}
+	// Nor did it count as the success that starts the backoff over: the next
+	// block is 30 minutes.
+	p.Fail(wire.RateLimited)
+	c.now = c.now.Add(16 * time.Minute)
+	if _, blocked := p.Blocked(); !blocked {
+		t.Errorf("a success during the block started the backoff over")
+	}
+	// After the block, a success does start it over.
+	c.now = c.now.Add(15 * time.Minute)
+	p.Succeed()
+	p.Fail(wire.RateLimited)
+	c.now = c.now.Add(16 * time.Minute)
+	if _, blocked := p.Blocked(); blocked {
+		t.Errorf("a success after the block did not start the backoff over")
 	}
 }

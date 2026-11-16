@@ -523,8 +523,8 @@ var methods = map[string]handler{
 	},
 	"login": func(ctx context.Context, n network.Network, params json.RawMessage) (any, error) {
 		var p struct {
-			Method  string            `json:"method"`
-			Session map[string]string `json:"session"`
+			Method  string          `json:"method"`
+			Session network.Session `json:"session"`
 		}
 		if err := decode(params, &p); err != nil {
 			return nil, err

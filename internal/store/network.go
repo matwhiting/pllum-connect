@@ -109,3 +109,60 @@ func (s *Store) ChatOrder(network, chatID string) (order int64, ok bool) {
 	}
 	return order, true
 }
+
+// NetworkValue is a value a network keeps for itself (its client's state,
+// where it got to), in the meta table under "<network>.<name>"; ok is false
+// when none is kept.
+func (s *Store) NetworkValue(network, name string) (value string, ok bool, err error) {
+	if err := s.ready(); err != nil {
+		return "", false, err
+	}
+	if network == "" || name == "" {
+		return "", false, errBadRequest
+	}
+	err = s.db.QueryRow(`SELECT value FROM meta WHERE key = ?`, network+"."+name).Scan(&value)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, dbErr(err)
+	}
+	return value, true, nil
+}
+
+// PutNetworkValue keeps a network's value under "<network>.<name>"; an
+// empty value removes it.
+func (s *Store) PutNetworkValue(network, name, value string) error {
+	if network == "" || name == "" {
+		return errBadRequest
+	}
+	return s.write(func(tx *sql.Tx) error {
+		if value == "" {
+			_, err := tx.Exec(`DELETE FROM meta WHERE key = ?`, network+"."+name)
+			return err
+		}
+		_, err := tx.Exec(`INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)`, network+"."+name, value)
+		return err
+	})
+}
+
+// SeenThrough marks his lines in a chat (or the chat an alias names) sent at
+// or before throughMs as seen then, for a network whose read receipts say
+// "read up to this time" rather than naming lines. A line already seen keeps
+// its time.
+func (s *Store) SeenThrough(network, chatID string, throughMs int64) error {
+	if network == "" || chatID == "" || throughMs <= 0 {
+		return errBadRequest
+	}
+	return s.write(func(tx *sql.Tx) error {
+		chat, err := resolve(tx, network, chatID)
+		if err != nil {
+			return err
+		}
+		_, err = tx.Exec(`UPDATE messages SET seen_ms = ?
+				WHERE network = ? AND chat_id = ? AND from_me = 1 AND early = 0
+					AND ts_ms <= ? AND seen_ms IS NULL`,
+			throughMs, network, chat, throughMs)
+		return err
+	})
+}

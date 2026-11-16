@@ -21,6 +21,10 @@ const (
 // only ever given to Fail and never sent as an error.
 const ReconnectNeeded wire.Kind = "reconnectNeeded"
 
+// Banned is the third: Meta has suspended the account. Like ReconnectNeeded
+// it is a state's name (network.Banned), never sent as an error kind.
+const Banned wire.Kind = "banned"
+
 // rateBackoff is how long a rateLimited blocks, by how many have come in a
 // row; the last holds from then on.
 var rateBackoff = []time.Duration{15 * time.Minute, 30 * time.Minute, time.Hour, 2 * time.Hour, 4 * time.Hour}
@@ -29,8 +33,8 @@ var rateBackoff = []time.Duration{15 * time.Minute, 30 * time.Minute, time.Hour,
 // when Meta pushes back. Meta bans accounts that look like a script, and a
 // ban costs him the account, so after a rateLimited the helper waits (15
 // minutes, then twice as long each time, up to 4 hours; a success starts
-// over), and after a checkpoint or reconnectNeeded it does not ask again
-// until he has signed in again (Clear).
+// over), and after a checkpoint, reconnectNeeded or banned it does not ask
+// again until he has signed in again (Clear).
 //
 // The zero value is ready to use. Now, Sleep and Rand may be set before first
 // use, so a test runs on its own clock and never sleeps.
@@ -42,7 +46,8 @@ type Pace struct {
 	mu           sync.Mutex
 	rateLimits   int       // rateLimited seen since the last success
 	blockedUntil time.Time // a rateLimited block, until this time
-	until        wire.Kind // checkpoint or reconnectNeeded: blocked until Clear
+	until        wire.Kind // checkpoint, reconnectNeeded or banned: blocked until Clear
+	next         time.Time // the time the last Wait let its request go
 }
 
 func (p *Pace) now() time.Time {
@@ -59,13 +64,39 @@ func (p *Pace) rand() float64 {
 	return rand.Float64()
 }
 
-// Wait sleeps a random 2 to 4 seconds, the gap between one request and the
-// next, and returns ctx's error if ctx ends first.
+// Wait sleeps until the caller's request may go, and returns ctx's error if
+// ctx ends first. Requests go in the order Wait is called, each a random 2 to
+// 4 seconds after the one before (or after now, when the last was longer ago
+// than that), so callers on several goroutines never fire together.
 func (p *Pace) Wait(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	d := MinGap + time.Duration(p.rand()*float64(MaxGap-MinGap))
+	p.mu.Lock()
+	now := p.now()
+	from := now
+	if p.next.After(from) {
+		from = p.next
+	}
+	at := from.Add(MinGap + time.Duration(p.rand()*float64(MaxGap-MinGap)))
+	prev := p.next
+	p.next = at
+	p.mu.Unlock()
+
+	err := p.sleep(ctx, at.Sub(now))
+	if err != nil {
+		// The request will not go: the slot is given back, unless a later
+		// caller has already been given the one after it.
+		p.mu.Lock()
+		if p.next.Equal(at) {
+			p.next = prev
+		}
+		p.mu.Unlock()
+	}
+	return err
+}
+
+func (p *Pace) sleep(ctx context.Context, d time.Duration) error {
 	if p.Sleep != nil {
 		return p.Sleep(ctx, d)
 	}
@@ -79,16 +110,16 @@ func (p *Pace) Wait(ctx context.Context) error {
 	}
 }
 
-// Fail records that a request failed with kind. Only three kinds matter:
-// rateLimited starts or lengthens a timed block, checkpoint and
-// reconnectNeeded block until Clear. A rateLimited that comes while a block
+// Fail records that a request failed with kind. Only four kinds matter:
+// rateLimited starts or lengthens a timed block; checkpoint,
+// reconnectNeeded and banned block until Clear. A rateLimited that comes while a block
 // is running (a request sent before it began, failing after) does not
 // lengthen it. Any other kind is not Meta pushing back, and changes nothing.
 func (p *Pace) Fail(kind wire.Kind) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	switch kind {
-	case wire.Checkpoint, ReconnectNeeded:
+	case wire.Checkpoint, ReconnectNeeded, Banned:
 		if p.until == "" {
 			p.until = kind
 		}
@@ -104,16 +135,20 @@ func (p *Pace) Fail(kind wire.Kind) {
 }
 
 // Succeed records a request that Meta answered: the rateLimited backoff
-// starts over. A checkpoint is not lifted by one.
+// starts over. A success while a rate-limit block runs (a request sent
+// before it began) changes nothing: only the block's own end lifts it. A
+// checkpoint is not lifted by one either.
 func (p *Pace) Succeed() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.now().Before(p.blockedUntil) {
+		return
+	}
 	p.rateLimits = 0
-	p.blockedUntil = time.Time{}
 }
 
 // Blocked is the kind that stops requests now, and whether anything does. A
-// checkpoint or reconnectNeeded outranks a rateLimited.
+// checkpoint, reconnectNeeded or banned outranks a rateLimited.
 func (p *Pace) Blocked() (wire.Kind, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -126,8 +161,8 @@ func (p *Pace) Blocked() (wire.Kind, bool) {
 	return "", false
 }
 
-// Clear lifts a checkpoint or reconnectNeeded. Only a new login calls it: he
-// has signed in again, which is what they ask for. A rateLimited block is
+// Clear lifts a checkpoint, reconnectNeeded or banned. Only a new login
+// calls it: he has signed in again, which is what they ask for. A rateLimited block is
 // Meta's and stays until its time is up.
 func (p *Pace) Clear() {
 	p.mu.Lock()
