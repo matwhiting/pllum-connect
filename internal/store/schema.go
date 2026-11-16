@@ -2,7 +2,7 @@ package store
 
 // schemaVersion is the version written to meta. An older store is brought up
 // to it; a store from a newer helper is refused rather than guessed at.
-const schemaVersion = 9 // 2 added beeper_ids; 3 messages.early; 4 messages.copied; 5 the outbox's write; 6 one row per transaction; 7 the caller's send key; 8 chats.mute_end_ms; 9 stored exact-time twins folded
+const schemaVersion = 10 // 2 added beeper_ids; 3 messages.early; 4 messages.copied; 5 the outbox's write; 6 one row per transaction; 7 the caller's send key; 8 chats.mute_end_ms; 9 stored exact-time twins folded; 10 outgoing.line_id
 
 // schema makes every table. Every key starts with network, so each network
 // keeps to its own rows. Chats and messages have an integer rid, stable for
@@ -148,6 +148,7 @@ var schema = []string{
 		request BLOB,
 		message BLOB,
 		client_id TEXT,
+		line_id TEXT,
 		PRIMARY KEY (network, msg_id)
 	)`,
 	// One outbox row per caller transaction, so two calls racing with the
@@ -210,6 +211,7 @@ var addedColumns = []struct{ table, column, definition string }{
 	{"outgoing", "message", "BLOB"},                        // 5
 	{"outgoing", "client_id", "TEXT"},                      // 7
 	{"chats", "mute_end_ms", "INTEGER NOT NULL DEFAULT 0"}, // 8
+	{"outgoing", "line_id", "TEXT"},                        // 10
 }
 
 // lateSchema runs after addedColumns, on every open: what needs a column an

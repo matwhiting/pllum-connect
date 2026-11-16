@@ -11,7 +11,7 @@ The contract between Pllum and this helper. Pllum refuses any other protocol ver
 - Times are integers in Unix milliseconds, in fields ending `Ms`. Cursors are opaque strings. Unknown fields are ignored on both sides.
 - The first request is `hello` `{"protocol":1,"storeKey":"<64 hex>","app":"<Pllum version>"}` → `{"protocol":1,"version":"<helper version>","commit":"<git SHA>","networks":["whatsapp"]}`. Any other version → error `outdated`, and Pllum stops the helper. Before `hello`, every other request is `badRequest`.
 
-**Error kinds** (the only values of `kind`): `badRequest`, `unknownMethod`, `unknownNetwork`, `notConnected` (not signed in), `offline` (signed in, no connection now), `notFound`, `notOnNetwork` (a `beeper:` line), `refused` (WhatsApp turned it down before it was sent; safe to retry), `unclear` (it may have happened), `rateLimited`, `tooLarge`, `mediaGone`, `unsupported`, `storeKey`, `outdated`, `timeout`, `internal`.
+**Error kinds** (the only values of `kind`): `badRequest`, `unknownMethod`, `unknownNetwork`, `notConnected` (not signed in), `offline` (signed in, no connection now), `notFound`, `notOnNetwork` (a `beeper:` line), `refused` (WhatsApp turned it down before it was sent; safe to retry), `unclear` (it may have happened), `rateLimited`, `tooLarge`, `mediaGone`, `unsupported`, `storeKey`, `outdated`, `timeout`, `internal`, and, for networks signed in through a website, `checkpoint`, `pinWrong`, `pinLimit` (see Additions below).
 
 **States** (`status` and the `state` event): `notConnected`, `linking`, `connecting`, `catchingUp`, `live`, `offline`, `reconnectNeeded`, `outdated`, `banned`.
 
@@ -26,16 +26,16 @@ The contract between Pllum and this helper. Pllum refuses any other protocol ver
 | `hello` | `protocol`, `storeKey`, `app` | `protocol`, `version`, `commit`, `networks` |
 | `shutdown` | — | `{}`, then exits |
 | `status` | — | `state`, `selfChatID`\|null |
-| `login` | `method` (`"qr"`; `"session"` with `session` is step 3's) | `{}`; progress comes as `qr` and `state` events |
+| `login` | `method`: `"qr"`, or `"session"` with `session: {"<cookie name>": "<value>"}` (every value a string; an empty or mistyped `session` is `badRequest`) | `{}`; progress comes as `qr` and `state` events (for `session`, `state` events only; a failure is `state` `notConnected` with a `kind`) |
 | `cancelLogin`, `logout` | — | `{}` |
 | `nudge` | — | `{}`: reconnect now if not connected (after sleep) |
 | `chats` | `sinceMs`, `cursor`?, `limit` (≤200) | `items: [Chat]`, `cursor`? (newest activity first) |
 | `chat` | `chatID` | `chat: Chat`\|null |
-| `messages` | `chatID`, `before`?, `limit` (≤200) | `items: [Message]` oldest first, `hasMore`, `oldestCursor`? |
+| `messages` | `chatID`, `before`?, `limit` (≤200) | `items: [Message]` oldest first, `hasMore`, `oldestCursor`?. A page that reaches the oldest stored line (`hasMore` false) of a chat that is not `historyComplete` also asks the network to fetch older lines, if it can: at most once per chat per 10 s, never while one is running; the answer does not wait for it |
 | `search` | `text`?, `chatIDs`, `fromMe`?, `senderID`?, `afterMs`?, `beforeMs`?, `limit` (≤50), `cursor`? | `items: [Message]` newest first, `cursor`? |
 | `findChats` | `query`, `limit` (≤20) | `items: [Chat]` |
 | `send` | `chatID`, `text`, `replyTo`?, `file`? (an absolute path), `fileName`?, `clientID`? (the caller's own key for this send) | `messageID` (made before sending; returns at once). A repeat with the `clientID` of a send that is sending or sent returns that send's `messageID` and sends nothing more, even while not connected; one whose send failed makes a new send, which the key then names |
-| `sendStatus` | `messageID`, or `clientID` (the key a `send` was made with) instead | `state`: `sending`\|`sent`\|`failed`\|`unknown`, `kind`?; asked by `clientID`, also `messageID` of the send the key names (none, and `unknown`, when it names none). Both or neither is `badRequest` |
+| `sendStatus` | `messageID`, or `clientID` (the key a `send` was made with) instead | `state`: `sending`\|`sent`\|`failed`\|`unknown`, `kind`?, `lineID`?; asked by `clientID`, also `messageID` of the send the key names (none, and `unknown`, when it names none). Both or neither is `badRequest`. `lineID` is the ID of the line the send became, once the network has it and when it differs from the sent ID; only on `sent` |
 | `react` | `chatID`, `messageID`, `emoji` (`""` removes), `transactionID` | `{}` |
 | `markRead` | `chatID`, `through`? (a message ID; null = newest incoming) | `{}` |
 | `markUnread` | `chatID` | `{}` |
@@ -45,12 +45,25 @@ The contract between Pllum and this helper. Pllum refuses any other protocol ver
 | `beeperChats` | — | `map: {beeperChatID: chatID}` |
 | `lineIDs` | `beeperIDs: [String]` (≤1000) | `map: {beeperID: lineID}` |
 | `counts` | — | `chats`, `messages`, `imported`, `matched`, `unplacedChats`, `oldestMs`\|null, `nearMisses` (optional) |
+| `signIn` | — | `url`, `donePattern`, `cookieDomain`, `required: [String]`, `optional: [String]`, `userAgent`; `unsupported` for a network with no sign-in page |
+| `chatByParticipant` | `participantID` | `chat: Chat`\|null: the one-to-one with that person (never a group, never an unplaced chat; the most recently active if several) |
+| `encryptedHistory` | — | `state`: `noBackup`\|`needsPIN`\|`restored`\|`skipped`; `unsupported` for a network with none |
+| `restoreHistory` | `pin` (a string; `""` skips; missing is `badRequest`) | `{}`; errors `pinWrong` (with `attemptsRemaining`?), `pinLimit`; `unsupported` for a network with none |
 
 `counts.nearMisses` is a measure, a count only: per network, the Beeper-only lines (`source` beeper) in placed chats that have a direct line on the same side (`fromMe`) within 2000 ms, none of which has the same content as the Beeper line under the matcher's `MatchKey` rules. It reads text to compare and returns a number, never text, IDs or JIDs, and changes nothing about matching. A helper that does not send it is read as 0.
 
 `ImportMessage`: `{"beeperID","networkID"|null,"fromMe","senderID"|null,"senderName"|null,"timeMs","text"|null,"kind","hidden","deleted","replyToBeeperID"|null,"media":[{"kind","width","height"}],"reactions":[{"emoji","senderID","fromMe"}]}`. A null `chatID` makes or extends the unplaced chat `unplaced:<beeperChatID>`; `replaces` names an unplaced chat whose rows are dropped once this placed import has them. An exact-time, one-to-one twin counts as matched: a copy whose text differs (a mention, say) from a direct line that carries no Beeper ID, on the same side at the same non-zero `timeMs`, when each is the only such line at that time in the chat and both have text or share a media kind.
 
-**Events:** `state` `{state, kind?}`; `qr` `{code, expiresMs}`; `history` `{chats, messages, done}` (counts while the link-time sync arrives; `done` after a 100% batch or 120 s with none); `changed` `{}` (something to re-read; at most one per 500 ms per network).
+**Events:** `session` `{session}`: the full named cookie set of a network signed in through a website, sent when it differs from the last one sent (or the one `login` was given), at most once a minute, and never a set missing a required cookie; `state` `{state, kind?}`; `qr` `{code, expiresMs}`; `history` `{chats, messages, done}` (counts while the link-time sync arrives; `done` after a 100% batch or 120 s with none); `changed` `{}` (something to re-read; at most one per 500 ms per network).
+
+**Additions for networks signed in through a website** (Instagram, Messenger). All are additive, so the protocol stays 1; Pllum and the helper ship together.
+
+- `hello`'s `networks` lists `"instagram"` and `"messenger"` when the helper runs them.
+- `signIn`: Pllum shows `url` in a web view with `userAgent`, waits for an address matching `donePattern` (a regular expression on the full URL), reads the `required` and `optional` cookies of `cookieDomain`, and sends them as `login` with `method:"session"`. The helper presents the same user agent to Meta, so the window and the helper look like one browser.
+- Error kind `checkpoint`: Meta wants him to confirm it is him (a challenge, checkpoint or consent page). It is also a `state` `kind`. The helper makes no further requests until he signs in again.
+- Error kinds `pinWrong` and `pinLimit` are `restoreHistory`'s only. `pinWrong` may carry `attemptsRemaining`, an integer: `{"id":"…","error":{"kind":"pinWrong","attemptsRemaining":2}}`. No other error carries it.
+- `status` may carry `encrypted`: `notRegistered`\|`connecting`\|`live`\|`failed` (Messenger only; a network that has no end-to-end encryption leaves it out).
+- Pace: the helper leaves a random 2 to 4 s between requests to Meta. After `rateLimited` it makes none for 15 minutes, then 30, 60, 120 and 240 on each further one (a success starts over); after `checkpoint` or `reconnectNeeded` none until a new `login`.
 
 **Go interface each network implements** (`internal/network`):
 
@@ -59,7 +72,7 @@ type Network interface {
 	Name() string                                     // "whatsapp"
 	Start(ctx context.Context) error                  // connects if signed in; returns at once
 	Status() Status                                   // State, SelfChatID
-	Login(ctx context.Context, p LoginParams) error
+	Login(ctx context.Context, p LoginParams) error // LoginParams{Method string; Session map[string]string}
 	CancelLogin()
 	Logout(ctx context.Context) error
 	Nudge()
@@ -74,5 +87,20 @@ type Network interface {
 }
 ```
 
-Reads (`chats`, `chat`, `messages`, `search`, `findChats`) and the Beeper calls (`import`, `beeperChats`, `lineIDs`, `counts`) are answered by `server` from `store` for every network; a network only writes into the store.
+A network may also implement these optional interfaces, which `server` finds with a type assertion (`internal/network`):
+
+```go
+type SignInPager interface{ SignIn() meta.SignInPage }
+type OlderPages interface {
+	FetchOlder(ctx context.Context, chatID string) (added int, err error)
+}
+type EncryptedHistory interface {
+	HistoryState() string
+	RestoreHistory(ctx context.Context, pin []byte) error
+}
+```
+
+A network without one answers `unsupported` to its method (`OlderPages` is simply not called).
+
+Reads (`chats`, `chat`, `messages`, `search`, `findChats`, `chatByParticipant`) and the Beeper calls (`import`, `beeperChats`, `lineIDs`, `counts`) are answered by `server` from `store` for every network; a network only writes into the store.
 

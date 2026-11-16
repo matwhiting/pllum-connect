@@ -24,6 +24,7 @@ type Outgoing struct {
 	Fail    string // the error kind, when failed
 	Txn     string // the caller's transaction ID, when it gave one
 	Client  string // the caller's own key for a send, when it gave one
+	LineID  string // the ID of the line the send became, once the network says; empty until then
 	MadeMs  int64
 	Request []byte
 	Message []byte
@@ -81,12 +82,25 @@ func (s *Store) SetOutgoingState(network, id, state, fail string) error {
 	})
 }
 
+// SetOutgoingLine keeps the ID of the line a send became, when it is not the
+// ID the send was made with (a network that learns the line's own ID only
+// after the send was acknowledged). An empty lineID clears it.
+func (s *Store) SetOutgoingLine(network, id, lineID string) error {
+	if network == "" || id == "" {
+		return errBadRequest
+	}
+	return s.write(func(tx *sql.Tx) error {
+		_, err := tx.Exec(`UPDATE outgoing SET line_id = NULLIF(?, '') WHERE network = ? AND msg_id = ?`, lineID, network, id)
+		return err
+	})
+}
+
 const outgoingColumns = `msg_id, chat_id, kind, state, COALESCE(fail, ''), COALESCE(txn, ''), made_ms, request, message,
-	COALESCE(client_id, '')`
+	COALESCE(client_id, ''), COALESCE(line_id, '')`
 
 func scanOutgoing(row interface{ Scan(...any) error }) (Outgoing, error) {
 	var o Outgoing
-	err := row.Scan(&o.ID, &o.ChatID, &o.Kind, &o.State, &o.Fail, &o.Txn, &o.MadeMs, &o.Request, &o.Message, &o.Client)
+	err := row.Scan(&o.ID, &o.ChatID, &o.Kind, &o.State, &o.Fail, &o.Txn, &o.MadeMs, &o.Request, &o.Message, &o.Client, &o.LineID)
 	return o, err
 }
 

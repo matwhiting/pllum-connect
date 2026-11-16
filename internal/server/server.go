@@ -42,7 +42,13 @@ type Deps struct {
 	Dir      string // the data folder; each network keeps its files under it
 	Open     func(key [32]byte) (*store.Store, error)
 	Networks func(st *store.Store, dir string, key [32]byte, emit network.Emit) []network.Network
+	// Now is the clock for the 10 s between two FetchOlder calls on a chat;
+	// nil is time.Now. It exists so a test needs no real waiting.
+	Now func() time.Time
 }
+
+// olderEvery is the least time between two FetchOlder calls on one chat.
+const olderEvery = 10 * time.Second
 
 // Serve answers requests from in until in ends, a shutdown request arrives or
 // ctx is cancelled, then stops the networks and returns within 5 s. It
@@ -55,6 +61,7 @@ func Serve(ctx context.Context, in io.Reader, out io.Writer, deps Deps) error {
 		deps:     deps,
 		out:      &lineWriter{w: out},
 		networks: map[string]network.Network{},
+		older:    map[string]olderState{},
 	}
 	lr := &lineReader{lines: make(chan line)}
 	go lr.run(in, ctx.Done())
@@ -89,6 +96,10 @@ type server struct {
 	networks map[string]network.Network
 	order    []network.Network
 	inFlight sync.WaitGroup
+
+	// FetchOlder calls: when each chat was last asked, and which are running.
+	olderMu sync.Mutex
+	older   map[string]olderState
 
 	// Events wait in held until hello's answer is out, so none precedes it.
 	evMu    sync.Mutex
@@ -137,7 +148,10 @@ func (s *server) handleLine(l line) (stop bool) {
 		s.answer(req.ID, wire.Empty)
 		return true
 	}
-	h, ok := methods[req.Method]
+	h, ok := s.ownMethod(req.Method)
+	if !ok {
+		h, ok = methods[req.Method]
+	}
 	if !ok {
 		h, ok = s.readMethod(req.Method)
 	}
@@ -163,7 +177,7 @@ func (s *server) handleLine(l line) (stop bool) {
 		defer s.inFlight.Done()
 		result, err := s.call(h, n, params)
 		if err != nil {
-			s.fail(req.ID, wire.KindOf(err))
+			s.failWith(req.ID, err)
 			return
 		}
 		s.answer(req.ID, result)
@@ -316,6 +330,15 @@ func (s *server) answer(id string, result any) {
 
 func (s *server) fail(id string, kind wire.Kind) {
 	s.out.write(wire.Response{ID: id, Error: &wire.ErrorBody{Kind: kind}})
+}
+
+// failWith answers with err's kind, and, for a wrong PIN, the tries left.
+func (s *server) failWith(id string, err error) {
+	body := &wire.ErrorBody{Kind: wire.KindOf(err)}
+	if n := wire.AttemptsOf(err); n != nil && *n >= 0 {
+		body.AttemptsRemaining = n
+	}
+	s.out.write(wire.Response{ID: id, Error: body})
 }
 
 // emit writes one event line; networks call it from any goroutine. Until
@@ -500,8 +523,8 @@ var methods = map[string]handler{
 	},
 	"login": func(ctx context.Context, n network.Network, params json.RawMessage) (any, error) {
 		var p struct {
-			Method  string          `json:"method"`
-			Session json.RawMessage `json:"session"`
+			Method  string            `json:"method"`
+			Session map[string]string `json:"session"`
 		}
 		if err := decode(params, &p); err != nil {
 			return nil, err
@@ -509,7 +532,7 @@ var methods = map[string]handler{
 		switch p.Method {
 		case network.LoginQR:
 		case network.LoginSession:
-			if len(p.Session) == 0 || bytes.Equal(p.Session, []byte("null")) {
+			if len(p.Session) == 0 {
 				return nil, badRequest
 			}
 		default:
@@ -549,37 +572,6 @@ var methods = map[string]handler{
 			return nil, err
 		}
 		return map[string]any{"messageID": id}, nil
-	},
-	"sendStatus": func(ctx context.Context, n network.Network, params json.RawMessage) (any, error) {
-		var p struct {
-			MessageID string `json:"messageID"`
-			ClientID  string `json:"clientID"`
-		}
-		if err := decode(params, &p); err != nil {
-			return nil, err
-		}
-		if (p.MessageID == "") == (p.ClientID == "") {
-			return nil, badRequest
-		}
-		r := map[string]any{}
-		id := p.MessageID
-		if p.ClientID != "" {
-			// asked by the caller's key: the send it names, when there is one
-			var err error
-			if id, err = n.SendFor(p.ClientID); err != nil {
-				return nil, err
-			}
-			if id == "" {
-				return map[string]any{"state": network.SendUnknown}, nil
-			}
-			r["messageID"] = id
-		}
-		st := n.SendState(id)
-		r["state"] = st.State
-		if st.Kind != "" {
-			r["kind"] = wire.KindOf(&wire.Error{Kind: st.Kind})
-		}
-		return r, nil
 	},
 	"react": func(ctx context.Context, n network.Network, params json.RawMessage) (any, error) {
 		var p struct {
@@ -691,10 +683,36 @@ func (s *server) readMethod(name string) (handler, bool) {
 	}, true
 }
 
+// messagesPage reads one page of a chat's lines, and says which chat it is.
+func messagesPage(st *store.Store, network string, params json.RawMessage) (store.MessagePage, string, error) {
+	var p struct {
+		ChatID string `json:"chatID"`
+		Before string `json:"before"`
+		Limit  int    `json:"limit"`
+	}
+	if err := decode(params, &p); err != nil {
+		return store.MessagePage{}, "", err
+	}
+	if p.ChatID == "" {
+		return store.MessagePage{}, "", badRequest
+	}
+	page, err := st.Messages(network, p.ChatID, p.Before, p.Limit)
+	return page, p.ChatID, err
+}
+
+func messagesResult(page store.MessagePage) map[string]any {
+	r := map[string]any{"items": page.Items, "hasMore": page.HasMore}
+	if page.OldestCursor != "" {
+		r["oldestCursor"] = page.OldestCursor
+	}
+	return r
+}
+
 // readHandler answers one read or Beeper method from the store.
 type readHandler func(st *store.Store, network string, params json.RawMessage) (any, error)
 
-// reads are the methods answered from the store.
+// reads are the methods answered from the store alone. (messages is
+// answered by ownMethod, which also asks for older lines.)
 var reads = map[string]readHandler{
 	"chats": func(st *store.Store, network string, params json.RawMessage) (any, error) {
 		var p struct {
@@ -728,28 +746,6 @@ var reads = map[string]readHandler{
 			return map[string]any{"chat": nil}, nil
 		}
 		return map[string]any{"chat": c}, nil
-	},
-	"messages": func(st *store.Store, network string, params json.RawMessage) (any, error) {
-		var p struct {
-			ChatID string `json:"chatID"`
-			Before string `json:"before"`
-			Limit  int    `json:"limit"`
-		}
-		if err := decode(params, &p); err != nil {
-			return nil, err
-		}
-		if p.ChatID == "" {
-			return nil, badRequest
-		}
-		page, err := st.Messages(network, p.ChatID, p.Before, p.Limit)
-		if err != nil {
-			return nil, err
-		}
-		r := map[string]any{"items": page.Items, "hasMore": page.HasMore}
-		if page.OldestCursor != "" {
-			r["oldestCursor"] = page.OldestCursor
-		}
-		return r, nil
 	},
 	"search": func(st *store.Store, network string, params json.RawMessage) (any, error) {
 		var p struct {

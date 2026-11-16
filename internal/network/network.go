@@ -4,8 +4,8 @@ package network
 
 import (
 	"context"
-	"encoding/json"
 
+	"github.com/matwhiting/pllum-connect/internal/meta"
 	"github.com/matwhiting/pllum-connect/internal/wire"
 )
 
@@ -53,8 +53,8 @@ type Status struct {
 
 // LoginParams are `login`'s params besides `network`.
 type LoginParams struct {
-	Method  string          // "qr", or "session" with Session
-	Session json.RawMessage // opaque; its shape belongs to the network that takes it
+	Method  string            // "qr", or "session" with Session
+	Session map[string]string // cookie name → value, for "session"; nil for "qr"
 }
 
 // The login methods of protocol 1.
@@ -112,4 +112,33 @@ type Network interface {
 	SetMuted(ctx context.Context, chatID string, muted bool) error
 	Media(ctx context.Context, chatID, messageID string) (path string, err error)
 	Stop()
+}
+
+// The interfaces below are optional: a network implements the ones it has,
+// and server checks for them with a type assertion, answering `unsupported`
+// (or doing nothing) for a network without. Step 2's Network is unchanged.
+
+// SignInPager is a network that signs in through a website: `signIn` answers
+// with its page, and Pllum shows it and sends the cookies back as a `login`
+// of method "session".
+type SignInPager interface {
+	SignIn() meta.SignInPage
+}
+
+// OlderPages is a network that can fetch history older than what the store
+// holds. server calls FetchOlder when `messages` reaches the oldest stored
+// line of a chat that is not historyComplete, at most once per chat per 10 s,
+// and not again while one is running. It returns how many lines it added.
+type OlderPages interface {
+	FetchOlder(ctx context.Context, chatID string) (added int, err error)
+}
+
+// EncryptedHistory is a network whose end-to-end encrypted history is
+// restored with a PIN. HistoryState is "noBackup", "needsPIN", "restored" or
+// "skipped". RestoreHistory takes the PIN as typed; an empty pin skips the
+// restore. A wrong PIN is a *wire.Error of kind PinWrong (with
+// AttemptsRemaining when known); too many is PinLimit.
+type EncryptedHistory interface {
+	HistoryState() string
+	RestoreHistory(ctx context.Context, pin []byte) error
 }

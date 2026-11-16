@@ -154,6 +154,24 @@ func start(t *testing.T, fake *fakeNetwork) *harness {
 // store that holds nothing.
 func startWith(t *testing.T, fake *fakeNetwork, open func(dir string, key [32]byte) (*store.Store, error)) *harness {
 	t.Helper()
+	return startNets(t, func(emit network.Emit) []network.Network {
+		if fake == nil {
+			return nil
+		}
+		fake.rawEmit = emit
+		fake.emit = emit.For(fake.name)
+		if fake.onMade != nil {
+			fake.onMade(fake.emit)
+		}
+		return []network.Network{fake}
+	}, open, nil)
+}
+
+// startNets is startWith for any networks: make is given the server's emit
+// and returns them. A non-nil now is the server's clock.
+func startNets(t *testing.T, mk func(emit network.Emit) []network.Network,
+	open func(dir string, key [32]byte) (*store.Store, error), now func() time.Time) *harness {
+	t.Helper()
 	inR, inW := io.Pipe()
 	outR, outW := io.Pipe()
 	h := &harness{
@@ -166,6 +184,7 @@ func startWith(t *testing.T, fake *fakeNetwork, open func(dir string, key [32]by
 	dir := t.TempDir()
 	deps := Deps{
 		Dir: dir,
+		Now: now,
 		Open: func(key [32]byte) (*store.Store, error) {
 			h.opened <- key
 			if open != nil {
@@ -174,15 +193,7 @@ func startWith(t *testing.T, fake *fakeNetwork, open func(dir string, key [32]by
 			return &store.Store{}, nil
 		},
 		Networks: func(st *store.Store, dir string, key [32]byte, emit network.Emit) []network.Network {
-			if fake == nil {
-				return nil
-			}
-			fake.rawEmit = emit
-			fake.emit = emit.For(fake.name)
-			if fake.onMade != nil {
-				fake.onMade(fake.emit)
-			}
-			return []network.Network{fake}
+			return mk(emit)
 		},
 	}
 	go func() {

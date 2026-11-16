@@ -37,6 +37,13 @@ const (
 	Outdated       Kind = "outdated"
 	Timeout        Kind = "timeout"
 	Internal       Kind = "internal"
+
+	// Added for networks signed in through a website (PROTOCOL.md).
+	// Checkpoint: Meta wants him to confirm it is him (a challenge,
+	// checkpoint or consent page). PinWrong and PinLimit are restoreHistory's.
+	Checkpoint Kind = "checkpoint"
+	PinWrong   Kind = "pinWrong"
+	PinLimit   Kind = "pinLimit"
 )
 
 // Kinds lists every kind of protocol 1.
@@ -44,13 +51,27 @@ var Kinds = []Kind{
 	BadRequest, UnknownMethod, UnknownNetwork, NotConnected, Offline, NotFound,
 	NotOnNetwork, Refused, Unclear, RateLimited, TooLarge, MediaGone,
 	Unsupported, StoreKey, Outdated, Timeout, Internal,
+	Checkpoint, PinWrong, PinLimit,
 }
 
 // Error is an error that carries only its kind, so nothing private can ride
-// along in its text.
-type Error struct{ Kind Kind }
+// along in its text. AttemptsRemaining is the one extra: on PinWrong, how many
+// tries are left before PinLimit, when the network knows.
+type Error struct {
+	Kind              Kind
+	AttemptsRemaining *int
+}
 
 func (e *Error) Error() string { return string(e.Kind) }
+
+// AttemptsOf is the attempts remaining err carries, for a PinWrong only.
+func AttemptsOf(err error) *int {
+	var e *Error
+	if errors.As(err, &e) && e != nil && e.Kind == PinWrong {
+		return e.AttemptsRemaining
+	}
+	return nil
+}
 
 // KindOf is the kind to send for err: the kind of the first *Error in its
 // chain, and Internal for anything else. A nil error has no kind.
@@ -90,7 +111,8 @@ type Response struct {
 
 // ErrorBody is an error response's body.
 type ErrorBody struct {
-	Kind Kind `json:"kind"`
+	Kind              Kind `json:"kind"`
+	AttemptsRemaining *int `json:"attemptsRemaining,omitempty"`
 }
 
 // Empty is the result of a method that answers {}.
