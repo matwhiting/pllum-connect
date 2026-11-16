@@ -29,3 +29,5 @@ go test ./...
 ## Licence
 
 GNU Affero General Public License v3.0 (AGPL-3.0). See [LICENSE](LICENSE).
+
+The helper includes code from [mautrix-meta](https://github.com/mautrix/meta) (AGPL-3.0), used as a library: the packages `pkg/instameow`, `pkg/instameow/slidetypes` and `pkg/messagix` and its subpackages, for Instagram and Messenger. Those packages pull in parts of the mautrix bridge framework at build time, but the helper never uses them. It never imports `pkg/connector` or `pkg/igconnector`.
