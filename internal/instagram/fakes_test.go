@@ -145,6 +145,7 @@ type fakeMeta struct {
 	mailbox   *slidetypes.Mailbox
 	ownFBID   int64
 	indexErr  error // LoadIndex fails with it
+	stateErr  error // LoadState fails with it (the real one refuses a state over 24 hours old)
 	authFirst bool  // a failing request dispatches AuthError first, as the client does
 
 	// mailboxPage answers PaginateMailbox; threadInfo answers GetThread;
@@ -217,7 +218,7 @@ func (m *fakeMeta) dispatch(evt slidetypes.ClientEvent) error {
 }
 
 func (m *fakeMeta) newClient(p instameow.ClientParams) igClient {
-	c := &fakeIG{m: m, params: p}
+	c := &fakeIG{m: m, params: p, seq: p.SeqID}
 	m.mu.Lock()
 	m.clients = append(m.clients, c)
 	m.mu.Unlock()
@@ -237,6 +238,7 @@ type fakeIG struct {
 	m      *fakeMeta
 	params instameow.ClientParams
 	state  json.RawMessage // what LoadState was given
+	seq    int64           // where the socket subscribes from, as the real client keeps it
 }
 
 func (c *fakeIG) LoadIndex(ctx context.Context) (*types.PolarisViewer, *slidetypes.Mailbox, error) {
@@ -248,18 +250,42 @@ func (c *fakeIG) LoadIndex(ctx context.Context) (*types.PolarisViewer, *slidetyp
 		return nil, nil, c.fail(ctx, err)
 	}
 	_ = c.params.EventHandler(ctx, &slidetypes.ReconnectionStateUpdate{State: json.RawMessage(`{"Configs":{"invented":true}}`)})
+	// The real LoadIndex subscribes from the inbox it just loaded, whatever
+	// the client was given.
+	if mailbox != nil {
+		c.seq = mailbox.UQSeqID
+	}
 	return viewer, mailbox, nil
 }
 
 func (c *fakeIG) LoadState(state json.RawMessage) error {
 	c.m.record("LoadState", string(state))
+	c.m.mu.Lock()
+	err := c.m.stateErr
+	c.m.mu.Unlock()
+	if err != nil {
+		return err
+	}
 	c.state = state
 	return nil
 }
 
 func (c *fakeIG) DumpState() (json.RawMessage, error) { return c.state, nil }
 
-func (c *fakeIG) Connect(ctx context.Context) { c.m.record("Connect", "") }
+func (c *fakeIG) Connect(ctx context.Context) { c.m.record("Connect", fmt.Sprint(c.seq)) }
+
+// argsOf are the args of every call called name, in order.
+func (m *fakeMeta) argsOf(name string) []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []string
+	for _, c := range m.calls {
+		if c.name == name {
+			out = append(out, c.arg)
+		}
+	}
+	return out
+}
 
 func (c *fakeIG) Disconnect() { c.m.record("Disconnect", "") }
 

@@ -23,6 +23,8 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"maps"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -127,7 +129,10 @@ type Instagram struct {
 	stopped     bool
 	ctx         context.Context
 	cancel      context.CancelFunc
-	session     network.Session // the cookies of the last login; never written anywhere
+	session     network.Session // the cookies held now (the login's, as Meta rotated them); never written anywhere
+	hashes      []string        // sessionHash of every version of the session held since the login
+	retry       bool            // the run ended for a passing reason: a nudge may start another
+	stopRetry   func() bool     // the timer for the rate limit's end
 	gen         int             // counts runs: events and results of an older one are dropped
 	cli         igClient
 	runCtx      context.Context // the current run's: ended when it is replaced
@@ -195,6 +200,11 @@ func (g *Instagram) Start(ctx context.Context) error {
 	}
 	g.ctx, g.cancel = context.WithCancel(context.WithoutCancel(ctx))
 	g.started = true
+	// A rate limit from an earlier run runs to its end, and the next one
+	// doubles from where it got to.
+	if until, step, ok := g.keptRateLimit(); ok {
+		g.pace.RestoreRateLimit(until, step)
+	}
 	// A session Meta stopped in an earlier run stays stopped: its state is
 	// reported again and nothing is asked until a new sign-in.
 	if kind, _, ok := g.keptBlock(); ok {
@@ -230,10 +240,12 @@ func (g *Instagram) Login(ctx context.Context, p network.LoginParams) error {
 		return errBadRequest
 	}
 	g.retire()
-	if kind, hash, ok := g.keptBlock(); ok {
-		if hash == sessionHash(session) {
-			// The session Meta stopped, sent again from the Keychain at
-			// start: refused here, with no request.
+	hash := sessionHash(session)
+	if kind, stopped, ok := g.keptBlock(); ok {
+		if slices.Contains(stopped, hash) {
+			// The session Meta stopped (any version of it Pllum was given),
+			// sent again from the Keychain at start: refused here, with no
+			// request.
 			g.holdBlock(kind)
 			return nil
 		}
@@ -244,6 +256,7 @@ func (g *Instagram) Login(ctx context.Context, p network.LoginParams) error {
 	// before (a checkpoint, a new session) is done. Only here.
 	g.pace.Clear()
 	g.session = session
+	g.hashes = []string{hash}
 	g.diff.Seed(session)
 	g.setState(network.Connecting, "")
 	g.startRun()
@@ -297,19 +310,26 @@ func (g *Instagram) Logout(ctx context.Context) error {
 	return nil
 }
 
-// Nudge tries the sign-in again, with the cookies it was given, after it
-// failed for a passing reason (no connection, a rate limit that has run
-// out). A dropped socket is the library's to reconnect, and a checkpoint,
-// an ended session or a suspension waits for a new login.
+// Nudge tries again, with the cookies it holds, after a sign-in or an inbox
+// reload failed for a passing reason: no connection or a timeout. A rate
+// limit is retried when its block ends (not before), a dropped socket is
+// the library's to reconnect, anything else waits for a new login.
 func (g *Instagram) Nudge() {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	if !g.started || g.stopped || g.session == nil || g.cli != nil || g.state != network.NotConnected {
-		return
+	if g.retry {
+		g.again()
 	}
-	switch g.kind {
-	case wire.Offline, wire.Timeout, wire.RateLimited, wire.Internal:
-	default:
+}
+
+// passing reports whether a failure of this kind may be retried: no
+// connection, or a timeout.
+func passing(kind wire.Kind) bool { return kind == wire.Offline || kind == wire.Timeout }
+
+// again starts a new run with the held cookies, unless the pace forbids a
+// request now. g.mu is held.
+func (g *Instagram) again() {
+	if !g.started || g.stopped || g.session == nil || g.cli != nil {
 		return
 	}
 	if _, blocked := g.pace.Blocked(); blocked {
@@ -318,6 +338,35 @@ func (g *Instagram) Nudge() {
 	g.retire()
 	g.setState(network.Connecting, "")
 	g.startRun()
+}
+
+// failed ends run gen after a failure that is not Meta stopping the session
+// (pushedBack has set those): the state is s with the kind, a passing kind
+// may be nudged, and a rate limit tries again by itself when its block
+// ends. g.mu is held.
+func (g *Instagram) failed(gen int, s network.State, kind wire.Kind) {
+	if gen != g.gen || g.stopped {
+		return
+	}
+	g.retire()
+	shown := kind
+	if s == network.Offline && kind == wire.Offline {
+		shown = ""
+	}
+	g.setState(s, shown)
+	g.retry = passing(kind)
+	if kind != wire.RateLimited {
+		return
+	}
+	until, _ := g.pace.RateLimit()
+	gen = g.gen
+	g.stopRetry = g.clock.AfterFunc(until.Sub(g.clock.Now()), func() {
+		g.mu.Lock()
+		defer g.mu.Unlock()
+		if gen == g.gen {
+			g.again()
+		}
+	})
 }
 
 // Stop disconnects and waits briefly for the network's work to end. The
@@ -384,6 +433,11 @@ func (g *Instagram) Media(ctx context.Context, chatID, messageID string) (string
 // held.
 func (g *Instagram) retire() {
 	g.gen++
+	g.retry = false
+	if g.stopRetry != nil {
+		g.stopRetry()
+		g.stopRetry = nil
+	}
 	if g.runCancel != nil {
 		g.runCancel()
 		g.runCancel = nil
@@ -435,9 +489,18 @@ func (g *Instagram) running() (gen int, cli igClient, ctx context.Context) {
 	return g.gen, g.cli, g.runCtx
 }
 
-// run makes a client for the session, loads the inbox (LoadIndex), stores
-// it, connects the socket and fills in the history.
+// run makes a client for the session and connects it. With the client's
+// saved state for this session it resumes, as igconnector does: LoadState
+// keeps the saved seq, and the socket replays what came while Pllum was
+// closed. Otherwise (none saved, too old, the first backfill unfinished, or
+// a resnapshot cleared the seq) it loads the inbox (LoadIndex), stores it,
+// connects and fills in the history. Nothing is made while the pace
+// forbids a request.
 func (g *Instagram) run(ctx context.Context, gen int, session network.Session) {
+	if err := g.gate(); err != nil {
+		g.signInFailed(gen, kindOf(err))
+		return
+	}
 	ck := &cookies.Cookies{Platform: types.Instagram}
 	values := make(map[cookies.MetaCookieName]string, len(session))
 	for name, v := range session {
@@ -461,11 +524,16 @@ func (g *Instagram) run(ctx context.Context, gen int, session network.Session) {
 	g.cli = cli
 	g.mu.Unlock()
 
-	// The configs the client loaded last time, for this same account, spare
-	// it a page load when they are fresh. Too old, and the client says so
-	// and loads them again.
-	if state, ok := g.savedState(ck); ok {
-		_ = cli.LoadState(state)
+	if state, ok := g.savedState(session); ok && seq != 0 && g.value("backfilled") != "" {
+		if cli.LoadState(state) == nil {
+			g.setViewer(cli.GetOwnFBID(), "")
+			g.work.Add(1)
+			go func() {
+				defer g.work.Done()
+				cli.Connect(ctx)
+			}()
+			return
+		}
 	}
 	var viewer *types.PolarisViewer
 	var mailbox *slidetypes.Mailbox
@@ -499,16 +567,11 @@ func (g *Instagram) run(ctx context.Context, gen int, session network.Session) {
 
 // signInFailed: the run's LoadIndex failed with kind. A checkpoint, an
 // ended session or a suspension has already set its state (pushedBack);
-// anything else leaves him not connected, with the kind, and a nudge may
-// try again.
+// anything else leaves him not connected, with the kind (see failed).
 func (g *Instagram) signInFailed(gen int, kind wire.Kind) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	if gen != g.gen || g.stopped {
-		return
-	}
-	g.retire()
-	g.setState(network.NotConnected, kind)
+	g.failed(gen, network.NotConnected, kind)
 }
 
 // request makes one request to Meta through the pace: none while a block is
@@ -531,11 +594,13 @@ func (g *Instagram) request(ctx context.Context, gen int, fn func(ctx context.Co
 	err := fn(ctx)
 	if err == nil {
 		g.pace.Succeed()
+		g.keepRateLimit()
 		g.checkSession(gen)
 		return nil
 	}
 	kind := kindOf(err)
 	g.pace.Fail(kind)
+	g.keepRateLimit()
 	g.pushedBack(gen, kind)
 	return &wire.Error{Kind: errorKind(kind)}
 }
@@ -557,7 +622,12 @@ func kindOf(err error) wire.Kind {
 		errors.Is(err, httpclient.ErrCheckpointRequired),
 		errors.Is(err, httpclient.ErrConsentRequired):
 		return wire.Checkpoint
-	case errors.Is(err, httpclient.ErrTokenInvalidated):
+	case errors.Is(err, httpclient.ErrTokenInvalidated),
+		// Both mean the session no longer works: Meta's GraphQL error
+		// 1357053 (igconnector's bad credentials), and the redirect loop
+		// the library counts as permanent.
+		errors.Is(err, httpclient.ErrTooManyRedirects),
+		isMetaError(err, 1357053):
 		return meta.ReconnectNeeded
 	case errors.Is(err, httpclient.ErrAccountSuspended):
 		return meta.Banned
@@ -573,6 +643,12 @@ func kindOf(err error) wire.Kind {
 		return e.Kind
 	}
 	return wire.Internal
+}
+
+// isMetaError reports whether err is Meta's error response with code.
+func isMetaError(err error, code int) bool {
+	var e *types.ErrorResponse
+	return errors.As(err, &e) && e != nil && e.ErrorCode == code
 }
 
 // errorKind is the wire kind to return for kind: reconnectNeeded and banned
@@ -614,8 +690,13 @@ func (g *Instagram) pushedBack(gen int, kind wire.Kind) {
 	}
 	g.retire()
 	g.setState(s, k)
-	// Kept, so neither a restart nor the same cookies sent again asks Meta.
-	_ = g.keep("block", string(kind)+"\n"+sessionHash(g.session))
+	// Kept, so neither a restart nor any version of these cookies sent again
+	// asks Meta.
+	hashes := g.hashes
+	if len(hashes) == 0 {
+		hashes = []string{sessionHash(g.session)}
+	}
+	_ = g.keep("block", string(kind)+"\n"+strings.Join(hashes, ","))
 }
 
 // sessionHash is a SHA-256 of a session's required cookies: what tells the
@@ -630,16 +711,45 @@ func sessionHash(s network.Session) string {
 }
 
 // keptBlock is the kind that stopped a session in this or an earlier run,
-// and that session's hash; ok is false when none is kept.
-func (g *Instagram) keptBlock() (kind wire.Kind, hash string, ok bool) {
-	k, hash, ok := strings.Cut(g.value("block"), "\n")
-	if !ok || hash == "" {
-		return "", "", false
+// and the hashes of every version of that session; ok is false when none
+// is kept.
+func (g *Instagram) keptBlock() (kind wire.Kind, hashes []string, ok bool) {
+	k, list, ok := strings.Cut(g.value("block"), "\n")
+	if !ok || list == "" {
+		return "", nil, false
 	}
 	if _, _, terminal := stateFor(wire.Kind(k)); !terminal {
-		return "", "", false
+		return "", nil, false
 	}
-	return wire.Kind(k), hash, true
+	return wire.Kind(k), strings.Split(list, ","), true
+}
+
+// keepRateLimit keeps the pace's rate limit (its end and its count) so a
+// restart carries it on; nothing when there is none.
+func (g *Instagram) keepRateLimit() {
+	until, step := g.pace.RateLimit()
+	v := ""
+	if step > 0 || !until.IsZero() {
+		v = strconv.FormatInt(until.UnixMilli(), 10) + "\n" + strconv.Itoa(step)
+	}
+	_ = g.keep("rate", v)
+}
+
+// keptRateLimit is the rate limit an earlier run kept.
+func (g *Instagram) keptRateLimit() (until time.Time, step int, ok bool) {
+	ms, n, ok := strings.Cut(g.value("rate"), "\n")
+	if !ok {
+		return time.Time{}, 0, false
+	}
+	untilMs, err1 := strconv.ParseInt(ms, 10, 64)
+	step, err2 := strconv.Atoi(n)
+	if err1 != nil || err2 != nil {
+		return time.Time{}, 0, false
+	}
+	if untilMs > 0 {
+		until = time.UnixMilli(untilMs)
+	}
+	return until, step, true
 }
 
 // holdBlock reports a kept block's state again and blocks the pace on it
@@ -661,9 +771,25 @@ func (g *Instagram) checkSession(gen int) {
 	if !ok {
 		return
 	}
-	if s, changed := g.diff.Changed(cli.GetCookies(), g.clock.Now()); changed {
-		g.emit(map[string]any{"event": "session", "session": s})
+	s, changed := g.diff.Changed(cli.GetCookies(), g.clock.Now())
+	if !changed {
+		return
 	}
+	// The rotated set is the session now: Pllum keeps it, a nudge signs in
+	// with it, and a block names it as well as the versions before.
+	g.mu.Lock()
+	if gen == g.gen {
+		g.session = network.Session(maps.Clone(s))
+		hash := sessionHash(g.session)
+		if !slices.Contains(g.hashes, hash) {
+			g.hashes = append(g.hashes, hash)
+		}
+		if g.value("state") != "" {
+			_ = g.keep("account", hash)
+		}
+	}
+	g.mu.Unlock()
+	g.emit(map[string]any{"event": "session", "session": s})
 }
 
 // setState moves the state and tells Pllum; g.mu is held. The state event
@@ -708,6 +834,10 @@ func (g *Instagram) handlerFor(gen int) instameow.EventHandler {
 		case *slidetypes.ReconnectionStateUpdate:
 			g.saveState(e.State)
 		case *slidetypes.ResnapshotRequired:
+			// The saved seq is too far behind to resume from: the next
+			// start loads the inbox.
+			_ = g.keep("seq", "")
+			_ = g.keep("seqTS", "")
 			g.resnapshot(gen)
 		case *slidetypes.Delta:
 			g.onDelta(ctx, gen, e)
@@ -789,23 +919,24 @@ func (g *Instagram) savedSeq() (int64, time.Time) {
 	return seq, time.UnixMilli(ms)
 }
 
-// saveState keeps the client's dumped state, for the account signed in now.
+// saveState keeps the client's dumped state, for the session held now (by
+// its hash: the state's tokens belong to that session).
 func (g *Instagram) saveState(state json.RawMessage) {
 	g.mu.Lock()
-	account := g.session[string(cookies.IGCookieDSUserID)]
+	session := g.session
 	g.mu.Unlock()
-	if len(state) == 0 || account == "" {
+	if len(state) == 0 || session == nil {
 		return
 	}
 	_ = g.keep("state", string(state))
-	_ = g.keep("account", account)
+	_ = g.keep("account", sessionHash(session))
 }
 
-// savedState is the dumped state kept for the account these cookies sign in
-// to; another account's is never loaded.
-func (g *Instagram) savedState(ck *cookies.Cookies) (json.RawMessage, bool) {
+// savedState is the dumped state kept for this session; another session's
+// (another account, or a new sign-in) is never loaded.
+func (g *Instagram) savedState(session network.Session) (json.RawMessage, bool) {
 	state := g.value("state")
-	if state == "" || g.value("account") != ck.Get(cookies.IGCookieDSUserID) {
+	if state == "" || g.value("account") != sessionHash(session) {
 		return nil, false
 	}
 	return json.RawMessage(state), true
@@ -813,7 +944,8 @@ func (g *Instagram) savedState(ck *cookies.Cookies) (json.RawMessage, bool) {
 
 // resnapshot: Meta says the socket is too far behind to resume. The library
 // has stopped it; the inbox is loaded again (through the pace) and it
-// connects anew.
+// connects anew. If that fails, the run ends offline (with rateLimited
+// while a block is in force), for a nudge or the block's end to retry.
 func (g *Instagram) resnapshot(gen int) {
 	cur, cli, ctx := g.running()
 	if cur != gen || cli == nil || ctx == nil {
@@ -829,7 +961,13 @@ func (g *Instagram) resnapshot(gen int) {
 			_, mailbox, err = cli.LoadIndex(ctx)
 			return err
 		})
-		if err != nil || !g.current(gen) {
+		if err != nil {
+			g.mu.Lock()
+			g.failed(gen, network.Offline, kindOf(err))
+			g.mu.Unlock()
+			return
+		}
+		if !g.current(gen) {
 			return
 		}
 		if mailbox != nil {

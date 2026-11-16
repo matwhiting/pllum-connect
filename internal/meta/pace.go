@@ -169,3 +169,24 @@ func (p *Pace) Clear() {
 	defer p.mu.Unlock()
 	p.until = ""
 }
+
+// RateLimit is the rate-limit block in force (its end, zero for none) and
+// how many rateLimited have come since the last success, so a restart can
+// carry them on (RestoreRateLimit).
+func (p *Pace) RateLimit() (until time.Time, step int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.blockedUntil, p.rateLimits
+}
+
+// RestoreRateLimit takes up a block and count RateLimit gave in an earlier
+// run: the block runs to its end, and the next rateLimited doubles from the
+// count.
+func (p *Pace) RestoreRateLimit(until time.Time, step int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if until.After(p.blockedUntil) {
+		p.blockedUntil = until
+	}
+	p.rateLimits = max(p.rateLimits, step)
+}

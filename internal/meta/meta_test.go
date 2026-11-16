@@ -416,3 +416,25 @@ func TestASuccessDuringARateLimitDoesNotLiftIt(t *testing.T) {
 		t.Errorf("a success after the block did not start the backoff over")
 	}
 }
+
+func TestARateLimitCarriesOverToANewPace(t *testing.T) {
+	c := newClock()
+	p := c.pace()
+	p.Fail(wire.RateLimited)
+	until, step := p.RateLimit()
+	if step != 1 || !until.Equal(c.now.Add(15*time.Minute)) {
+		t.Fatalf("RateLimit = %v, %d", until, step)
+	}
+	q := c.pace() // a restart
+	q.RestoreRateLimit(until, step)
+	c.now = c.now.Add(14 * time.Minute)
+	if _, blocked := q.Blocked(); !blocked {
+		t.Errorf("the restored block ended early")
+	}
+	c.now = c.now.Add(2 * time.Minute)
+	q.Fail(wire.RateLimited)
+	c.now = c.now.Add(16 * time.Minute)
+	if _, blocked := q.Blocked(); !blocked {
+		t.Errorf("the next block after a restore was not 30 minutes")
+	}
+}

@@ -485,6 +485,9 @@ func TestPostsReelsStoriesAndCallsAreLabels(t *testing.T) {
 
 func TestARestartResumesFromTheSavedSeqID(t *testing.T) {
 	h := newHarness(t)
+	h.m.messagePage = func(igChatID, cursor string) (*slidetypes.PaginateMessagesResponse, error) {
+		return messagesPage(false, ""), nil // the first backfill completes
+	}
 	h.login(validSession())
 	saved := start.Add(-5 * time.Minute).Truncate(time.Millisecond)
 	if err := h.m.dispatch(&slidetypes.SeqIDUpdate{SeqID: 4242, Timestamp: saved}); err != nil {
@@ -493,7 +496,11 @@ func TestARestartResumesFromTheSavedSeqID(t *testing.T) {
 	dir, m := h.dir, h.m
 	h.close()
 
+	// With the client's saved state, a restart loads it and connects from
+	// the saved seq: no LoadIndex, which would subscribe from now and drop
+	// what came while Pllum was closed.
 	again := openHarness(t, dir, m)
+	indexes := m.count("LoadIndex")
 	again.login(validSession())
 	p := m.last().params
 	if p.SeqID != 4242 || !p.SeqIDTS.Equal(saved) {
@@ -502,15 +509,36 @@ func TestARestartResumesFromTheSavedSeqID(t *testing.T) {
 	if m.last().state == nil || !strings.Contains(string(m.last().state), "invented") {
 		t.Errorf("the saved client state was not loaded for the same account")
 	}
+	if n := m.count("LoadIndex") - indexes; n != 0 {
+		t.Errorf("a restart with saved state ran LoadIndex %d times, want 0", n)
+	}
+	if got := m.argsOf("Connect"); got[len(got)-1] != "4242" {
+		t.Errorf("the socket subscribed from seq %s, want 4242", got[len(got)-1])
+	}
 	again.close()
 
-	// Another account's state is never loaded.
+	// A state the client refuses (too old) loads the inbox instead.
+	m.stateErr = errors.New("cached state is too old")
+	stale := openHarness(t, dir, m)
+	indexes = m.count("LoadIndex")
+	stale.login(validSession())
+	if m.count("LoadIndex")-indexes != 1 {
+		t.Errorf("a refused state did not load the inbox")
+	}
+	stale.close()
+	m.stateErr = nil
+
+	// Another account's state is never loaded, and it loads the inbox.
 	other := openHarness(t, dir, m)
 	s := validSession()
 	s["ds_user_id"] = "4000000098"
+	indexes = m.count("LoadIndex")
 	other.login(s)
 	if m.last().state != nil {
 		t.Errorf("another account's state was loaded")
+	}
+	if m.count("LoadIndex")-indexes != 1 {
+		t.Errorf("another account did not load the inbox")
 	}
 }
 
@@ -590,11 +618,23 @@ func TestBackfillIsPacedAndStopsAtItsLimits(t *testing.T) {
 		t.Errorf("a thread with no earlier page is not historyComplete")
 	}
 
-	// The next sign-in asks again only for threads active since: none here.
+	// The next sign-in resumes from the saved state: no request at all (the
+	// socket replays what it missed).
 	before := len(h3.m.requests())
 	h3.login(validSession())
+	if got := h3.m.requests()[before:]; len(got) != 0 {
+		t.Errorf("a second sign-in with saved state made %v, want none", got)
+	}
+	// Without it, the inbox is loaded and only threads active since are
+	// asked again: none here.
+	if err := h3.st.PutNetworkValue(Name, "state", ""); err != nil {
+		t.Fatal(err)
+	}
+	h3.g.values = map[string]string{}
+	before = len(h3.m.requests())
+	h3.login(validSession())
 	if got := h3.m.requests()[before:]; len(got) != 1 || got[0].name != "LoadIndex" {
-		t.Errorf("a second sign-in made %v, want LoadIndex only", got)
+		t.Errorf("a second sign-in without saved state made %v, want LoadIndex only", got)
 	}
 }
 

@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"go.mau.fi/mautrix-meta/pkg/instameow/slidetypes"
 	"go.mau.fi/mautrix-meta/pkg/messagix/httpclient"
@@ -130,12 +131,14 @@ func TestBannedAndEndedSessionsPersistToo(t *testing.T) {
 		})
 	}
 
-	// A rate limit is not kept: a restart signs in.
+	// A rate limit is not terminal: it outlives a restart only until its
+	// block ends, and then the same session signs in.
 	dir := stopOn(t, validSession(), httpclient.ErrRateLimited, true)
 	h := restart(t, dir)
+	h.clock.Advance(16 * mins)
 	h.login(validSession())
 	if h.m.count("LoadIndex") != 1 {
-		t.Errorf("a rate limit outlived the restart: %v", h.m.calls)
+		t.Errorf("after its block, a rate limit still stopped the session: %v", h.m.calls)
 	}
 }
 
@@ -156,3 +159,5 @@ func TestTheBlockStoresNoCookieValue(t *testing.T) {
 		t.Errorf("the block does not name its kind: %q", v)
 	}
 }
+
+const mins = time.Minute
