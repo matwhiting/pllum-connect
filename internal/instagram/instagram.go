@@ -19,9 +19,12 @@ package instagram
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -192,6 +195,11 @@ func (g *Instagram) Start(ctx context.Context) error {
 	}
 	g.ctx, g.cancel = context.WithCancel(context.WithoutCancel(ctx))
 	g.started = true
+	// A session Meta stopped in an earlier run stays stopped: its state is
+	// reported again and nothing is asked until a new sign-in.
+	if kind, _, ok := g.keptBlock(); ok {
+		g.holdBlock(kind)
+	}
 	return nil
 }
 
@@ -222,6 +230,16 @@ func (g *Instagram) Login(ctx context.Context, p network.LoginParams) error {
 		return errBadRequest
 	}
 	g.retire()
+	if kind, hash, ok := g.keptBlock(); ok {
+		if hash == sessionHash(session) {
+			// The session Meta stopped, sent again from the Keychain at
+			// start: refused here, with no request.
+			g.holdBlock(kind)
+			return nil
+		}
+		// A new session: he has signed in again in the window.
+		_ = g.keep("block", "")
+	}
 	// He has signed in again in the window: whatever Meta asked of him
 	// before (a checkpoint, a new session) is done. Only here.
 	g.pace.Clear()
@@ -596,6 +614,40 @@ func (g *Instagram) pushedBack(gen int, kind wire.Kind) {
 	}
 	g.retire()
 	g.setState(s, k)
+	// Kept, so neither a restart nor the same cookies sent again asks Meta.
+	_ = g.keep("block", string(kind)+"\n"+sessionHash(g.session))
+}
+
+// sessionHash is a SHA-256 of a session's required cookies: what tells the
+// session Meta stopped from a new sign-in, with no cookie value kept.
+// Optional cookies (rur rotates) do not count.
+func sessionHash(s network.Session) string {
+	h := sha256.New()
+	for _, name := range meta.InstagramPage.Required {
+		h.Write([]byte(name + "=" + s[name] + "\x00"))
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// keptBlock is the kind that stopped a session in this or an earlier run,
+// and that session's hash; ok is false when none is kept.
+func (g *Instagram) keptBlock() (kind wire.Kind, hash string, ok bool) {
+	k, hash, ok := strings.Cut(g.value("block"), "\n")
+	if !ok || hash == "" {
+		return "", "", false
+	}
+	if _, _, terminal := stateFor(wire.Kind(k)); !terminal {
+		return "", "", false
+	}
+	return wire.Kind(k), hash, true
+}
+
+// holdBlock reports a kept block's state again and blocks the pace on it
+// (never Clear: only a new session lifts it). g.mu is held.
+func (g *Instagram) holdBlock(kind wire.Kind) {
+	st, k, _ := stateFor(kind)
+	g.pace.Fail(kind)
+	g.setState(st, k)
 }
 
 // checkSession sends the session event when the client's cookies have

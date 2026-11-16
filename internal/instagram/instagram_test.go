@@ -221,12 +221,22 @@ func TestACheckpointStopsEveryRequestUntilANewLogin(t *testing.T) {
 		t.Errorf("FetchOlder after a socket AuthError = %v, want checkpoint", err)
 	}
 
-	// He signs in again in the window: a new login asks again.
+	// The same cookies sent again (Pllum's start-up login) ask nothing.
+	_ = h.g.Login(context.Background(), network.LoginParams{Method: network.LoginSession, Session: validSession()})
+	h.settle()
+	if got := len(h.m.requests()); got != calls {
+		t.Errorf("the stopped session, sent again, made %d requests", got-calls)
+	}
+
+	// He signs in again in the window (a new session): a new login asks
+	// again.
 	h.m.authFirst = false
 	h.m.mailboxPage = func(n int, cursor string) (*slidetypes.PaginateMailboxResponse, error) {
 		return &slidetypes.PaginateMailboxResponse{Mailbox: &slidetypes.MailboxPage{}}, nil
 	}
-	h.login(validSession())
+	fresh := validSession()
+	fresh["sessionid"] = "sess-invented-2"
+	h.login(fresh)
 	if got := len(h.m.requests()); got == calls {
 		t.Errorf("a new login made no requests")
 	}
