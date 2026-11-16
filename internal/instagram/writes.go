@@ -1,25 +1,32 @@
 package instagram
 
 import (
+	"bytes"
 	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	"mime/multipart"
 	"net"
 	"net/http"
+	"net/textproto"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/google/go-querystring/query"
 	"go.mau.fi/mautrix-meta/pkg/instameow"
 	"go.mau.fi/mautrix-meta/pkg/instameow/slidetypes"
+	"go.mau.fi/mautrix-meta/pkg/messagix/graphql"
 	"go.mau.fi/mautrix-meta/pkg/messagix/httpclient"
 	"go.mau.fi/mautrix-meta/pkg/messagix/methods"
 	"go.mau.fi/mautrix-meta/pkg/messagix/types"
 	"go.mau.fi/util/jsontime"
+	"go.mau.fi/util/random"
 
 	"github.com/matwhiting/pllum-connect/internal/meta"
 	"github.com/matwhiting/pllum-connect/internal/network"
@@ -48,6 +55,20 @@ import (
 // A send still sending at start becomes unknown and is never sent again:
 // that Meta drops a second send with the same threading ID is unproven. An
 // echo carrying its threading ID still settles it.
+//
+// The library would also send again by itself; what it does here:
+//   - its HTTP layer re-POSTs a request up to five more times after a
+//     transport failure or a 5xx. The two send mutations are marked NoRetry
+//     (init, below), so a send is POSTed once. Reactions, read receipts and
+//     mutes keep the retries: sent twice, they come to the same.
+//   - on Meta's "please reload the page" answer (1357004), every mutation
+//     here reloads the inbox (ReloadIndex, at most once per 15 minutes) and
+//     is asked once more, outside the pace. Meta refused the first ask, so a
+//     message still goes once. Turning this off would mean calling
+//     GetHTTP().MakeGraphQLRequest directly; it is left as the library has it.
+//   - its media upload repeats itself on an answer it cannot read, with
+//     sleeps the context cannot cut short. Upload (below) is a one-shot
+//     copy of it instead.
 
 // igWriter is every write the adapter makes to Instagram, and nothing else:
 // a message (SendMessage), a photo or video (SendMedia after Upload), a
@@ -100,13 +121,140 @@ func (m metaClient) MuteThread(ctx context.Context, req *slidetypes.MuteThreadRe
 }
 
 // Upload uploads a file for a thread (named by its thread key, as
-// mautrix-meta's mediadl.ReuploadFileToMeta names it).
+// mautrix-meta's mediadl.ReuploadFileToMeta names it), asked once. It is
+// the library's SendMercuryUploadRequest (httpclient/mercury.go, mautrix-meta
+// v0.2610.0, AGPL-3.0 like this helper) with its retry loop taken out: the
+// same URL, headers and body, sent with MakeRequestOnce. The library's loop
+// asks up to five more times, sleeping 3 to 15 s where the context cannot
+// cut it short, whenever Meta's answer is an error it does not know; anti-
+// goal 1 forbids asking again after Meta said no.
 func (m metaClient) Upload(ctx context.Context, threadID int64, media *httpclient.MercuryUploadMedia) (*types.MercuryUploadResponse, error) {
 	h := m.c.GetHTTP()
 	if h == nil {
 		return nil, instameow.ErrClientIsNil
 	}
-	return h.SendMercuryUploadRequest(ctx, threadID, media)
+	values, err := query.Values(h.NewHTTPQuery())
+	if err != nil {
+		return nil, errInternal
+	}
+	url := m.c.GetEndpoint("media_upload") + values.Encode()
+	headers := h.BuildHeaders(true, false)
+	headers.Set("accept", "*/*")
+	headers.Set("origin", m.c.GetEndpoint("base_url"))
+	headers.Set("referer", m.c.GetEndpoint("thread")+strconv.FormatInt(threadID, 10)+"/")
+	headers.Set("priority", "u=1, i")
+	headers.Set("sec-fetch-dest", "empty")
+	headers.Set("sec-fetch-mode", "cors")
+	headers.Set("sec-fetch-site", "same-origin") // header is required
+	return uploadOnce(ctx, h, url, headers, media)
+}
+
+// onceRequester is the one request an upload makes: the client's
+// MakeRequestOnce (*httpclient.HTTPClient), which never repeats itself.
+type onceRequester interface {
+	MakeRequestOnce(ctx context.Context, url, method string, headers http.Header, payload []byte, contentType types.ContentType) (*http.Response, []byte, error)
+}
+
+// uploadOnce posts the upload's multipart body to url once and reads
+// Meta's answer. An error answer becomes a fixed kind: an ended session
+// (1357053, 1357001 "please log in") stops the pace like any other; a
+// consent page is a checkpoint; anything else is refused. A 429 is the
+// library's ErrRateLimited, which the pace backs off on.
+func uploadOnce(ctx context.Context, r onceRequester, url string, headers http.Header, media *httpclient.MercuryUploadMedia) (*types.MercuryUploadResponse, error) {
+	payload, contentType, err := mercuryPayload(media)
+	if err != nil {
+		return nil, errBadRequest
+	}
+	headers.Set("content-type", contentType)
+	_, body, err := r.MakeRequestOnce(ctx, url, http.MethodPost, headers, payload, types.NONE)
+	if err != nil {
+		return nil, err
+	}
+	var resp *types.MercuryUploadResponse
+	if err := json.Unmarshal(bytes.TrimPrefix(body, httpclient.AntiJSPrefix), &resp); err != nil || resp == nil {
+		return nil, errInternal
+	}
+	if resp.ErrorCode != 0 {
+		switch resp.ErrorCode {
+		case 1357053:
+			return nil, &resp.ErrorResponse // kindOf: an ended session
+		case types.ErrPleaseLogIn.ErrorCode:
+			return nil, httpclient.ErrTokenInvalidated
+		}
+		return nil, errRefused
+	}
+	if strings.Contains(resp.Redirect, "/consent/") {
+		return nil, httpclient.ErrConsentRequired
+	}
+	if uploadMetadata(resp) != nil {
+		return nil, errRefused
+	}
+	return resp, nil
+}
+
+// uploadMetadata reads the uploaded file's IDs: the library's
+// parseMetadata (httpclient/mercury.go, v0.2610.0), copied.
+func uploadMetadata(resp *types.MercuryUploadResponse) error {
+	if len(resp.Payload.Metadata) == 0 {
+		return errRefused
+	}
+	switch resp.Payload.Metadata[0] {
+	case '[':
+		var list []types.FileMetadata
+		if err := json.Unmarshal(resp.Payload.Metadata, &list); err != nil || len(list) == 0 {
+			return errRefused
+		}
+		resp.Payload.RealMetadata = &list[0]
+	case '{':
+		var byIndex map[string]types.FileMetadata
+		if err := json.Unmarshal(resp.Payload.Metadata, &byIndex); err != nil {
+			return errRefused
+		}
+		first := byIndex["0"]
+		resp.Payload.RealMetadata = &first
+	default:
+		return errRefused
+	}
+	return nil
+}
+
+// mercuryPayload is the upload's multipart body and its content type: the
+// library's newMercuryMediaPayload (httpclient/mercury.go, v0.2610.0),
+// copied.
+func mercuryPayload(media *httpclient.MercuryUploadMedia) ([]byte, string, error) {
+	var body bytes.Buffer
+	w := multipart.NewWriter(&body)
+	if err := w.SetBoundary("----WebKitFormBoundary" + random.String(16)); err != nil {
+		return nil, "", err
+	}
+	if media.IsVoiceClip {
+		if err := w.WriteField("voice_clip", "true"); err != nil {
+			return nil, "", err
+		}
+		if media.WaveformData != nil {
+			waveform, err := json.Marshal(media.WaveformData)
+			if err != nil {
+				return nil, "", err
+			}
+			if err := w.WriteField("voice_clip_waveform_data", string(waveform)); err != nil {
+				return nil, "", err
+			}
+		}
+	}
+	part := make(textproto.MIMEHeader)
+	part.Set("Content-Disposition", fmt.Sprintf(`form-data; name="farr"; filename="%s"`, media.Filename))
+	part.Set("Content-Type", media.MimeType)
+	pw, err := w.CreatePart(part)
+	if err != nil {
+		return nil, "", err
+	}
+	if _, err := pw.Write(media.MediaData); err != nil {
+		return nil, "", err
+	}
+	if err := w.Close(); err != nil {
+		return nil, "", err
+	}
+	return body.Bytes(), w.FormDataContentType(), nil
 }
 
 // writerFor is the writer of a client: the real one's through metaClient,
@@ -119,6 +267,18 @@ func writerFor(c igClient) igWriter {
 		return c
 	}
 	return nil
+}
+
+// The send mutations are asked once: the library's retries would POST the
+// same message again after a slow answer or a 5xx, and that Meta drops the
+// copy (same offline threading ID) is unproven. GraphQLDocs is a map of
+// values, so each doc is copied, flagged and stored back.
+func init() {
+	for _, name := range []string{"IGDirectTextSendMutation", "IGDirectMediaSendMutation"} {
+		doc := graphql.GraphQLDocs[name]
+		doc.NoRetry = true
+		graphql.GraphQLDocs[name] = doc
+	}
 }
 
 const (
@@ -151,6 +311,23 @@ type sendRequest struct {
 	TextOTID string `json:"textOTID,omitempty"` // a text sent before its file: the text's own
 	Target   string `json:"target,omitempty"`   // the line a reaction is to
 	Emoji    string `json:"emoji,omitempty"`
+}
+
+// sendProgress is how far a send got, kept in the outbox row's message
+// before the next step: a text-and-file send whose text went never sends
+// the text again.
+type sendProgress struct {
+	TextSent   bool   `json:"textSent,omitempty"`
+	TextLineID string `json:"textLineID,omitempty"`
+}
+
+// progressOf is a row's progress.
+func progressOf(o store.Outgoing) sendProgress {
+	var p sendProgress
+	if len(o.Message) > 0 {
+		_ = json.Unmarshal(o.Message, &p)
+	}
+	return p
 }
 
 // otidFor makes the offline threading ID of a write. Its logic is
@@ -235,22 +412,32 @@ func (g *Instagram) ask(ctx context.Context, gen int, fn func(ctx context.Contex
 	return ran, raw, err
 }
 
-// unsure reports whether a write that failed may still have reached Meta:
-// no answer in time, the helper stopping while it waited, or an answer that
-// could not be read. Meta's own refusals (an error response, an HTTP
-// status, a checkpoint, an ended session) and a request that never got an
-// answer at all are not.
+// unsure reports whether a write that failed may still have reached Meta,
+// so must never be sent again: a connection that broke after it was made
+// (the body may have gone), a 5xx, no answer in time, the helper stopping
+// while it waited, or an answer that could not be read or understood. Only
+// a connection never made (a dial failure), Meta saying no (an error
+// answer, a 4xx, a checkpoint, an ended session, a ban, a rate limit), or a
+// request never asked (the caller's ran is false) is safe to send again.
 func unsure(err error) bool {
+	var op *net.OpError
+	if errors.As(err, &op) && op.Op == "dial" {
+		return false // nothing reached Meta
+	}
 	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) ||
-		errors.Is(err, httpclient.ErrResponseReadFailed) {
+		errors.Is(err, httpclient.ErrResponseReadFailed) || errors.Is(err, httpclient.ErrRequestFailed) {
 		return true
 	}
 	var ne net.Error
 	if errors.As(err, &ne) && ne.Timeout() {
 		return true
 	}
+	if code := statusOf(err); code != 0 {
+		return code >= 500
+	}
 	var er *types.ErrorResponse
-	if errors.As(err, &er) || errors.Is(err, httpclient.ErrUnexpectedError) || errors.Is(err, httpclient.ErrRequestFailed) {
+	var ge *types.GraphQLError
+	if errors.As(err, &er) || errors.As(err, &ge) {
 		return false
 	}
 	switch kindOf(err) {
@@ -258,6 +445,31 @@ func unsure(err error) bool {
 		return false
 	}
 	return true
+}
+
+// statusOf is the HTTP status of the library's "unexpected status" error
+// ("server returned unexpected HTTP status 503", as the library formats it
+// in httpclient.makeRequestOnce), or 0.
+func statusOf(err error) int {
+	if !errors.Is(err, httpclient.ErrUnexpectedError) {
+		return 0
+	}
+	if errors.Is(err, httpclient.ErrRateLimited) {
+		return http.StatusTooManyRequests
+	}
+	msg := err.Error()
+	prefix := httpclient.ErrUnexpectedError.Error() + " "
+	i := strings.LastIndex(msg, prefix)
+	if i < 0 {
+		return 0
+	}
+	rest := msg[i+len(prefix):]
+	end := 0
+	for end < len(rest) && rest[end] >= '0' && rest[end] <= '9' {
+		end++
+	}
+	code, _ := strconv.Atoi(rest[:end])
+	return code
 }
 
 // writeErr is the error a write that is not a send returns: why it was
@@ -309,13 +521,21 @@ func (g *Instagram) threadIDs(ctx context.Context, gen int, cli igClient, chat s
 // Send keeps the message in the outbox under its offline threading ID,
 // returns that ID at once, and sends it in the background. A send repeated
 // with the caller's key (m.ClientID) of one kept and not failed gives that
-// send's ID and sends nothing more; one that failed is done, and the key
-// makes a new send.
+// send's ID and sends nothing more. One that failed after its text went
+// (a text-and-file send) is the same send, and goes on with the file alone.
+// Any other failed send is done, and the key makes a new send.
 func (g *Instagram) Send(ctx context.Context, m network.Outgoing) (string, error) {
 	if m.ClientID != "" {
 		if chat, ok := g.st.ChatFor(Name, m.ChatID); ok {
-			if id, held, err := g.sentFor(m.ClientID, chat); err != nil || held {
-				return id, err
+			o, held, err := g.keyed(m.ClientID, chat)
+			if err != nil {
+				return "", err
+			}
+			if held && o.State == store.OutFailed {
+				return g.resume(o)
+			}
+			if held {
+				return o.ID, nil
 			}
 		}
 	}
@@ -358,8 +578,8 @@ func (g *Instagram) Send(ctx context.Context, m network.Outgoing) (string, error
 	id := otidPrefix + req.OTID
 	if err := g.st.PutOutgoing(Name, store.Outgoing{ID: id, ChatID: chat, Kind: outMessage, Client: m.ClientID,
 		MadeMs: g.clock.Now().UnixMilli(), Request: body}); err != nil {
-		if raced, held, rerr := g.sentFor(m.ClientID, chat); rerr == nil && held {
-			return raced, nil // another call with this key kept it first, and sends it
+		if raced, held, rerr := g.keyed(m.ClientID, chat); rerr == nil && held {
+			return raced.ID, nil // another call with this key kept it first, and sends it
 		}
 		return "", err
 	}
@@ -377,17 +597,48 @@ func (g *Instagram) SendFor(clientID string) (string, error) {
 	return o.ID, nil
 }
 
-// sentFor is the send already kept under the caller's key, when it has not
-// failed. A key naming a send to another chat is a bad request.
-func (g *Instagram) sentFor(client, chat string) (string, bool, error) {
+// keyed is the send the caller's key still holds: one sending, sent or
+// unknown, or one that failed after part of it went (its text). A failed
+// send that sent nothing frees the key. A key naming a send to another chat
+// is a bad request.
+func (g *Instagram) keyed(client, chat string) (store.Outgoing, bool, error) {
 	o, ok, err := g.st.OutgoingClient(Name, client)
-	if err != nil || !ok || o.State == store.OutFailed {
-		return "", false, err
+	if err != nil || !ok {
+		return store.Outgoing{}, false, err
+	}
+	if o.State == store.OutFailed && !progressOf(o).TextSent {
+		return store.Outgoing{}, false, nil
 	}
 	if o.ChatID != chat || o.Kind != outMessage {
-		return "", false, errBadRequest
+		return store.Outgoing{}, false, errBadRequest
 	}
-	return o.ID, true, nil
+	return o, true, nil
+}
+
+// resume sends again what is left of a send that failed after its text
+// went: the file, under the same row and ID. Once in line it is not put in
+// line again.
+func (g *Instagram) resume(o store.Outgoing) (string, error) {
+	if err := g.writeGate(); err != nil {
+		return "", err
+	}
+	g.smu.Lock()
+	cur, ok, err := g.st.Outgoing(Name, o.ID)
+	if err != nil || !ok {
+		g.smu.Unlock()
+		return "", cmp.Or[error](err, errNotFound)
+	}
+	if cur.State != store.OutFailed {
+		g.smu.Unlock()
+		return cur.ID, nil // already going again
+	}
+	if err := g.st.SetOutgoingState(Name, cur.ID, store.OutSending, ""); err != nil {
+		g.smu.Unlock()
+		return "", err
+	}
+	g.smu.Unlock()
+	g.enqueue(cur.ID)
+	return cur.ID, nil
 }
 
 // SendState is what became of a send: sending, sent, failed with its kind,
@@ -570,8 +821,9 @@ func (g *Instagram) deliver(id string) {
 	}
 
 	reply := req.ReplyTo
-	textSent := false
-	if req.TextOTID != "" {
+	progress := progressOf(o)
+	textSent := progress.TextSent
+	if req.TextOTID != "" && !textSent {
 		msg, ok, maybe := g.sendOne(ctx, gen, func(ctx context.Context) (slidetypes.SentMessage, error) {
 			return sendText(ctx, w, short, req.TextOTID, req.Text, reply)
 		})
@@ -581,8 +833,15 @@ func (g *Instagram) deliver(id string) {
 			}
 			return // maybe: it stays sending
 		}
-		g.storeSent(o.ChatID, msg, req.Text, "text", reply, nil)
-		textSent, reply = true, "" // the reply went with the text
+		progress = sendProgress{TextSent: true, TextLineID: g.storeSent(o.ChatID, msg, req.Text, "text", reply, nil)}
+		b, _ := json.Marshal(progress)
+		if err := g.st.SetOutgoingMessage(Name, id, b); err != nil {
+			return // the text went but that is not kept: it stays sending, never sent again
+		}
+		textSent = true
+	}
+	if textSent {
+		reply = "" // the reply went with the text
 	}
 
 	var msg slidetypes.SentMessage
@@ -609,7 +868,7 @@ func (g *Instagram) deliver(id string) {
 	case maybe:
 		return // it stays sending
 	case textSent:
-		g.fail(id, wire.Unclear) // its text went, the file did not
+		g.fail(id, wire.Unclear) // its text went, the file did not: the key's next send is the file alone
 		return
 	default:
 		g.fail(id, wire.Refused)
@@ -767,11 +1026,12 @@ func (g *Instagram) React(ctx context.Context, chatID, messageID, emoji, transac
 			return err
 		}
 	}
-	return g.react(o)
+	return g.react(o, emoji)
 }
 
-// react sends one kept reaction and settles it.
-func (g *Instagram) react(o store.Outgoing) error {
+// react sends one kept reaction, with the emoji asked for now (a failed
+// one tried again may be another), and settles it.
+func (g *Instagram) react(o store.Outgoing, emoji string) error {
 	var req sendRequest
 	if json.Unmarshal(o.Request, &req) != nil {
 		g.fail(o.ID, wire.Internal)
@@ -779,7 +1039,8 @@ func (g *Instagram) react(o store.Outgoing) error {
 	}
 	ctx, cancel := g.writeCtx()
 	defer cancel()
-	status, emoji := slidetypes.ReactionStatusCreated, req.Emoji
+	status := slidetypes.ReactionStatusCreated
+	chosen := emoji
 	if emoji == "" {
 		own, ok, err := g.st.OwnReaction(Name, o.ChatID, req.Target)
 		if err != nil {
@@ -816,7 +1077,7 @@ func (g *Instagram) react(o store.Outgoing) error {
 		return writeErr(ran, raw, err)
 	}
 	sender, _ := g.personOf(g.viewer())
-	_ = g.st.SetReaction(Name, o.ChatID, req.Target, store.Reaction{Emoji: req.Emoji, SenderID: sender, FromMe: true})
+	_ = g.st.SetReaction(Name, o.ChatID, req.Target, store.Reaction{Emoji: chosen, SenderID: sender, FromMe: true})
 	g.settle(o.ID, "")
 	g.changed()
 	return nil

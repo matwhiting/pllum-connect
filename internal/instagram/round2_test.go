@@ -46,6 +46,8 @@ func TestAFailedResnapshotIsOfflineAndANudgeRecoversIt(t *testing.T) {
 	indexes, connects := h.m.count("LoadIndex"), h.m.count("Connect")
 	h.g.Nudge()
 	h.settle()
+	// Connect runs on its own goroutine, which settle does not wait for.
+	eventually(t, "the nudge to connect the socket", func() bool { return h.m.count("Connect") >= connects+1 })
 	if h.m.count("LoadIndex") != indexes+1 || h.m.count("Connect") != connects+1 {
 		t.Errorf("a nudge did not reconnect: %v", h.m.calls)
 	}
