@@ -2,7 +2,10 @@ package messenger
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -59,10 +62,6 @@ func validSession() network.Session {
 // one-to-ones (Bob's newest), an encrypted group, and four pointers from an
 // older thread to an encrypted one (Alice's twice, by two rows).
 func inbox() *table.LSTable {
-	thread := func(key int64, tt table.ThreadType, at time.Time, folder string) *table.LSDeleteThenInsertThread {
-		return &table.LSDeleteThenInsertThread{ThreadKey: key, ThreadType: tt, LastActivityTimestampMs: at.UnixMilli(),
-			FolderName: folder, ThreadName: canary + " name", Snippet: canary + " snippet"}
-	}
 	base := time.Date(2026, 3, 1, 9, 0, 0, 0, time.UTC)
 	return &table.LSTable{
 		LSDeleteThenInsertThread: []*table.LSDeleteThenInsertThread{
@@ -84,6 +83,55 @@ func inbox() *table.LSTable {
 		},
 		LSMoveThreadToE2EECutoverFolder: []*table.LSMoveThreadToE2EECutoverFolder{{ThreadKey: daveFBID}},
 	}
+}
+
+// thread is an invented thread as a listing gives it, in sync group 1 under
+// the inbox (parent -1).
+func thread(key int64, tt table.ThreadType, at time.Time, folder string) *table.LSDeleteThenInsertThread {
+	return &table.LSDeleteThenInsertThread{ThreadKey: key, ThreadType: tt, LastActivityTimestampMs: at.UnixMilli(),
+		FolderName: folder, ThreadName: canary + " name", Snippet: canary + " snippet", ParentThreadKey: -1, SyncGroup: 1}
+}
+
+// threadsPage is one page of a folder's threads, with the range Meta gives
+// for it: more says there are older threads, from the oldest on this page.
+func threadsPage(f folderKey, more bool, threads ...*table.LSDeleteThenInsertThread) *table.LSTable {
+	tbl := &table.LSTable{}
+	minKey, minAt := int64(0), int64(9999999999999)
+	for _, t := range threads {
+		t.SyncGroup, t.ParentThreadKey = f.group, f.parent
+		tbl.LSDeleteThenInsertThread = append(tbl.LSDeleteThenInsertThread, t)
+		if t.LastActivityTimestampMs < minAt {
+			minKey, minAt = t.ThreadKey, t.LastActivityTimestampMs
+		}
+	}
+	tbl.LSUpsertSyncGroupThreadsRange = []*table.LSUpsertSyncGroupThreadsRange{{
+		SyncGroup: f.group, ParentThreadKey: f.parent, HasMoreBefore: more, MinThreadKey: minKey, MinLastActivityTimestampMS: minAt,
+	}}
+	return tbl
+}
+
+// history is a page of an invented thread's lines, with the range Meta gives
+// for it: more says there are older lines.
+func history(key int64, more bool, lines ...*table.LSUpsertMessage) *table.LSTable {
+	tbl := &table.LSTable{LSUpsertMessage: lines}
+	r := &table.LSInsertNewMessageRange{ThreadKey: key, HasMoreBefore: more, MinTimestampMs: 1 << 62, MaxTimestampMs: 0}
+	for _, l := range lines {
+		l.ThreadKey = key
+		if l.TimestampMs < r.MinTimestampMs {
+			r.MinTimestampMs, r.MinMessageId = l.TimestampMs, l.MessageId
+		}
+		if l.TimestampMs > r.MaxTimestampMs {
+			r.MaxTimestampMs, r.MaxMessageId = l.TimestampMs, l.MessageId
+		}
+	}
+	r.MinTimestampMsTemplate, r.MaxTimestampMsTemplate = r.MinTimestampMs, r.MaxTimestampMs
+	tbl.LSInsertNewMessageRange = []*table.LSInsertNewMessageRange{r}
+	return tbl
+}
+
+// line is an invented line of an unencrypted thread.
+func line(id string, sender int64, at time.Time, text string) *table.LSUpsertMessage {
+	return &table.LSUpsertMessage{MessageId: id, SenderId: sender, TimestampMs: at.UnixMilli(), Text: text}
 }
 
 // fakeUser is his invented account as LoadMessagesPage gives it.
@@ -116,21 +164,97 @@ type fakeMeta struct {
 	registerErrs []error
 	regKeys      [][32]byte
 	regUUIDs     []uuid.UUID
-	// pages are the thread pages FetchMoreThreads gives, in order; after
-	// them, the listing has ended. endless gives a new page every time.
-	pages   []threadPage
+	// folders are the thread pages FetchThreadsTask gives for each folder
+	// (sync group and parent thread key), in order; after them, an empty
+	// answer. endless gives every folder a new page every time.
+	folders map[folderKey][]*table.LSTable
 	endless bool
 	fetches int
+	// threadTasks and messageTasks are the reads asked, in order.
+	threadTasks  []socket.FetchThreadsTask
+	messageTasks []socket.FetchMessagesTask
+	// older are the pages of a thread's history FetchMessagesTask gives, in
+	// order, delivered on the main socket as Meta does; after them, a range
+	// saying there is nothing older. inResponse puts them in the task's own
+	// answer instead. silent answers nothing at all.
+	older      map[int64][]*table.LSTable
+	olderFn    func(key int64) *table.LSTable // when set, every thread's next page
+	inResponse bool
+	silent     bool
+	// taskErr fails the reads it returns an error for.
+	taskErr func(task socket.Task) error
+
+	// clock is the time the pace runs on; calls are the requests made, with
+	// the time each went.
+	clock *fakeClock
+	calls []call
 }
 
-// threadPage is one FetchMoreThreads answer.
-type threadPage struct {
-	keys *socket.KeyStoreData
-	tbl  *table.LSTable
+// call is one request made of the fake, and when.
+type call struct {
+	name string
+	at   time.Time
 }
 
 func newFakeMeta() *fakeMeta {
-	return &fakeMeta{table: inbox(), e2ee: &fakeE2EE{}, history: &fakeHistory{}}
+	return &fakeMeta{table: inbox(), e2ee: &fakeE2EE{}, history: &fakeHistory{},
+		folders: map[folderKey][]*table.LSTable{}, older: map[int64][]*table.LSTable{}, clock: newFakeClock()}
+}
+
+// record notes a request; f.mu is held.
+func (f *fakeMeta) record(name string) {
+	f.calls = append(f.calls, call{name: name, at: f.clock.Now()})
+}
+
+// requests are the requests made so far.
+func (f *fakeMeta) requests() []call {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]call{}, f.calls...)
+}
+
+// fakeClock is the time the pace runs on: Sleep moves it on at once.
+type fakeClock struct {
+	mu  sync.Mutex
+	now time.Time
+}
+
+func newFakeClock() *fakeClock {
+	return &fakeClock{now: time.Date(2026, 3, 2, 9, 0, 0, 0, time.UTC)}
+}
+
+func (c *fakeClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
+
+func (c *fakeClock) Sleep(ctx context.Context, d time.Duration) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	c.Advance(d)
+	return nil
+}
+
+func (c *fakeClock) Advance(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if d > 0 {
+		c.now = c.now.Add(d)
+	}
+}
+
+// gaps fails unless every request went at least 2 s after the one before.
+func gaps(t *testing.T, calls []call) {
+	t.Helper()
+	sorted := append([]call{}, calls...)
+	sort.SliceStable(sorted, func(i, j int) bool { return sorted[i].at.Before(sorted[j].at) })
+	for i := 1; i < len(sorted); i++ {
+		if d := sorted[i].at.Sub(sorted[i-1].at); d < 2*time.Second {
+			t.Fatalf("%s went %v after %s", sorted[i].name, d, sorted[i-1].name)
+		}
+	}
 }
 
 func (f *fakeMeta) newClient(ck *cookies.Cookies) msgrClient {
@@ -161,6 +285,7 @@ func (c *fakeClient) SetEventHandler(h messagix.EventHandler) {
 func (c *fakeClient) Connect(ctx context.Context) error {
 	c.f.mu.Lock()
 	c.f.connects++
+	c.f.record("Connect")
 	hold := c.f.holdConnect
 	c.f.mu.Unlock()
 	if !hold {
@@ -181,21 +306,74 @@ func (c *fakeClient) dispatch(evt any) {
 	}
 }
 
-func (c *fakeClient) FetchMoreThreads(ctx context.Context, syncGroup int64) (*socket.KeyStoreData, *table.LSTable, error) {
+func (c *fakeClient) GetCursor(db int64) string {
+	return "cursor-invented-" + strconv.FormatInt(db, 10)
+}
+
+// ExecuteTasks answers the two reads: a page of a folder's threads in the
+// answer, and a page of a thread's history on the main socket.
+func (c *fakeClient) ExecuteTasks(ctx context.Context, tasks ...socket.Task) (*table.LSTable, error) {
 	c.f.mu.Lock()
-	defer c.f.mu.Unlock()
-	c.f.fetches++
-	if c.f.endless {
-		key := int64(7000000000000000 + c.f.fetches)
-		return &socket.KeyStoreData{HasMoreBefore: true, MinThreadKey: key},
-			&table.LSTable{LSDeleteThenInsertThread: []*table.LSDeleteThenInsertThread{{ThreadKey: key, ThreadType: table.GROUP_THREAD}}}, nil
+	if len(tasks) != 1 {
+		c.f.mu.Unlock()
+		return nil, errors.New("invented: one task at a time")
 	}
-	if len(c.f.pages) == 0 {
-		return nil, nil, nil
+	switch t := tasks[0].(type) {
+	case *socket.FetchThreadsTask:
+		c.f.record("FetchThreadsTask")
+		c.f.threadTasks = append(c.f.threadTasks, *t)
+		c.f.fetches++
+	case *socket.FetchMessagesTask:
+		c.f.record("FetchMessagesTask")
+		c.f.messageTasks = append(c.f.messageTasks, *t)
+	default:
+		c.f.mu.Unlock()
+		return nil, errors.New("invented: a task the reads never send")
 	}
-	p := c.f.pages[0]
-	c.f.pages = c.f.pages[1:]
-	return p.keys, p.tbl, nil
+	if c.f.taskErr != nil {
+		if err := c.f.taskErr(tasks[0]); err != nil {
+			c.f.mu.Unlock()
+			return nil, err
+		}
+	}
+	switch t := tasks[0].(type) {
+	case *socket.FetchThreadsTask:
+		defer c.f.mu.Unlock()
+		key := folderKey{group: int64(t.SyncGroup), parent: t.ParentThreadKey}
+		if c.f.endless {
+			k := int64(7000000000000000 + c.f.fetches)
+			at := c.f.clock.Now().Add(-time.Duration(c.f.fetches) * time.Minute)
+			return threadsPage(key, true, thread(k, table.GROUP_THREAD, at, "inbox")), nil
+		}
+		pages := c.f.folders[key]
+		if len(pages) == 0 {
+			return &table.LSTable{}, nil
+		}
+		c.f.folders[key] = pages[1:]
+		return pages[0], nil
+	case *socket.FetchMessagesTask:
+		var tbl *table.LSTable
+		if c.f.olderFn != nil {
+			tbl = c.f.olderFn(t.ThreadKey)
+		} else if pages := c.f.older[t.ThreadKey]; len(pages) > 0 {
+			tbl, c.f.older[t.ThreadKey] = pages[0], pages[1:]
+		} else {
+			tbl = &table.LSTable{LSUpdateExistingMessageRange: []*table.LSUpdateExistingMessageRange{
+				{ThreadKey: t.ThreadKey, TimestampMS: t.ReferenceTimestampMs}}}
+		}
+		inResponse, silent := c.f.inResponse, c.f.silent
+		c.f.mu.Unlock()
+		switch {
+		case silent:
+			return &table.LSTable{}, nil
+		case inResponse:
+			return tbl, nil
+		}
+		go c.dispatch(tbl)
+		return &table.LSTable{}, nil
+	}
+	c.f.mu.Unlock()
+	return nil, nil
 }
 
 // last is the newest client made.
@@ -209,6 +387,7 @@ func (c *fakeClient) LoadMessagesPage(ctx context.Context) (types.UserInfo, *tab
 	c.f.mu.Lock()
 	defer c.f.mu.Unlock()
 	c.f.loads++
+	c.f.record("LoadMessagesPage")
 	if c.f.loadErr != nil {
 		return nil, nil, c.f.loadErr
 	}
@@ -227,6 +406,7 @@ func (c *fakeClient) RegisterE2EE(ctx context.Context, fbid int64) error {
 	}
 	c.f.mu.Lock()
 	c.f.registers++
+	c.f.record("RegisterE2EE")
 	c.f.regKeys = append(c.f.regKeys, *c.dev.IdentityKey.Pub)
 	c.f.regUUIDs = append(c.f.regUUIDs, c.dev.FacebookUUID)
 	var err error
@@ -402,7 +582,10 @@ func newHarnessOver(t *testing.T, dir string, f *fakeMeta) *harness {
 	})
 	h.m = New(st, h.dir, testKey, emit.For(Name)).WithGate()
 	h.m.newClient = h.f.newClient
-	h.m.pace = &meta.Pace{Sleep: func(context.Context, time.Duration) error { return nil }}
+	h.m.now = f.clock.Now
+	h.m.pageWait = 2 * time.Second
+	h.m.pace = &meta.Pace{Now: f.clock.Now, Sleep: f.clock.Sleep}
+	st.SetClock(f.clock.Now)
 	if err := h.m.Start(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -444,7 +627,7 @@ func (h *harness) signIn(t *testing.T) {
 
 func eventually(t *testing.T, what string, ok func() bool) {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(20 * time.Second)
 	for !ok() {
 		if time.Now().After(deadline) {
 			t.Fatalf("timed out waiting for %s", what)

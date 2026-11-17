@@ -35,6 +35,25 @@ const canaryPIN = "730519"
 // fixed values.
 var stateWords = map[string]bool{"": true, "noBackup": true, "needsPIN": true, "restored": true, "skipped": true}
 
+// breakdownWords are the only keys the counts' breakdowns may hold: the
+// library's folder names, fixed names for thread types, the sync groups and
+// how a folder's listing stopped.
+var breakdownWords = func() map[string]bool {
+	w := map[string]bool{}
+	for _, s := range []string{
+		"inbox", "other", "spam", "pending", "montage", "hidden", "legacy", "disabled", "page_background", "page_done",
+		"blocked", "community", "restricted", "bc_partnership", "e2ee_cutover", "e2ee_cutover_archived",
+		"e2ee_cutover_pending", "e2ee_cutover_other", "interop", "archived", "ai_active", "salsa_restricted",
+		"messenger_marketing_message", "noFolder", "otherFolder",
+		"oneToOne", "group", "encryptedOneToOne", "encryptedGroup", "marketplace", "communityGroup", "folder", "otherType",
+		"1", "95", "otherGroup",
+		"complete", "yearReached", "capped", "failed",
+	} {
+		w[s] = true
+	}
+	return w
+}()
+
 func TestGateCountsAreCountsOnly(t *testing.T) {
 	h := newHarness(t)
 	h.f.history.sample = 3
@@ -72,6 +91,16 @@ func TestGateCountsAreCountsOnly(t *testing.T) {
 		case string:
 			if k != "historyState" || !stateWords[v] {
 				t.Errorf("%s holds a string that is not a fixed state", k)
+			}
+		case map[string]any:
+			// A breakdown: fixed words to counts.
+			for word, n := range v {
+				if !breakdownWords[word] {
+					t.Errorf("%s has a key that is not a fixed word", k)
+				}
+				if f, ok := n.(float64); !ok || invented[f] {
+					t.Errorf("%s holds something other than a count", k)
+				}
 			}
 		default:
 			t.Errorf("%s is %T, not a number or a boolean", k, v)

@@ -2,36 +2,46 @@
 // mautrix-meta's messagix client (his facebook.com web session) and
 // whatsmeow's Messenger mode (his end-to-end encrypted chats).
 //
-// This is its first slice, the gate (Task B0 of step 3's plan): it signs in
-// with the cookies of a facebook.com session Pllum took from its own sign-in
-// window (`login` with method "session"), loads the messages page once and
-// connects the main (lightspeed) socket; on its first connect, as
+// It signs in with the cookies of a facebook.com session Pllum took from its
+// own sign-in window (`login` with method "session"), loads the messages
+// page and connects the main (lightspeed) socket; on its first connect, as
 // mautrix-meta's connector does, it registers Pllum as a Messenger device
 // (once, ever) and connects the encrypted socket (e2ee.go), looks for his
-// history backup, which his PIN restores (history.go), and pages the older
-// threads of his inbox, counting what it sees (gate.go). It writes no chat or
-// line into the store yet, and it sends nothing: every write method is
-// `unsupported`.
+// history backup, which his PIN restores (history.go), lists every folder
+// of his inbox and fetches the recent history of the unencrypted threads
+// (backfill.go). Everything the messages page, the pages and the main
+// socket say is written into the store (ingest.go): groups as chats, his
+// older one-to-one threads as aliases of their encrypted chats (ids.go),
+// their lines, reactions, read receipts, mutes and people. The gate
+// (gate.go) counts what it sees. It sends nothing yet: every write method
+// is `unsupported`.
 //
 // Meta locks accounts that behave like a script, so every request goes
 // through one meta.Pace: one at a time, 2 to 4 s apart, none for a while
 // after a rateLimited, and none at all after a checkpoint, an ended session
-// or a suspension until he signs in again (a new `login`). Nothing here
-// retries a request on its own; the encrypted socket's reconnect timing is
-// the library's.
+// or a suspension until he signs in again (a new `login`). Both blocks are
+// kept in the store, so neither a restart nor the same cookies sent again
+// at Pllum's start asks Meta anything. Nothing here retries a request on
+// its own; the sockets' reconnect timing is the library's.
 //
 // Nothing here logs: the client gets zerolog.Nop(), whatsmeow gets
 // waLog.Noop, and every error returned carries only a fixed kind. The
 // cookies and the PIN are held in memory only; the store keeps the
-// secure-history device under "messenger.history" in its meta table, and the
-// whatsmeow device lives in <dir>/messenger/device.db.
+// secure-history device under "messenger.history" in its meta table (with
+// the values ids.go lists), and the whatsmeow device lives in
+// <dir>/messenger/device.db.
 package messenger
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"maps"
+	"slices"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -60,21 +70,24 @@ var (
 	errBadRequest   = &wire.Error{Kind: wire.BadRequest}
 	errInternal     = &wire.Error{Kind: wire.Internal}
 	errNotConnected = &wire.Error{Kind: wire.NotConnected}
+	errNotFound     = &wire.Error{Kind: wire.NotFound}
 	errUnsupported  = &wire.Error{Kind: wire.Unsupported}
 	errUnclear      = &wire.Error{Kind: wire.Unclear}
 )
 
 // msgrClient is what the adapter uses of messagix's client: the messages
-// page, the main (lightspeed) socket and the older pages of threads over it,
-// the cookies (for the session event), and the encrypted side's
-// registration. *messagix.Client satisfies it through realClient; tests use
+// page, the main (lightspeed) socket, the reads sent over it (ExecuteTasks
+// with FetchThreadsTask and FetchMessagesTask only, and the sync group
+// cursor those carry), the cookies (for the session event), and the
+// encrypted side's registration. *messagix.Client satisfies it through realClient; tests use
 // a fake.
 type msgrClient interface {
 	LoadMessagesPage(ctx context.Context) (types.UserInfo, *table.LSTable, error)
 	SetEventHandler(h messagix.EventHandler)
 	Connect(ctx context.Context) error
 	Disconnect()
-	FetchMoreThreads(ctx context.Context, syncGroup int64) (*socket.KeyStoreData, *table.LSTable, error)
+	ExecuteTasks(ctx context.Context, tasks ...socket.Task) (*table.LSTable, error)
+	GetCursor(db int64) string
 	GetCookies() *cookies.Cookies
 	SetDevice(dev *wastore.Device)
 	RegisterE2EE(ctx context.Context, fbid int64) error
@@ -112,7 +125,8 @@ type Messenger struct {
 	pace      *meta.Pace
 	diff      *meta.SessionDiff
 	now       func() time.Time
-	gate      bool // started with --gate: the gate's one sample page of history is fetched
+	gate      bool          // started with --gate: every sign-in lists every folder, and one page of restored history is sampled
+	pageWait  time.Duration // how long a page of history may take to come back on the socket
 
 	mu        sync.Mutex
 	started   bool
@@ -120,6 +134,7 @@ type Messenger struct {
 	ctx       context.Context
 	cancel    context.CancelFunc
 	session   network.Session // the cookies held now; never written anywhere
+	hashes    []string        // sessionHash of every version of the session held since the login
 	gen       int             // counts runs: events and results of an older one are dropped
 	cli       msgrClient
 	runCtx    context.Context
@@ -154,6 +169,26 @@ type Messenger struct {
 	newestAt              int64 // its last activity, in ms
 	liveEncryptedReceived atomic.Int64
 	liveUndecryptable     atomic.Int64
+
+	vmu    sync.Mutex
+	values map[string]string // the network's own store values, as read or written
+
+	nmu   sync.Mutex
+	names map[int64]string // people's names from contact rows, this run only
+
+	lmu         sync.Mutex
+	recent      map[string]string // a line seen this run → its chat, for edits
+	recentOrder []string
+
+	wmu     sync.Mutex
+	waiters map[int64]chan rangeNote // a thread key → the FetchOlder waiting for its page
+
+	lkmu  sync.Mutex
+	locks map[string]*sync.Mutex // one history fetch per chat at a time
+
+	chmu      sync.Mutex
+	chPending bool
+	chLast    time.Time
 }
 
 var (
@@ -161,6 +196,7 @@ var (
 	_ network.SignInPager      = (*Messenger)(nil)
 	_ network.EncryptedHistory = (*Messenger)(nil)
 	_ network.Gate             = (*Messenger)(nil)
+	_ network.OlderPages       = (*Messenger)(nil)
 )
 
 // New makes the messenger network over st; emit must be emit.For("messenger").
@@ -175,13 +211,21 @@ func New(st *store.Store, dir string, key [32]byte, emit network.Emit) *Messenge
 		pace:      &meta.Pace{},
 		diff:      meta.NewSessionDiff(meta.FacebookPage),
 		now:       time.Now,
+		pageWait:  pageWaitDefault,
 		state:     network.NotConnected,
+		values:    map[string]string{},
+		names:     map[int64]string{},
+		recent:    map[string]string{},
+		waiters:   map[int64]chan rangeNote{},
+		locks:     map[string]*sync.Mutex{},
 	}
 }
 
-// WithGate turns on what only the gate needs: after his history is restored,
-// one page of the newest encrypted one-to-one is fetched, decrypted and
-// counted. main calls it when the helper is started with --gate.
+// WithGate turns on what only the gate needs: every sign-in lists every
+// folder (with no year's reach, so the counts hold the oldest threads too),
+// and after his history is restored, one page of the newest encrypted
+// one-to-one is fetched, decrypted and counted. main calls it when the
+// helper is started with --gate.
 func (m *Messenger) WithGate() *Messenger {
 	m.gate = true
 	return m
@@ -194,7 +238,9 @@ func (m *Messenger) Name() string { return Name }
 func (m *Messenger) SignIn() meta.SignInPage { return meta.FacebookPage }
 
 // Start readies the network. It asks nothing of Meta and opens nothing: the
-// cookies live in Pllum's Keychain and come as a `login`.
+// cookies live in Pllum's Keychain and come as a `login`. A rate limit from
+// an earlier run runs on to its end, and a session Meta stopped in an
+// earlier run stays stopped.
 func (m *Messenger) Start(ctx context.Context) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -203,6 +249,12 @@ func (m *Messenger) Start(ctx context.Context) error {
 	}
 	m.ctx, m.cancel = context.WithCancel(context.WithoutCancel(ctx))
 	m.started = true
+	if until, step, ok := m.keptRateLimit(); ok {
+		m.pace.RestoreRateLimit(until, step)
+	}
+	if kind, _, ok := m.keptBlock(); ok {
+		m.holdBlock(kind)
+	}
 	return nil
 }
 
@@ -234,10 +286,23 @@ func (m *Messenger) Login(ctx context.Context, p network.LoginParams) error {
 		return errBadRequest
 	}
 	m.retire()
+	hash := sessionHash(session)
+	if kind, stopped, ok := m.keptBlock(); ok {
+		if slices.Contains(stopped, hash) {
+			// The session Meta stopped (any version of it Pllum was given),
+			// sent again from the Keychain at start: refused here, with no
+			// request.
+			m.holdBlock(kind)
+			return nil
+		}
+		// A new session: he has signed in again in the window.
+		_ = m.keep("block", "")
+	}
 	// He has signed in again in the window: whatever Meta asked of him
 	// before is done. Only here.
 	m.pace.Clear()
 	m.session = session
+	m.hashes = []string{hash}
 	m.diff.Seed(session)
 	m.setState(network.Connecting, "")
 	m.startRun()
@@ -454,7 +519,7 @@ func (m *Messenger) run(ctx context.Context, gen int, session network.Session) {
 	}
 	m.fbid = fbid
 	m.mu.Unlock()
-	m.addTable(tbl)
+	m.ingest(tbl, store.SourceSync)
 
 	cli.SetEventHandler(m.mainHandler(gen, cli, fbid))
 	if err := m.request(ctx, gen, func(ctx context.Context) error { return cli.Connect(ctx) }); err != nil {
@@ -466,7 +531,7 @@ func (m *Messenger) run(ctx context.Context, gen int, session network.Session) {
 // connect (or reconnect, if no connect came) sets up the encrypted side,
 // once per run, as the connector's handleMetaEvent does; the socket's own
 // reconnects are messagix's. A socket Meta refuses as unauthorized is an
-// ended session. Tables only add to the gate's counts.
+// ended session. Its tables are written into the store.
 func (m *Messenger) mainHandler(gen int, cli msgrClient, fbid int64) messagix.EventHandler {
 	return func(_ context.Context, evt any) {
 		defer func() { _ = recover() }()
@@ -483,14 +548,15 @@ func (m *Messenger) mainHandler(gen int, cli msgrClient, fbid int64) messagix.Ev
 			m.pace.Fail(meta.ReconnectNeeded)
 			m.pushedBack(gen, meta.ReconnectNeeded)
 		case *table.LSTable:
-			m.addTable(e)
+			m.ingest(e, store.SourceLive)
 		}
 	}
 }
 
 // beginE2EE sets up the encrypted side for run gen, once: the device and
-// the encrypted socket, then the history check, then the older pages of his
-// inbox. All of it through the pace, in one goroutine.
+// the encrypted socket, then the history check, then (at the first sign-in,
+// or every one with --gate) the listing of every folder, then the first
+// sign-in's history. All of it through the pace, in one goroutine.
 func (m *Messenger) beginE2EE(gen int, cli msgrClient, fbid int64) {
 	m.mu.Lock()
 	ctx := m.runCtx
@@ -508,7 +574,12 @@ func (m *Messenger) beginE2EE(gen int, cli msgrClient, fbid int64) {
 			return
 		}
 		m.checkHistory(ctx, gen, cli, fbid)
-		m.pageThreads(ctx, gen, cli)
+		if m.gate || m.value("backfilled") == "" {
+			if !m.listThreads(ctx, gen, cli) {
+				return
+			}
+		}
+		m.backfill(ctx, gen, cli)
 	}()
 }
 
@@ -541,33 +612,6 @@ func (m *Messenger) socketUp(gen int, encrypted, up bool) {
 // connector's thread backfill does, until the listing ends (no page, no more
 // before, or the oldest thread key stops moving) or maxThreadPages, and adds
 // each to the gate's counts.
-func (m *Messenger) pageThreads(ctx context.Context, gen int, cli msgrClient) {
-	var prev int64
-	for page := 0; page < maxThreadPages; page++ {
-		var keys *socket.KeyStoreData
-		var tbl *table.LSTable
-		err := m.request(ctx, gen, func(ctx context.Context) (err error) {
-			keys, tbl, err = cli.FetchMoreThreads(ctx, 1)
-			return err
-		})
-		if err != nil || !m.current(gen) {
-			return
-		}
-		if tbl == nil {
-			m.listed(page, true, false)
-			return
-		}
-		m.addTable(tbl)
-		if keys == nil || !keys.HasMoreBefore || keys.MinThreadKey == prev {
-			m.listed(page+1, true, false)
-			return
-		}
-		prev = keys.MinThreadKey
-		m.listed(page+1, false, false)
-	}
-	m.listed(maxThreadPages, false, true)
-}
-
 // failed ends run gen after a failure that is not Meta stopping the session
 // (pushedBack has set those): he is left not connected, with the kind, until
 // a new login.
@@ -603,11 +647,13 @@ func (m *Messenger) request(ctx context.Context, gen int, fn func(ctx context.Co
 	err := fn(ctx)
 	if err == nil {
 		m.pace.Succeed()
+		m.keepRateLimit()
 		m.checkSession(gen)
 		return nil
 	}
 	kind := kindOf(err)
 	m.pace.Fail(kind)
+	m.keepRateLimit()
 	m.pushedBack(gen, kind)
 	return &wire.Error{Kind: errorKind(kind)}
 }
@@ -696,6 +742,73 @@ func (m *Messenger) pushedBack(gen int, kind wire.Kind) {
 	}
 	m.retire()
 	m.setState(s, k)
+	// Kept, so neither a restart nor any version of these cookies sent again
+	// asks Meta.
+	hashes := m.hashes
+	if len(hashes) == 0 {
+		hashes = []string{sessionHash(m.session)}
+	}
+	_ = m.keep("block", string(kind)+"\n"+strings.Join(hashes, ","))
+}
+
+// sessionHash is a SHA-256 of a session's required cookies: what tells the
+// session Meta stopped from a new sign-in, with no cookie value kept.
+func sessionHash(s network.Session) string {
+	h := sha256.New()
+	for _, name := range meta.FacebookPage.Required {
+		h.Write([]byte(name + "=" + s[name] + "\x00"))
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// keptBlock is the kind that stopped a session in this or an earlier run,
+// and the hashes of every version of that session; ok is false when none
+// is kept.
+func (m *Messenger) keptBlock() (kind wire.Kind, hashes []string, ok bool) {
+	k, list, ok := strings.Cut(m.value("block"), "\n")
+	if !ok || list == "" {
+		return "", nil, false
+	}
+	if _, _, terminal := stateFor(wire.Kind(k)); !terminal {
+		return "", nil, false
+	}
+	return wire.Kind(k), strings.Split(list, ","), true
+}
+
+// holdBlock reports a kept block's state again and blocks the pace on it
+// (never Clear: only a new session lifts it). m.mu is held.
+func (m *Messenger) holdBlock(kind wire.Kind) {
+	st, k, _ := stateFor(kind)
+	m.pace.Fail(kind)
+	m.setState(st, k)
+}
+
+// keepRateLimit keeps the pace's rate limit (its end and its count) so a
+// restart carries it on; nothing when there is none.
+func (m *Messenger) keepRateLimit() {
+	until, step := m.pace.RateLimit()
+	v := ""
+	if step > 0 || !until.IsZero() {
+		v = strconv.FormatInt(until.UnixMilli(), 10) + "\n" + strconv.Itoa(step)
+	}
+	_ = m.keep("rate", v)
+}
+
+// keptRateLimit is the rate limit an earlier run kept.
+func (m *Messenger) keptRateLimit() (until time.Time, step int, ok bool) {
+	ms, n, ok := strings.Cut(m.value("rate"), "\n")
+	if !ok {
+		return time.Time{}, 0, false
+	}
+	untilMs, err1 := strconv.ParseInt(ms, 10, 64)
+	step, err2 := strconv.Atoi(n)
+	if err1 != nil || err2 != nil {
+		return time.Time{}, 0, false
+	}
+	if untilMs > 0 {
+		until = time.UnixMilli(untilMs)
+	}
+	return until, step, true
 }
 
 // checkSession sends the session event when the client's cookies have
@@ -713,9 +826,14 @@ func (m *Messenger) checkSession(gen int) {
 	if !changed {
 		return
 	}
+	// The rotated set is the session now: a block names it as well as the
+	// versions before.
 	m.mu.Lock()
 	if gen == m.gen {
 		m.session = network.Session(maps.Clone(s))
+		if hash := sessionHash(m.session); !slices.Contains(m.hashes, hash) {
+			m.hashes = append(m.hashes, hash)
+		}
 	}
 	m.mu.Unlock()
 	m.emit(map[string]any{"event": "session", "session": s})
