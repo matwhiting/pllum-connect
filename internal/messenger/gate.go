@@ -16,8 +16,14 @@ import (
 type GateCounts struct {
 	// Loaded is true once the messages page has loaded.
 	Loaded bool `json:"loaded"`
-	// Groups are the unencrypted group threads on the page's first listing.
+	// Groups are the unencrypted group threads in his inbox.
 	Groups int `json:"groups"`
+	// ListPages are the older pages of threads fetched after the messages
+	// page's first listing; ListComplete says the listing ended, ListCapped
+	// that it stopped at maxThreadPages with more to come.
+	ListPages    int  `json:"listPages"`
+	ListComplete bool `json:"listComplete"`
+	ListCapped   bool `json:"listCapped"`
 	// EncryptedPointers are the older threads that point at an encrypted
 	// one (a hybrid thread mapping, or the e2ee cutover folder), each once.
 	EncryptedPointers int `json:"encryptedPointers"`
@@ -30,6 +36,8 @@ type GateCounts struct {
 	// was registered before).
 	Registered bool  `json:"registered"`
 	RegisterMs int64 `json:"registerMs"`
+	// MainConnected: the main (lightspeed) socket is up.
+	MainConnected bool `json:"mainConnected"`
 	// E2EEConnected: the encrypted socket is up. E2EEFailed: Meta ended the
 	// encrypted session during this run.
 	E2EEConnected bool `json:"e2eeConnected"`
@@ -55,77 +63,94 @@ func (m *Messenger) GateCounts() any {
 	return c
 }
 
+// maxThreadPages is the most older pages of threads one run fetches.
+const maxThreadPages = 20
+
 // cutoverFolder is the folder prefix of an older thread moved aside when its
 // chat became end-to-end encrypted (connector events.go: e2ee_cutover and
 // its _archived, _pending and _other forms).
 const cutoverFolder = "e2ee_cutover"
 
-// list counts the messages page's first listing for the gate, and finds the
-// newest encrypted one-to-one (the one whose history the gate samples).
-func (m *Messenger) list(tbl *table.LSTable) {
-	type thread struct {
-		key       int64
-		encrypted bool
+// listing is what the gate has seen of his inbox: every thread (an older
+// thread and its encrypted one apart), and every older thread that points
+// at an encrypted one. It only grows, from the messages page, the older
+// pages and the main socket's tables, so a thread repeated is counted once.
+type listing struct {
+	threads  map[listedThread]bool
+	pointers map[int64]bool
+}
+
+type listedThread struct {
+	key       int64
+	encrypted bool
+}
+
+// addTable adds a table's threads to the gate's counts, and keeps the newest
+// encrypted one-to-one (the one whose history the gate samples).
+func (m *Messenger) addTable(tbl *table.LSTable) {
+	if tbl == nil {
+		return
 	}
-	var c GateCounts
-	var newest, newestAt int64
-	seen := map[thread]bool{}
-	pointers := map[int64]bool{}
+	m.cmu.Lock()
+	defer m.cmu.Unlock()
+	l := &m.listing
+	if l.threads == nil {
+		l.threads, l.pointers = map[listedThread]bool{}, map[int64]bool{}
+	}
+	c := &m.counts
 	add := func(key int64, tt table.ThreadType, folder string, lastMs int64) {
 		if key == 0 {
 			return
 		}
 		if strings.HasPrefix(folder, cutoverFolder) && !tt.IsWhatsApp() {
-			pointers[key] = true
+			l.pointers[key] = true
 		}
-		t := thread{key, tt.IsWhatsApp()}
-		if seen[t] {
+		if tt == table.ENCRYPTED_OVER_WA_ONE_TO_ONE && (lastMs > m.newestAt || m.newestOneToOne == 0) {
+			m.newestOneToOne, m.newestAt = key, lastMs
+		}
+		t := listedThread{key, tt.IsWhatsApp()}
+		if l.threads[t] {
 			return
 		}
-		seen[t] = true
+		l.threads[t] = true
 		switch {
 		case tt.IsWhatsApp():
 			c.EncryptedThreads++
 			if tt == table.ENCRYPTED_OVER_WA_ONE_TO_ONE {
 				c.EncryptedOneToOnes++
-				if lastMs > newestAt || newest == 0 {
-					newest, newestAt = key, lastMs
-				}
 			}
 		case isGroup(tt):
 			c.Groups++
 		}
 	}
-	if tbl != nil {
-		for _, t := range tbl.LSDeleteThenInsertThread {
-			add(t.ThreadKey, t.ThreadType, t.FolderName, t.LastActivityTimestampMs)
-		}
-		for _, t := range tbl.LSUpdateOrInsertThread {
-			add(t.ThreadKey, t.ThreadType, t.FolderName, t.LastActivityTimestampMs)
-		}
-		for _, t := range tbl.LSVerifyThreadExists {
-			add(t.ThreadKey, t.ThreadType, t.FolderName, 0)
-		}
-		for _, p := range tbl.LSVerifyHybridThreadExists {
-			pointers[p.ThreadKey] = true
-		}
-		for _, p := range tbl.LSUpdateThreadAuthorityAndMappingWithOTIDFromJID {
-			pointers[p.ThreadKey] = true
-		}
-		for _, p := range tbl.LSMoveThreadToE2EECutoverFolder {
-			pointers[p.ThreadKey] = true
-		}
+	for _, t := range tbl.LSDeleteThenInsertThread {
+		add(t.ThreadKey, t.ThreadType, t.FolderName, t.LastActivityTimestampMs)
 	}
-	delete(pointers, 0)
-	c.EncryptedPointers = len(pointers)
+	for _, t := range tbl.LSUpdateOrInsertThread {
+		add(t.ThreadKey, t.ThreadType, t.FolderName, t.LastActivityTimestampMs)
+	}
+	for _, t := range tbl.LSVerifyThreadExists {
+		add(t.ThreadKey, t.ThreadType, t.FolderName, 0)
+	}
+	for _, p := range tbl.LSVerifyHybridThreadExists {
+		l.pointers[p.ThreadKey] = true
+	}
+	for _, p := range tbl.LSUpdateThreadAuthorityAndMappingWithOTIDFromJID {
+		l.pointers[p.ThreadKey] = true
+	}
+	for _, p := range tbl.LSMoveThreadToE2EECutoverFolder {
+		l.pointers[p.ThreadKey] = true
+	}
+	delete(l.pointers, 0)
+	c.EncryptedPointers = len(l.pointers)
 	c.Loaded = true
+}
 
+// listed records how far the older pages of his inbox got.
+func (m *Messenger) listed(pages int, complete, capped bool) {
 	m.cmu.Lock()
 	defer m.cmu.Unlock()
-	c.Registered, c.RegisterMs, c.E2EEConnected, c.E2EEFailed = m.counts.Registered, m.counts.RegisterMs, m.counts.E2EEConnected, m.counts.E2EEFailed
-	c.HistoryState, c.RestoredMessages = m.counts.HistoryState, m.counts.RestoredMessages
-	m.counts = c
-	m.newestOneToOne = newest
+	m.counts.ListPages, m.counts.ListComplete, m.counts.ListCapped = pages, complete, capped
 }
 
 // isGroup reports whether an unencrypted thread type is a group chat.

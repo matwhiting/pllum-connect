@@ -7,8 +7,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
+	"go.mau.fi/mautrix-meta/pkg/messagix"
 	"go.mau.fi/mautrix-meta/pkg/messagix/cookies"
 	"go.mau.fi/mautrix-meta/pkg/messagix/securehistory"
+	"go.mau.fi/mautrix-meta/pkg/messagix/socket"
 	"go.mau.fi/mautrix-meta/pkg/messagix/table"
 	"go.mau.fi/mautrix-meta/pkg/messagix/types"
 	"go.mau.fi/whatsmeow/proto/waAdv"
@@ -102,6 +105,28 @@ type fakeMeta struct {
 	clients   []*fakeClient
 	e2ee      *fakeE2EE
 	history   *fakeHistory
+
+	// holdConnect keeps the main socket from saying it connected until a
+	// test dispatches the event itself.
+	holdConnect bool
+	connects    int
+	// registerErrs fail the next registrations, in order (Meta's answer
+	// lost). regKeys and regUUIDs are the identity key and Facebook device
+	// UUID each registration was made with.
+	registerErrs []error
+	regKeys      [][32]byte
+	regUUIDs     []uuid.UUID
+	// pages are the thread pages FetchMoreThreads gives, in order; after
+	// them, the listing has ended. endless gives a new page every time.
+	pages   []threadPage
+	endless bool
+	fetches int
+}
+
+// threadPage is one FetchMoreThreads answer.
+type threadPage struct {
+	keys *socket.KeyStoreData
+	tbl  *table.LSTable
 }
 
 func newFakeMeta() *fakeMeta {
@@ -120,6 +145,64 @@ type fakeClient struct {
 	f   *fakeMeta
 	ck  *cookies.Cookies
 	dev *wastore.Device
+
+	hmu     sync.Mutex
+	handler messagix.EventHandler
+}
+
+func (c *fakeClient) SetEventHandler(h messagix.EventHandler) {
+	c.hmu.Lock()
+	defer c.hmu.Unlock()
+	c.handler = h
+}
+
+// Connect starts the main socket: it says connected at once, unless the
+// test holds it.
+func (c *fakeClient) Connect(ctx context.Context) error {
+	c.f.mu.Lock()
+	c.f.connects++
+	hold := c.f.holdConnect
+	c.f.mu.Unlock()
+	if !hold {
+		go c.dispatch(&messagix.ConnectedEvent{})
+	}
+	return nil
+}
+
+func (c *fakeClient) Disconnect() {}
+
+// dispatch delivers a main-socket event, as messagix's loop does.
+func (c *fakeClient) dispatch(evt any) {
+	c.hmu.Lock()
+	h := c.handler
+	c.hmu.Unlock()
+	if h != nil {
+		h(context.Background(), evt)
+	}
+}
+
+func (c *fakeClient) FetchMoreThreads(ctx context.Context, syncGroup int64) (*socket.KeyStoreData, *table.LSTable, error) {
+	c.f.mu.Lock()
+	defer c.f.mu.Unlock()
+	c.f.fetches++
+	if c.f.endless {
+		key := int64(7000000000000000 + c.f.fetches)
+		return &socket.KeyStoreData{HasMoreBefore: true, MinThreadKey: key},
+			&table.LSTable{LSDeleteThenInsertThread: []*table.LSDeleteThenInsertThread{{ThreadKey: key, ThreadType: table.GROUP_THREAD}}}, nil
+	}
+	if len(c.f.pages) == 0 {
+		return nil, nil, nil
+	}
+	p := c.f.pages[0]
+	c.f.pages = c.f.pages[1:]
+	return p.keys, p.tbl, nil
+}
+
+// last is the newest client made.
+func (f *fakeMeta) last() *fakeClient {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.clients[len(f.clients)-1]
 }
 
 func (c *fakeClient) LoadMessagesPage(ctx context.Context) (types.UserInfo, *table.LSTable, error) {
@@ -139,9 +222,21 @@ func (c *fakeClient) SetDevice(dev *wastore.Device) { c.dev = dev }
 // RegisterE2EE does what the library's does to the device once Meta has
 // answered: an ID on the Messenger server, and the placeholder account.
 func (c *fakeClient) RegisterE2EE(ctx context.Context, fbid int64) error {
+	if c.dev.FacebookUUID == uuid.Nil {
+		c.dev.FacebookUUID = uuid.New()
+	}
 	c.f.mu.Lock()
 	c.f.registers++
+	c.f.regKeys = append(c.f.regKeys, *c.dev.IdentityKey.Pub)
+	c.f.regUUIDs = append(c.f.regUUIDs, c.dev.FacebookUUID)
+	var err error
+	if len(c.f.registerErrs) > 0 {
+		err, c.f.registerErrs = c.f.registerErrs[0], c.f.registerErrs[1:]
+	}
 	c.f.mu.Unlock()
+	if err != nil {
+		return err
+	}
 	c.dev.ID = &watypes.JID{User: "2000001", Device: 7, Server: watypes.MessengerServer}
 	c.dev.Account = &waAdv.ADVSignedDeviceIdentity{
 		Details:             []byte{},
@@ -287,7 +382,14 @@ type harness struct {
 
 func newHarness(t *testing.T) *harness {
 	t.Helper()
-	h := &harness{f: newFakeMeta(), dir: filepath.Join(t.TempDir(), "connect")}
+	return newHarnessOver(t, filepath.Join(t.TempDir(), "connect"), newFakeMeta())
+}
+
+// newHarnessOver is a new network (a new helper process, as it were) over
+// an existing folder, on the given fakes.
+func newHarnessOver(t *testing.T, dir string, f *fakeMeta) *harness {
+	t.Helper()
+	h := &harness{f: f, dir: dir}
 	st, err := store.Open(h.dir, testKey)
 	if err != nil {
 		t.Fatal(err)
@@ -304,11 +406,27 @@ func newHarness(t *testing.T) *harness {
 	if err := h.m.Start(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() {
-		h.m.Stop()
-		st.Close()
-	})
+	t.Cleanup(h.close)
 	return h
+}
+
+// close stops the network and closes its store; safe to call twice.
+func (h *harness) close() {
+	h.m.Stop()
+	h.st.Close()
+}
+
+// state is the network's state and kind now.
+func (h *harness) state() (network.State, string) {
+	h.emu.Lock()
+	defer h.emu.Unlock()
+	for i := len(h.events) - 1; i >= 0; i-- {
+		if h.events[i]["event"] == "state" {
+			k, _ := h.events[i]["kind"].(string)
+			return h.events[i]["state"].(network.State), k
+		}
+	}
+	return network.NotConnected, ""
 }
 
 // signIn logs in with the invented session and waits for the encrypted

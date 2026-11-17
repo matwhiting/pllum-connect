@@ -4,11 +4,14 @@
 //
 // This is its first slice, the gate (Task B0 of step 3's plan): it signs in
 // with the cookies of a facebook.com session Pllum took from its own sign-in
-// window (`login` with method "session"), loads the messages page once,
-// registers Pllum as a Messenger device and connects the encrypted socket
-// (e2ee.go), restores his encrypted history with his PIN (history.go), and
-// counts what it sees (gate.go). It writes no chat or line into the store
-// yet, and it sends nothing: every write method is `unsupported`.
+// window (`login` with method "session"), loads the messages page once and
+// connects the main (lightspeed) socket; on its first connect, as
+// mautrix-meta's connector does, it registers Pllum as a Messenger device
+// (once, ever) and connects the encrypted socket (e2ee.go), looks for his
+// history backup, which his PIN restores (history.go), and pages the older
+// threads of his inbox, counting what it sees (gate.go). It writes no chat or
+// line into the store yet, and it sends nothing: every write method is
+// `unsupported`.
 //
 // Meta locks accounts that behave like a script, so every request goes
 // through one meta.Pace: one at a time, 2 to 4 s apart, none for a while
@@ -19,8 +22,8 @@
 //
 // Nothing here logs: the client gets zerolog.Nop(), whatsmeow gets
 // waLog.Noop, and every error returned carries only a fixed kind. The
-// cookies and the PIN are held in memory only; the store keeps his FBID and
-// the secure-history device under "messenger.*" in its meta table, and the
+// cookies and the PIN are held in memory only; the store keeps the
+// secure-history device under "messenger.history" in its meta table, and the
 // whatsmeow device lives in <dir>/messenger/device.db.
 package messenger
 
@@ -29,7 +32,6 @@ import (
 	"database/sql"
 	"errors"
 	"maps"
-	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -39,6 +41,7 @@ import (
 	"go.mau.fi/mautrix-meta/pkg/messagix/cookies"
 	"go.mau.fi/mautrix-meta/pkg/messagix/httpclient"
 	"go.mau.fi/mautrix-meta/pkg/messagix/securehistory"
+	"go.mau.fi/mautrix-meta/pkg/messagix/socket"
 	"go.mau.fi/mautrix-meta/pkg/messagix/table"
 	"go.mau.fi/mautrix-meta/pkg/messagix/types"
 	wastore "go.mau.fi/whatsmeow/store"
@@ -58,14 +61,20 @@ var (
 	errInternal     = &wire.Error{Kind: wire.Internal}
 	errNotConnected = &wire.Error{Kind: wire.NotConnected}
 	errUnsupported  = &wire.Error{Kind: wire.Unsupported}
+	errUnclear      = &wire.Error{Kind: wire.Unclear}
 )
 
 // msgrClient is what the adapter uses of messagix's client: the messages
-// page, the cookies (for the session event), and the encrypted side's
+// page, the main (lightspeed) socket and the older pages of threads over it,
+// the cookies (for the session event), and the encrypted side's
 // registration. *messagix.Client satisfies it through realClient; tests use
 // a fake.
 type msgrClient interface {
 	LoadMessagesPage(ctx context.Context) (types.UserInfo, *table.LSTable, error)
+	SetEventHandler(h messagix.EventHandler)
+	Connect(ctx context.Context) error
+	Disconnect()
+	FetchMoreThreads(ctx context.Context, syncGroup int64) (*socket.KeyStoreData, *table.LSTable, error)
 	GetCookies() *cookies.Cookies
 	SetDevice(dev *wastore.Device)
 	RegisterE2EE(ctx context.Context, fbid int64) error
@@ -117,6 +126,7 @@ type Messenger struct {
 	runCancel context.CancelFunc
 	fbid      int64
 	e2ee      e2eeClient
+	e2eeBegun bool // this run has started setting up the encrypted side
 	state     network.State
 	kind      wire.Kind
 	work      sync.WaitGroup
@@ -125,7 +135,11 @@ type Messenger struct {
 	dmu       sync.Mutex
 	db        *sql.DB
 	container *sqlstore.Container
-	dev       *wastore.Device
+	dev       *wastore.Device // his registered, saved device
+	// pending is a device made for pendingFor whose registration or save
+	// failed in this helper: the next sign-in registers its keys again.
+	pending    *wastore.Device
+	pendingFor int64
 
 	// the secure history (history.go)
 	hmu     sync.Mutex // one restore at a time
@@ -135,7 +149,9 @@ type Messenger struct {
 	// what the gate counts (gate.go)
 	cmu                   sync.Mutex
 	counts                GateCounts
+	listing               listing
 	newestOneToOne        int64 // the thread key of the newest encrypted one-to-one, 0 for none
+	newestAt              int64 // its last activity, in ms
 	liveEncryptedReceived atomic.Int64
 	liveUndecryptable     atomic.Int64
 }
@@ -334,7 +350,7 @@ func (m *Messenger) Stop() {
 	m.dmu.Lock()
 	if m.db != nil {
 		m.db.Close()
-		m.db, m.container, m.dev = nil, nil, nil
+		m.db, m.container, m.dev, m.pending = nil, nil, nil, nil
 	}
 	m.dmu.Unlock()
 }
@@ -349,7 +365,17 @@ func (m *Messenger) retire() {
 		m.runCancel = nil
 	}
 	m.runCtx = nil
-	m.cli = nil
+	m.e2eeBegun = false
+	if old := m.cli; old != nil {
+		m.cli = nil
+		// messagix's Disconnect waits for its connection loop, which may be
+		// inside our event handler on this very path.
+		m.work.Add(1)
+		go func() {
+			defer m.work.Done()
+			old.Disconnect()
+		}()
+	}
 	if old := m.e2ee; old != nil {
 		m.e2ee = nil
 		// Disconnect waits for the socket to stop, which may be inside an
@@ -362,6 +388,7 @@ func (m *Messenger) retire() {
 	}
 	m.cmu.Lock()
 	m.counts.E2EEConnected = false
+	m.counts.MainConnected = false
 	m.cmu.Unlock()
 }
 
@@ -386,8 +413,9 @@ func (m *Messenger) current(gen int) bool {
 }
 
 // run makes a client for the session, loads the messages page (which signs
-// it in and lists the first page of his inbox), then sets up the encrypted
-// side and looks for his history backup.
+// it in and lists the first page of his inbox), and connects the main
+// socket. The rest happens when that socket first says it is connected
+// (mainHandler), in mautrix-meta's connector's order.
 func (m *Messenger) run(ctx context.Context, gen int, session network.Session) {
 	ck := &cookies.Cookies{Platform: types.Facebook}
 	values := make(map[cookies.MetaCookieName]string, len(session))
@@ -426,14 +454,118 @@ func (m *Messenger) run(ctx context.Context, gen int, session network.Session) {
 	}
 	m.fbid = fbid
 	m.mu.Unlock()
-	_ = m.st.PutNetworkValue(Name, "viewer", strconv.FormatInt(fbid, 10))
-	m.list(tbl)
+	m.addTable(tbl)
 
-	if err := m.connectE2EE(ctx, gen, cli, fbid); err != nil {
+	cli.SetEventHandler(m.mainHandler(gen, cli, fbid))
+	if err := m.request(ctx, gen, func(ctx context.Context) error { return cli.Connect(ctx) }); err != nil {
 		m.failed(gen, wire.KindOf(err))
+	}
+}
+
+// mainHandler is the main socket's event handler for run gen. The first
+// connect (or reconnect, if no connect came) sets up the encrypted side,
+// once per run, as the connector's handleMetaEvent does; the socket's own
+// reconnects are messagix's. A socket Meta refuses as unauthorized is an
+// ended session. Tables only add to the gate's counts.
+func (m *Messenger) mainHandler(gen int, cli msgrClient, fbid int64) messagix.EventHandler {
+	return func(_ context.Context, evt any) {
+		defer func() { _ = recover() }()
+		if !m.current(gen) {
+			return
+		}
+		switch e := evt.(type) {
+		case *messagix.ConnectedEvent, *messagix.ReconnectedEvent:
+			m.socketUp(gen, false, true)
+			m.beginE2EE(gen, cli, fbid)
+		case *messagix.TransientDisconnectEvent:
+			m.socketUp(gen, false, false)
+		case *messagix.PermanentErrorEvent:
+			m.pace.Fail(meta.ReconnectNeeded)
+			m.pushedBack(gen, meta.ReconnectNeeded)
+		case *table.LSTable:
+			m.addTable(e)
+		}
+	}
+}
+
+// beginE2EE sets up the encrypted side for run gen, once: the device and
+// the encrypted socket, then the history check, then the older pages of his
+// inbox. All of it through the pace, in one goroutine.
+func (m *Messenger) beginE2EE(gen int, cli msgrClient, fbid int64) {
+	m.mu.Lock()
+	ctx := m.runCtx
+	if gen != m.gen || m.stopped || m.e2eeBegun || ctx == nil {
+		m.mu.Unlock()
 		return
 	}
-	m.checkHistory(ctx, gen, cli, fbid)
+	m.e2eeBegun = true
+	m.work.Add(1)
+	m.mu.Unlock()
+	go func() {
+		defer m.work.Done()
+		if err := m.connectE2EE(ctx, gen, cli, fbid); err != nil {
+			m.failed(gen, wire.KindOf(err))
+			return
+		}
+		m.checkHistory(ctx, gen, cli, fbid)
+		m.pageThreads(ctx, gen, cli)
+	}()
+}
+
+// socketUp records the main socket (encrypted false) or the encrypted socket
+// going up or down for run gen: live while both are up, offline while the
+// libraries reconnect either.
+func (m *Messenger) socketUp(gen int, encrypted, up bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if gen != m.gen || m.stopped {
+		return
+	}
+	m.cmu.Lock()
+	if encrypted {
+		m.counts.E2EEConnected = up
+	} else {
+		m.counts.MainConnected = up
+	}
+	both := m.counts.MainConnected && m.counts.E2EEConnected
+	m.cmu.Unlock()
+	switch {
+	case both:
+		m.setState(network.Live, "")
+	case m.state == network.Live:
+		m.setState(network.Offline, "")
+	}
+}
+
+// pageThreads fetches the older pages of his inbox through the pace, as the
+// connector's thread backfill does, until the listing ends (no page, no more
+// before, or the oldest thread key stops moving) or maxThreadPages, and adds
+// each to the gate's counts.
+func (m *Messenger) pageThreads(ctx context.Context, gen int, cli msgrClient) {
+	var prev int64
+	for page := 0; page < maxThreadPages; page++ {
+		var keys *socket.KeyStoreData
+		var tbl *table.LSTable
+		err := m.request(ctx, gen, func(ctx context.Context) (err error) {
+			keys, tbl, err = cli.FetchMoreThreads(ctx, 1)
+			return err
+		})
+		if err != nil || !m.current(gen) {
+			return
+		}
+		if tbl == nil {
+			m.listed(page, true, false)
+			return
+		}
+		m.addTable(tbl)
+		if keys == nil || !keys.HasMoreBefore || keys.MinThreadKey == prev {
+			m.listed(page+1, true, false)
+			return
+		}
+		prev = keys.MinThreadKey
+		m.listed(page+1, false, false)
+	}
+	m.listed(maxThreadPages, false, true)
 }
 
 // failed ends run gen after a failure that is not Meta stopping the session

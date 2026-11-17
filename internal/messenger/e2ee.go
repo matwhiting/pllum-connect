@@ -12,7 +12,6 @@ import (
 	"go.mau.fi/whatsmeow/types/events"
 	waLog "go.mau.fi/whatsmeow/util/log"
 
-	"github.com/matwhiting/pllum-connect/internal/network"
 	"github.com/matwhiting/pllum-connect/internal/store"
 )
 
@@ -51,65 +50,80 @@ func (c realClient) PrepareE2EE() (e2eeClient, error) {
 	return waClient{cli}, nil
 }
 
-// device is his saved Messenger device for this account, or a new one (not
-// yet saved) when there is none. The device database is opened the first
-// time, never at Start, so nothing is made on disk until he signs in.
-func (m *Messenger) device(ctx context.Context, fbid int64) (*wastore.Device, error) {
+// device is his Messenger device for this account, registered with Meta
+// and saved: the one saved in an earlier run or sign-in, or else one
+// registered now (once, timed). It holds dmu throughout, so two runs never
+// each make one. A registration that fails (Meta's answer lost, or the save
+// after it) keeps its unsaved device, keys and Facebook device ID, for the
+// next sign-in in this helper to register again: Meta finds the same keys
+// and keeps one device, where new keys would add a second. Its error is
+// unclear: it may have happened, and signing in again is not the fix. The
+// device database is opened the first time, never at Start, so nothing is
+// made on disk until he signs in.
+func (m *Messenger) device(ctx context.Context, gen int, cli msgrClient, fbid int64) (dev *wastore.Device, registerMs int64, err error) {
 	m.dmu.Lock()
 	defer m.dmu.Unlock()
 	if m.container == nil {
 		db, err := store.OpenDevice(filepath.Join(m.dir, Name, "device.db"), m.key)
 		if err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 		c := sqlstore.NewWithDB(db, "sqlite3", waLog.Noop)
 		if err := c.Upgrade(ctx); err != nil {
 			db.Close()
-			return nil, errInternal
+			return nil, 0, errInternal
 		}
 		m.db, m.container = db, c
 	}
 	devices, err := m.container.GetAllDevices(ctx)
 	if err != nil {
-		return nil, errInternal
+		return nil, 0, errInternal
 	}
 	user := strconv.FormatInt(fbid, 10)
 	for _, d := range devices {
 		if d.ID != nil && d.ID.User == user && d.ID.Server == watypes.MessengerServer {
 			m.dev = d
-			return d, nil
+			cli.SetDevice(d)
+			return d, 0, nil
 		}
 	}
-	m.dev = m.container.NewDevice()
-	return m.dev, nil
-}
 
-// connectE2EE sets up the encrypted side for run gen: the saved device, or a
-// new one registered with Meta (once, timed) and saved; then the encrypted
-// socket. The state goes live when the socket says it is connected.
-func (m *Messenger) connectE2EE(ctx context.Context, gen int, cli msgrClient, fbid int64) error {
-	dev, err := m.device(ctx, fbid)
-	if err != nil {
-		return err
+	dev = m.pending
+	if dev == nil || m.pendingFor != fbid {
+		dev = m.container.NewDevice()
+		m.pending, m.pendingFor = dev, fbid
 	}
 	cli.SetDevice(dev)
-	var registerMs int64
 	if dev.ID == nil {
+		asked := false
 		err := m.request(ctx, gen, func(ctx context.Context) error {
+			asked = true
 			began := m.now()
 			err := cli.RegisterE2EE(ctx, fbid)
 			registerMs = m.now().Sub(began).Milliseconds()
 			return err
 		})
-		if err != nil {
-			return err
+		switch {
+		case err != nil && !asked:
+			return nil, 0, err // refused before Meta was asked
+		case err != nil, dev.ID == nil:
+			return nil, 0, errUnclear
 		}
-		if dev.ID == nil {
-			return errInternal
-		}
-		if err := dev.Save(ctx); err != nil {
-			return errInternal
-		}
+	}
+	if err := dev.Save(ctx); err != nil {
+		return nil, 0, errUnclear
+	}
+	m.pending, m.pendingFor = nil, 0
+	m.dev = dev
+	return dev, registerMs, nil
+}
+
+// connectE2EE sets up the encrypted side for run gen: his device (device),
+// then the encrypted socket. The state goes live when both sockets are up.
+func (m *Messenger) connectE2EE(ctx context.Context, gen int, cli msgrClient, fbid int64) error {
+	_, registerMs, err := m.device(ctx, gen, cli, fbid)
+	if err != nil {
+		return err
 	}
 	m.cmu.Lock()
 	m.counts.Registered = true
@@ -160,24 +174,8 @@ func (m *Messenger) e2eeHandler(gen int) func(evt any) {
 	}
 }
 
-// e2eeUp records the encrypted socket going up or down for run gen: live
-// while it is up, offline while the library reconnects it.
-func (m *Messenger) e2eeUp(gen int, up bool) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if gen != m.gen || m.stopped {
-		return
-	}
-	m.cmu.Lock()
-	m.counts.E2EEConnected = up
-	m.cmu.Unlock()
-	switch {
-	case up:
-		m.setState(network.Live, "")
-	case m.state == network.Live || m.state == network.Connecting:
-		m.setState(network.Offline, "")
-	}
-}
+// e2eeUp records the encrypted socket going up or down for run gen.
+func (m *Messenger) e2eeUp(gen int, up bool) { m.socketUp(gen, true, up) }
 
 // e2eeConnected reports whether run gen's encrypted socket is up.
 func (m *Messenger) e2eeConnected() bool {
