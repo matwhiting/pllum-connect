@@ -164,3 +164,11 @@ type EncryptedHistory interface {
 	HistoryState() string
 	RestoreHistory(ctx context.Context, pin []byte) error
 }
+
+// Gate is a network with a gate: counts, and only counts, that say whether
+// it can move off Beeper (Messenger's encrypted chats, step 3's Task B0).
+// The server answers the hidden method `gateCounts` with them only when the
+// helper is started with --gate; otherwise the method does not exist.
+type Gate interface {
+	GateCounts() any
+}

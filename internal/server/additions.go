@@ -31,6 +31,11 @@ func (s *server) ownMethod(name string) (handler, bool) {
 		return encryptedHistory, true
 	case "restoreHistory":
 		return restoreHistory, true
+	case "gateCounts":
+		// hidden: it exists only when the helper is started with --gate
+		if s.deps.Gate {
+			return gateCounts, true
+		}
 	}
 	return nil, false
 }
@@ -213,4 +218,14 @@ func restoreHistory(ctx context.Context, n network.Network, params json.RawMessa
 		return nil, badRequest
 	}
 	return wire.Empty, eh.RestoreHistory(ctx, []byte(*p.PIN))
+}
+
+// gateCounts answers a network's gate counts (counts only), or unsupported
+// for a network with no gate. Only registered with --gate (ownMethod).
+func gateCounts(ctx context.Context, n network.Network, _ json.RawMessage) (any, error) {
+	g, ok := n.(network.Gate)
+	if !ok {
+		return nil, unsupported
+	}
+	return g.GateCounts(), nil
 }

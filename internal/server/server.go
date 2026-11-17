@@ -45,6 +45,9 @@ type Deps struct {
 	// Now is the clock for the 10 s between two FetchOlder calls on a chat;
 	// nil is time.Now. It exists so a test needs no real waiting.
 	Now func() time.Time
+	// Gate is true when the helper was started with --gate: only then is
+	// the hidden method `gateCounts` answered (network.Gate).
+	Gate bool
 }
 
 // olderEvery is the least time between two FetchOlder calls on one chat.

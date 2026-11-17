@@ -18,6 +18,7 @@ import (
 	"syscall"
 
 	"github.com/matwhiting/pllum-connect/internal/instagram"
+	"github.com/matwhiting/pllum-connect/internal/messenger"
 	"github.com/matwhiting/pllum-connect/internal/network"
 	"github.com/matwhiting/pllum-connect/internal/quiet"
 	"github.com/matwhiting/pllum-connect/internal/server"
@@ -44,6 +45,9 @@ func run(args []string) int {
 	flags := flag.NewFlagSet("pllum-connect", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
 	data := flags.String("data", "", "the data folder (made 0700)")
+	// --gate is Messenger's gate (step 3, Task B0), run by a Debug Pllum
+	// only: it adds the hidden method gateCounts.
+	gate := flags.Bool("gate", false, "answer gateCounts")
 	if err := flags.Parse(args); err != nil || *data == "" || flags.NArg() != 0 {
 		return exitUsage
 	}
@@ -79,11 +83,17 @@ func run(args []string) int {
 			return store.Open(dir, key)
 		},
 		Networks: func(st *store.Store, dir string, key [32]byte, emit network.Emit) []network.Network {
+			m := messenger.New(st, dir, key, emit.For(messenger.Name))
+			if *gate {
+				m.WithGate()
+			}
 			return []network.Network{
 				whatsapp.New(st, dir, key, emit.For(whatsapp.Name)),
 				instagram.New(st, dir, key, emit.For(instagram.Name)),
+				m,
 			}
 		},
+		Gate: *gate,
 	}
 	if err := server.Serve(ctx, os.Stdin, os.Stdout, deps); err != nil {
 		return exitFailed

@@ -20,6 +20,8 @@ pllum-connect --data <folder>
 
 The data folder is made with mode 0700. Only one copy runs per folder: a second exits with code 3. The helper exits 0 at the end of its input.
 
+`--gate` adds one hidden method, `gateCounts` (counts only), for Messenger's gate: the one sitting in which a Debug Pllum checks whether its encrypted chats can be read before Messenger is built out. Pllum's own copy never passes it.
+
 ## Test
 
 ```sh

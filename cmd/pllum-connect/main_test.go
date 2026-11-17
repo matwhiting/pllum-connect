@@ -62,9 +62,9 @@ func TestASecondCopyOnTheSameFolderExitsLocked(t *testing.T) {
 		if !strings.Contains(line, `"result"`) {
 			t.Fatalf("the first copy did not answer hello: %s", line)
 		}
-		// Both networks run: hello lists them, in order.
-		if !strings.Contains(line, `"networks":["whatsapp","instagram"]`) {
-			t.Errorf("hello's networks are not whatsapp and instagram: %s", line)
+		// Every network runs: hello lists them, in order.
+		if !strings.Contains(line, `"networks":["whatsapp","instagram","messenger"]`) {
+			t.Errorf("hello's networks are not whatsapp, instagram and messenger: %s", line)
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatalf("the first copy did not answer hello within 10 s")
@@ -139,5 +139,40 @@ func TestNoDataFolderIsAUsageError(t *testing.T) {
 	var exit *exec.ExitError
 	if !errors.As(err, &exit) || exit.ExitCode() != 2 {
 		t.Fatalf("no --data ended with %v, want exit code 2", err)
+	}
+}
+
+// The hidden gateCounts exists only in a helper started with --gate, and
+// answers counts before any sign-in (nothing is asked of Meta).
+func TestGateCountsOnlyWithTheGateFlag(t *testing.T) {
+	bin := buildHelper(t)
+	for _, gate := range []bool{false, true} {
+		args := []string{"--data", filepath.Join(t.TempDir(), "connect")}
+		if gate {
+			args = append(args, "--gate")
+		}
+		cmd := exec.Command(bin, args...)
+		var out, errOut bytes.Buffer
+		cmd.Stdout, cmd.Stderr = &out, &errOut
+		cmd.Stdin = strings.NewReader(`{"id":"h","method":"hello","params":{"protocol":1,"storeKey":"` + testKeyHex + `","app":"0.0.1-test"}}` + "\n" +
+			`{"id":"g","method":"gateCounts","params":{"network":"messenger"}}` + "\n")
+		if err := cmd.Run(); err != nil {
+			t.Fatalf("gate %v: the helper ended with %v", gate, err)
+		}
+		var answer string
+		for _, line := range strings.Split(out.String(), "\n") {
+			if strings.Contains(line, `"id":"g"`) {
+				answer = line
+			}
+		}
+		switch {
+		case !gate && !strings.Contains(answer, `"kind":"unknownMethod"`):
+			t.Errorf("without --gate, gateCounts answered %q, want unknownMethod", answer)
+		case gate && !strings.Contains(answer, `"registered":false`):
+			t.Errorf("with --gate, gateCounts answered %q, want counts", answer)
+		}
+		if errOut.Len() != 0 {
+			t.Errorf("gate %v: the helper wrote %d bytes to stderr, want none", gate, errOut.Len())
+		}
 	}
 }
