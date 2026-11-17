@@ -522,7 +522,11 @@ type handler func(ctx context.Context, n network.Network, params json.RawMessage
 var methods = map[string]handler{
 	"status": func(ctx context.Context, n network.Network, _ json.RawMessage) (any, error) {
 		st := n.Status()
-		return map[string]any{"state": st.State, "selfChatID": nullable(st.SelfChatID)}, nil
+		out := map[string]any{"state": st.State, "selfChatID": nullable(st.SelfChatID)}
+		if st.Encrypted != "" {
+			out["encrypted"] = st.Encrypted
+		}
+		return out, nil
 	},
 	"login": func(ctx context.Context, n network.Network, params json.RawMessage) (any, error) {
 		var p struct {

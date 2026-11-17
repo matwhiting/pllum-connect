@@ -343,21 +343,9 @@ func (m *Messenger) backfill(ctx context.Context, gen int, cli msgrClient) {
 	if m.value("backfilled") != "" {
 		return
 	}
-	var chats []string
-	cursor := ""
-	since := m.now().Add(-activeWithin).UnixMilli()
-	for {
-		page, err := m.st.Chats(Name, since, cursor, 200)
-		if err != nil {
-			return
-		}
-		for _, c := range page.Items {
-			chats = append(chats, c.ID)
-		}
-		if page.Cursor == "" {
-			break
-		}
-		cursor = page.Cursor
+	chats, ok := m.activeChats()
+	if !ok {
+		return
 	}
 	for _, chat := range chats {
 		if ctx.Err() != nil || !m.current(gen) {
@@ -391,11 +379,33 @@ func (m *Messenger) backfill(ctx context.Context, gen int, cli msgrClient) {
 	}
 }
 
+// activeChats are the chats active in the last 90 days, newest first; ok
+// is false when the store could not list them.
+func (m *Messenger) activeChats() (chats []string, ok bool) {
+	cursor := ""
+	since := m.now().Add(-activeWithin).UnixMilli()
+	for {
+		page, err := m.st.Chats(Name, since, cursor, 200)
+		if err != nil {
+			return nil, false
+		}
+		for _, c := range page.Items {
+			chats = append(chats, c.ID)
+		}
+		if page.Cursor == "" {
+			return chats, true
+		}
+		cursor = page.Cursor
+	}
+}
+
 // FetchOlder fetches one page of a chat's history older than what the
-// store holds, from its unencrypted thread (a group's, or the older thread
-// of a one-to-one), and tells Pllum when it added lines. A chat with no
-// unencrypted thread, or none of its lines held, or held after a page that
-// did not move, asks nothing; one the store does not hold is notFound.
+// store holds, and tells Pllum when it added lines: of its encrypted
+// backup first, once his history is restored (history.go), until that has
+// nothing older; then of its unencrypted thread (a group's, or the older
+// thread of a one-to-one). A chat with neither, or none of its lines held,
+// or held after a page that did not move, asks nothing; one the store does
+// not hold is notFound.
 func (m *Messenger) FetchOlder(ctx context.Context, chatID string) (int, error) {
 	if err := m.blocked(); err != nil {
 		return 0, err
@@ -408,14 +418,21 @@ func (m *Messenger) FetchOlder(ctx context.Context, chatID string) (int, error) 
 	if !ok {
 		return 0, errNotFound
 	}
-	key, ok := m.threadOfChat(chat)
-	if !ok {
-		return 0, nil
-	}
 	// It ends with the run, or with the caller.
 	ctx2, cancel := context.WithCancel(runCtx)
 	defer cancel()
 	defer context.AfterFunc(ctx, cancel)()
+	if m.encPaging(chat) {
+		m.mu.Lock()
+		fbid := m.fbid
+		m.mu.Unlock()
+		added, _, err := m.fetchEncPage(ctx2, gen, cli, fbid, chat)
+		return added, err
+	}
+	key, ok := m.threadOfChat(chat)
+	if !ok {
+		return 0, nil
+	}
 	added, _, err := m.fetchPage(ctx2, gen, cli, chat, key)
 	if added > 0 {
 		m.changed()

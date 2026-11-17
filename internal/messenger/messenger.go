@@ -12,9 +12,11 @@
 // (backfill.go). Everything the messages page, the pages and the main
 // socket say is written into the store (ingest.go): groups as chats, his
 // older one-to-one threads as aliases of their encrypted chats (ids.go),
-// their lines, reactions, read receipts, mutes and people. The gate
-// (gate.go) counts what it sees. It sends nothing yet: every write method
-// is `unsupported`.
+// their lines, reactions, read receipts, mutes and people; and so is
+// everything the encrypted socket says of the encrypted chats (their lines,
+// receipts and undecryptable messages) and, once his PIN has restored it,
+// his backup of them (history.go). The gate (gate.go) counts what it sees.
+// It sends nothing yet: every write method is `unsupported`.
 //
 // Meta locks accounts that behave like a script, so every request goes
 // through one meta.Pace: one at a time, 2 to 4 s apart, none for a while
@@ -143,9 +145,13 @@ type Messenger struct {
 	fbid      int64
 	e2ee      e2eeClient
 	e2eeBegun bool // this run has started setting up the encrypted side
-	state     network.State
-	kind      wire.Kind
-	work      sync.WaitGroup
+	// e2eeEverUp: this run's encrypted socket has been up; e2eeFailed: Meta
+	// ended its encrypted session, or its registration failed.
+	e2eeEverUp bool
+	e2eeFailed bool
+	state      network.State
+	kind       wire.Kind
+	work       sync.WaitGroup
 
 	// the whatsmeow device store (e2ee.go)
 	dmu       sync.Mutex
@@ -158,9 +164,11 @@ type Messenger struct {
 	pendingFor int64
 
 	// the secure history (history.go)
-	hmu     sync.Mutex // one restore at a time
-	backup  *securehistory.Backup
-	history string // historyState: "", noBackup, needsPIN, restored, skipped
+	hmu      sync.Mutex // one restore at a time
+	backup   *securehistory.Backup
+	history  string      // historyState: "", noBackup, needsPIN, restored, skipped
+	epmu     sync.Mutex  // one change to the history device's keys at a time
+	ebActive atomic.Bool // the first read of his backup is running
 
 	// what the gate counts (gate.go)
 	cmu                   sync.Mutex
@@ -259,12 +267,13 @@ func (m *Messenger) Start(ctx context.Context) error {
 	return nil
 }
 
-// Status is the network's state. Messenger has no "message yourself" chat
-// that Pllum shows, so SelfChatID is empty.
+// Status is the network's state, and how its encrypted connection is.
+// Messenger has no "message yourself" chat that Pllum shows, so SelfChatID
+// is empty.
 func (m *Messenger) Status() network.Status {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return network.Status{State: m.state}
+	return network.Status{State: m.state, Encrypted: m.encryptedState()}
 }
 
 // Login signs in with the cookies of a facebook.com session. A session
@@ -463,6 +472,7 @@ func (m *Messenger) retire() {
 func (m *Messenger) startRun() {
 	ctx, cancel := context.WithCancel(m.ctx)
 	m.runCtx, m.runCancel = ctx, cancel
+	m.e2eeEverUp, m.e2eeFailed = false, false
 	gen, session := m.gen, m.session
 	m.work.Add(1)
 	go func() {
@@ -575,6 +585,13 @@ func (m *Messenger) beginE2EE(gen int, cli msgrClient, fbid int64) {
 		// standard error, as in the main handler.
 		defer func() { _ = recover() }()
 		if err := m.connectE2EE(ctx, gen, cli, fbid); err != nil {
+			if k := wire.KindOf(err); k == wire.Unclear || k == wire.Internal {
+				m.mu.Lock()
+				if gen == m.gen {
+					m.e2eeFailed = true
+				}
+				m.mu.Unlock()
+			}
 			m.failed(gen, wire.KindOf(err))
 			return
 		}
@@ -587,13 +604,19 @@ func (m *Messenger) beginE2EE(gen int, cli msgrClient, fbid int64) {
 		if !m.gate {
 			// The gate only counts: it fetches no history (review I4).
 			m.backfill(ctx, gen, cli)
+			// His restored backup, once (history.go); a restore made later
+			// in this run starts it itself.
+			m.encryptedBackfill(ctx, gen, cli, fbid)
 		}
 	}()
 }
 
 // socketUp records the main socket (encrypted false) or the encrypted socket
-// going up or down for run gen: live while both are up, offline while the
-// libraries reconnect either.
+// going up or down for run gen. Messenger is live only while both are up.
+// With the main socket up (groups read) and the encrypted one down after it
+// had been up, or ended, it is offline with kind unsupported: the encrypted
+// chats can't be read. With the main socket down it is offline while the
+// library reconnects it. Until both have first come up it stays connecting.
 func (m *Messenger) socketUp(gen int, encrypted, up bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -606,12 +629,17 @@ func (m *Messenger) socketUp(gen int, encrypted, up bool) {
 	} else {
 		m.counts.MainConnected = up
 	}
-	both := m.counts.MainConnected && m.counts.E2EEConnected
+	main, enc := m.counts.MainConnected, m.counts.E2EEConnected
 	m.cmu.Unlock()
+	if encrypted && up {
+		m.e2eeEverUp, m.e2eeFailed = true, false
+	}
 	switch {
-	case both:
+	case main && enc:
 		m.setState(network.Live, "")
-	case m.state == network.Live:
+	case main && (m.e2eeEverUp || m.e2eeFailed):
+		m.setState(network.Offline, wire.Unsupported)
+	case !main && (m.state == network.Live || m.state == network.Offline):
 		m.setState(network.Offline, "")
 	}
 }

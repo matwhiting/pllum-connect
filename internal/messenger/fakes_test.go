@@ -199,8 +199,14 @@ type call struct {
 }
 
 func newFakeMeta() *fakeMeta {
-	return &fakeMeta{table: inbox(), e2ee: &fakeE2EE{}, history: &fakeHistory{},
+	f := &fakeMeta{table: inbox(), e2ee: &fakeE2EE{}, history: &fakeHistory{},
 		folders: map[folderKey][]*table.LSTable{}, older: map[int64][]*table.LSTable{}, clock: newFakeClock()}
+	f.history.rec = func(name string) {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		f.record(name)
+	}
+	return f
 }
 
 // record notes a request; f.mu is held.
@@ -445,15 +451,16 @@ func (c *fakeClient) PrepareE2EE() (e2eeClient, error) { return c.f.e2ee, nil }
 
 func (c *fakeClient) History() historyClient { return c.f.history }
 
-// fakeE2EE is the encrypted socket: Connect says connected, and a test
-// delivers events through it.
+// fakeE2EE is the encrypted socket: Connect says connected (unless the
+// test holds it), and a test delivers events through it.
 type fakeE2EE struct {
 	mu       sync.Mutex
-	handlers []func(evt any)
+	handlers []func(evt any) bool
 	connects int
+	hold     bool
 }
 
-func (e *fakeE2EE) AddEventHandler(h func(evt any)) {
+func (e *fakeE2EE) AddEventHandlerWithSuccessStatus(h func(evt any) bool) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.handlers = append(e.handlers, h)
@@ -462,20 +469,29 @@ func (e *fakeE2EE) AddEventHandler(h func(evt any)) {
 func (e *fakeE2EE) Connect() error {
 	e.mu.Lock()
 	e.connects++
+	hold := e.hold
 	e.mu.Unlock()
-	go e.dispatch(&events.Connected{})
+	if !hold {
+		go e.dispatch(&events.Connected{})
+	}
 	return nil
 }
 
 func (e *fakeE2EE) Disconnect() {}
 
-func (e *fakeE2EE) dispatch(evt any) {
+// dispatch delivers an event as whatsmeow does, and reports whether every
+// handler took it (whatsmeow acks only then).
+func (e *fakeE2EE) dispatch(evt any) bool {
 	e.mu.Lock()
-	hs := append([]func(any){}, e.handlers...)
+	hs := append([]func(any) bool{}, e.handlers...)
 	e.mu.Unlock()
+	ok := true
 	for _, h := range hs {
-		h(evt)
+		if !h(evt) {
+			ok = false
+		}
 	}
+	return ok
 }
 
 // fakeHistory is Meta's secure-history service. RecoverPIN copies the PIN it
@@ -492,6 +508,48 @@ type fakeHistory struct {
 	added        int
 	fetches      int
 	sample       int // how many lines one page of history decrypts to
+
+	// pages, when set, are each thread's pages of the backup, in order;
+	// after them (or for a thread with none) an empty page that ends it.
+	// asks are the references each thread was asked from; rec notes each
+	// fetch among the fake's requests, for the pace.
+	pages map[string][]fakePage
+	asks  map[string][]int64
+	given map[*securehistory.MessageRange][]*securehistory.DecryptedMessage
+	rec   func(name string)
+}
+
+// fakePage is one page of an invented backup: its lines, and its range.
+// unmoved gives a range that does not reach back past the reference.
+type fakePage struct {
+	msgs    []*securehistory.DecryptedMessage
+	before  int64
+	more    bool
+	unmoved bool
+}
+
+// script gives a thread's pages of the backup.
+func (h *fakeHistory) script(thread string, pages ...fakePage) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.pages == nil {
+		h.pages = map[string][]fakePage{}
+	}
+	h.pages[thread] = append(h.pages[thread], pages...)
+}
+
+// asked are the references a thread's backup was asked from.
+func (h *fakeHistory) asked(thread string) []int64 {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]int64{}, h.asks[thread]...)
+}
+
+// total is how many pages of the backup were asked in all.
+func (h *fakeHistory) total() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.fetches
 }
 
 func (h *fakeHistory) GetBackup(ctx context.Context) (*securehistory.Backup, error) {
@@ -530,16 +588,41 @@ func (h *fakeHistory) AddDevice(ctx context.Context, e *securehistory.Enrollment
 }
 
 func (h *fakeHistory) FetchMessages(ctx context.Context, device *securehistory.Device, threadID string, before bool, ts int64, count int) (*securehistory.MessageRange, error) {
+	if h.rec != nil {
+		h.rec("FetchMessages")
+	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.fetches++
 	no := false
-	return &securehistory.MessageRange{Range: &securehistory.MessageRangeInfo{HasMoreBefore: &no}}, nil
+	if h.pages == nil {
+		return &securehistory.MessageRange{Range: &securehistory.MessageRangeInfo{HasMoreBefore: &no}}, nil
+	}
+	if h.asks == nil {
+		h.asks = map[string][]int64{}
+		h.given = map[*securehistory.MessageRange][]*securehistory.DecryptedMessage{}
+	}
+	h.asks[threadID] = append(h.asks[threadID], ts)
+	p := fakePage{}
+	if pages := h.pages[threadID]; len(pages) > 0 {
+		p, h.pages[threadID] = pages[0], pages[1:]
+	}
+	more := p.more
+	next := p.before
+	if p.unmoved {
+		next = ts
+	}
+	r := &securehistory.MessageRange{BackupID: device.BackupID, Range: &securehistory.MessageRangeInfo{HasMoreBefore: &more, HasMoreAfter: &no, Before: next}}
+	h.given[r] = p.msgs
+	return r, nil
 }
 
 func (h *fakeHistory) Decrypt(r *securehistory.MessageRange, device *securehistory.Device, threadID string, self int64, isGroup bool) ([]*securehistory.DecryptedMessage, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if h.pages != nil {
+		return h.given[r], nil
+	}
 	out := make([]*securehistory.DecryptedMessage, h.sample)
 	for i := range out {
 		out[i] = &securehistory.DecryptedMessage{ID: canary + "-line"}

@@ -23,15 +23,18 @@ import (
 // e2eeClient is what the adapter uses of the whatsmeow client: its events,
 // and the socket. waClient wraps *whatsmeow.Client; tests use a fake.
 type e2eeClient interface {
-	AddEventHandler(h func(evt any))
+	AddEventHandlerWithSuccessStatus(h func(evt any) bool)
 	Connect() error
 	Disconnect()
 }
 
-// waClient is whatsmeow's client, its event handler taking a plain func.
+// waClient is whatsmeow's client, its event handler taking a plain func
+// that reports whether the event was kept.
 type waClient struct{ *whatsmeow.Client }
 
-func (c waClient) AddEventHandler(h func(evt any)) { c.Client.AddEventHandler(h) }
+func (c waClient) AddEventHandlerWithSuccessStatus(h func(evt any) bool) {
+	c.Client.AddEventHandlerWithSuccessStatus(h)
+}
 
 // PrepareE2EE is messagix's whatsmeow client for the device SetDevice gave
 // it, made silent (waLog.Noop; its receive and send loggers are made from
@@ -134,7 +137,7 @@ func (m *Messenger) connectE2EE(ctx context.Context, gen int, cli msgrClient, fb
 	if err != nil {
 		return errInternal
 	}
-	e.AddEventHandler(m.e2eeHandler(gen))
+	e.AddEventHandlerWithSuccessStatus(m.e2eeHandler(gen))
 	m.mu.Lock()
 	if gen != m.gen || m.stopped {
 		m.mu.Unlock()
@@ -146,33 +149,100 @@ func (m *Messenger) connectE2EE(ctx context.Context, gen int, cli msgrClient, fb
 }
 
 // e2eeHandler is the encrypted socket's event handler for run gen: the
-// connection's state, and the gate's live counts. It reads no message.
-func (m *Messenger) e2eeHandler(gen int) func(evt any) {
-	return func(evt any) {
-		defer func() { _ = recover() }()
+// connection's state, and the encrypted chats' lines, receipts and
+// undecryptable messages, each written to the store before it returns.
+// whatsmeow (with SynchronousAck) acks a message only when every handler
+// reports true, so one not kept (a store error, a panic, or an event for a
+// run that has ended) is sent again.
+func (m *Messenger) e2eeHandler(gen int) func(evt any) bool {
+	return func(evt any) (ok bool) {
+		defer func() {
+			if recover() != nil {
+				ok = false
+			}
+		}()
 		if !m.current(gen) {
-			return
+			switch evt.(type) {
+			case *events.FBMessage, *events.Receipt, *events.UndecryptableMessage:
+				return false
+			}
+			return true
 		}
-		switch evt.(type) {
+		switch e := evt.(type) {
 		case *events.Connected:
 			m.e2eeUp(gen, true)
 		case *events.Disconnected:
 			m.e2eeUp(gen, false)
 		case *events.FBMessage:
 			m.liveEncryptedReceived.Add(1)
+			return m.kept(m.onFBMessage(e))
+		case *events.Receipt:
+			return m.kept(m.onEncReceipt(e))
 		case *events.UndecryptableMessage:
 			m.liveUndecryptable.Add(1)
+			return m.kept(m.onUndecryptable(e))
 		case events.PermanentDisconnect:
 			// Meta ended the encrypted session (logged out, an unknown
 			// device, a token it would not refresh). Nothing re-registers or
-			// reconnects on its own: the gate records it.
-			m.cmu.Lock()
-			m.counts.E2EEFailed = true
-			m.cmu.Unlock()
-			m.e2eeUp(gen, false)
+			// reconnects on its own.
+			m.e2eeEnded(gen)
 		}
+		return true
 	}
 }
+
+// kept is a handler's answer for a write: true when it was kept, telling
+// Pllum there is something to re-read when it wrote anything.
+func (m *Messenger) kept(wrote bool, err error) bool {
+	if err != nil {
+		return false
+	}
+	if wrote {
+		m.changed()
+	}
+	return true
+}
+
+// e2eeEnded records that Meta ended run gen's encrypted session: failed,
+// until a new sign-in.
+func (m *Messenger) e2eeEnded(gen int) {
+	m.cmu.Lock()
+	m.counts.E2EEFailed = true
+	m.cmu.Unlock()
+	m.mu.Lock()
+	if gen == m.gen && !m.stopped {
+		m.e2eeFailed = true
+	}
+	m.mu.Unlock()
+	m.e2eeUp(gen, false)
+}
+
+// encryptedState is `status`'s encrypted: failed once Meta ended the
+// encrypted session or its registration failed, live while its socket is
+// up, connecting while a sign-in is in force, else notRegistered (no
+// encrypted session in force). m.mu is held.
+func (m *Messenger) encryptedState() string {
+	m.cmu.Lock()
+	up := m.counts.E2EEConnected
+	m.cmu.Unlock()
+	switch {
+	case m.e2eeFailed:
+		return encFailed
+	case up:
+		return encLive
+	case m.cli != nil:
+		return encConnecting
+	}
+	return encNotRegistered
+}
+
+// The words of `status`'s encrypted.
+const (
+	encNotRegistered = "notRegistered"
+	encConnecting    = "connecting"
+	encLive          = "live"
+	encFailed        = "failed"
+)
 
 // e2eeUp records the encrypted socket going up or down for run gen.
 func (m *Messenger) e2eeUp(gen int, up bool) { m.socketUp(gen, true, up) }

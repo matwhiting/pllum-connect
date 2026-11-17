@@ -50,6 +50,10 @@ const (
 type Status struct {
 	State      State
 	SelfChatID string
+	// Encrypted is how a network's end-to-end encrypted connection is
+	// ("notRegistered", "connecting", "live", "failed"); empty for a
+	// network that has none, and then left out.
+	Encrypted string
 }
 
 // LoginParams are `login`'s params besides `network`.

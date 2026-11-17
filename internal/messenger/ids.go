@@ -32,7 +32,11 @@ import (
 // encrypted side, "cursor.<chat>" → where its older history goes on
 // ("<ms>\n<message ID>"), "olderDone.<chat>" when an encrypted chat's
 // older thread has no more, "backfilled" once the first sign-in's
-// backfill has run, and "block" and "rate" (messenger.go).
+// backfill has run, and "block" and "rate" (messenger.go). His restored
+// backup's (history.go): "ecursor.<chat>" → where a chat's backup goes on
+// (ms), "encDone.<chat>" when it has no more, "estalled.<chat>" while it is
+// held, "ebf.<chat>" and "ebfPages" (the first restore's pages, a chat's
+// and in all) and "ebackfilled" once that has run.
 
 // Server suffixes of the encrypted chats.
 const (
