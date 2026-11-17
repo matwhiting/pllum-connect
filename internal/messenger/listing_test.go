@@ -100,10 +100,26 @@ func TestEveryFolderIsListed(t *testing.T) {
 		}
 	}
 	h.f.mu.Unlock()
-	for _, f := range []folderKey{inboxOne, inbox95, {1, marketplace}, {95, marketplace}, {1, community}, {95, community}} {
+	for _, f := range []folderKey{inboxOne, inbox95, {1, marketplace}, {95, marketplace}, {1, community}} {
 		if !asked[f] {
 			t.Errorf("folder (group %d, parent %d) was never listed", f.group, f.parent)
 		}
+	}
+	// Sync group 95 only under the parents the messages page names, as the
+	// library's own first fetch: never under a folder thread.
+	if asked[folderKey{95, community}] {
+		t.Errorf("sync group 95 was listed under a folder thread")
+	}
+	h.f.mu.Lock()
+	history, posted := len(h.f.messageTasks), h.f.posted
+	h.f.mu.Unlock()
+	// The gate only counts: no history is fetched for it (review I4).
+	if history != 0 {
+		t.Errorf("the gate fetched %d pages of history", history)
+	}
+	// Each page's answer goes back to the library for its sync cursors.
+	if posted == 0 {
+		t.Errorf("no thread page was handed back to the library")
 	}
 
 	c := h.m.GateCounts().(GateCounts)

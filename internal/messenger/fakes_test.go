@@ -3,6 +3,7 @@ package messenger
 import (
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -181,6 +182,7 @@ type fakeMeta struct {
 	olderFn    func(key int64) *table.LSTable // when set, every thread's next page
 	inResponse bool
 	silent     bool
+	posted     int // thread pages handed back for the library's sync cursors
 	// taskErr fails the reads it returns an error for.
 	taskErr func(task socket.Task) error
 
@@ -306,6 +308,14 @@ func (c *fakeClient) dispatch(evt any) {
 	}
 }
 
+// PostHandlePublishResponse is where the real client takes the sync
+// cursors a page's answer carries; the fake counts the calls.
+func (c *fakeClient) PostHandlePublishResponse(tbl *table.LSTable) {
+	c.f.mu.Lock()
+	c.f.posted++
+	c.f.mu.Unlock()
+}
+
 func (c *fakeClient) GetCursor(db int64) string {
 	return "cursor-invented-" + strconv.FormatInt(db, 10)
 }
@@ -343,7 +353,11 @@ func (c *fakeClient) ExecuteTasks(ctx context.Context, tasks ...socket.Task) (*t
 		if c.f.endless {
 			k := int64(7000000000000000 + c.f.fetches)
 			at := c.f.clock.Now().Add(-time.Duration(c.f.fetches) * time.Minute)
-			return threadsPage(key, true, thread(k, table.GROUP_THREAD, at, "inbox")), nil
+			page := threadsPage(key, true, thread(k, table.GROUP_THREAD, at, "inbox"))
+			// A listed thread comes with its newest line, as Meta's pages do.
+			h := history(k, true, line(fmt.Sprintf("mid.$invented-e%d", c.f.fetches), aliceFBID, at, "x"))
+			page.LSUpsertMessage, page.LSInsertNewMessageRange = h.LSUpsertMessage, h.LSInsertNewMessageRange
+			return page, nil
 		}
 		pages := c.f.folders[key]
 		if len(pages) == 0 {

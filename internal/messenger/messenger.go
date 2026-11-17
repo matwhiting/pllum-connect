@@ -88,6 +88,7 @@ type msgrClient interface {
 	Disconnect()
 	ExecuteTasks(ctx context.Context, tasks ...socket.Task) (*table.LSTable, error)
 	GetCursor(db int64) string
+	PostHandlePublishResponse(tbl *table.LSTable)
 	GetCookies() *cookies.Cookies
 	SetDevice(dev *wastore.Device)
 	RegisterE2EE(ctx context.Context, fbid int64) error
@@ -554,9 +555,10 @@ func (m *Messenger) mainHandler(gen int, cli msgrClient, fbid int64) messagix.Ev
 }
 
 // beginE2EE sets up the encrypted side for run gen, once: the device and
-// the encrypted socket, then the history check, then (at the first sign-in,
-// or every one with --gate) the listing of every folder, then the first
-// sign-in's history. All of it through the pace, in one goroutine.
+// the encrypted socket, then the history check, then (until the first
+// sign-in's listing has ended, or every sign-in with --gate) the listing of
+// every folder, then (not with --gate) the first sign-in's history. All of
+// it through the pace, in one goroutine.
 func (m *Messenger) beginE2EE(gen int, cli msgrClient, fbid int64) {
 	m.mu.Lock()
 	ctx := m.runCtx
@@ -569,17 +571,23 @@ func (m *Messenger) beginE2EE(gen int, cli msgrClient, fbid int64) {
 	m.mu.Unlock()
 	go func() {
 		defer m.work.Done()
+		// A panic in a page's ingest must not end the helper or reach
+		// standard error, as in the main handler.
+		defer func() { _ = recover() }()
 		if err := m.connectE2EE(ctx, gen, cli, fbid); err != nil {
 			m.failed(gen, wire.KindOf(err))
 			return
 		}
 		m.checkHistory(ctx, gen, cli, fbid)
-		if m.gate || m.value("backfilled") == "" {
+		if m.gate || m.value("listed") == "" {
 			if !m.listThreads(ctx, gen, cli) {
 				return
 			}
 		}
-		m.backfill(ctx, gen, cli)
+		if !m.gate {
+			// The gate only counts: it fetches no history (review I4).
+			m.backfill(ctx, gen, cli)
+		}
 	}()
 }
 
@@ -608,10 +616,6 @@ func (m *Messenger) socketUp(gen int, encrypted, up bool) {
 	}
 }
 
-// pageThreads fetches the older pages of his inbox through the pace, as the
-// connector's thread backfill does, until the listing ends (no page, no more
-// before, or the oldest thread key stops moving) or maxThreadPages, and adds
-// each to the gate's counts.
 // failed ends run gen after a failure that is not Meta stopping the session
 // (pushedBack has set those): he is left not connected, with the kind, until
 // a new login.

@@ -68,6 +68,27 @@ func (s *Store) LineTime(network, chatID, msgID string) (ms int64, ok bool) {
 	return ms, true
 }
 
+// OldestLine is the time and ID of the oldest line a chat (or the chat an
+// alias names) holds whose ID starts with idPrefix (a network's own lines,
+// not another's in the same chat); ok is false when it holds none.
+func (s *Store) OldestLine(network, chatID, idPrefix string) (ms int64, id string, ok bool) {
+	if s.ready() != nil || chatID == "" {
+		return 0, "", false
+	}
+	chat, err := resolve(s.db, network, chatID)
+	if err != nil {
+		return 0, "", false
+	}
+	err = s.db.QueryRow(`SELECT ts_ms, msg_id FROM messages
+			WHERE network = ? AND chat_id = ? AND early = 0 AND ts_ms > 0 AND substr(msg_id, 1, ?) = ?
+			ORDER BY ts_ms, rid LIMIT 1`,
+		network, chat, len(idPrefix), idPrefix).Scan(&ms, &id)
+	if err != nil {
+		return 0, "", false
+	}
+	return ms, id, true
+}
+
 // Raw is what the network kept with a line to fetch its media later. A line
 // the chat does not hold is notFound; one held with nothing kept is empty.
 func (s *Store) Raw(network, chatID, msgID string) ([]byte, error) {

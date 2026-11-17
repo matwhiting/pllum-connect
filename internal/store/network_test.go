@@ -122,3 +122,33 @@ func TestChatOrderIsTheOrderChatsWereMade(t *testing.T) {
 		t.Fatalf("ChatOrder found a chat nothing holds")
 	}
 }
+
+func TestOldestLineIsTheNetworksOwnOldest(t *testing.T) {
+	s := openTest(t)
+	put(t, s, text(phoneChat, "mid.$invented-2", base+2000, ""))
+	put(t, s, text(phoneChat, "other-invented-0", base+500, ""))
+	put(t, s, text(phoneChat, "mid.$invented-1", base+1000, ""))
+	if err := s.Alias(net, lidChat, phoneChat); err != nil {
+		t.Fatal(err)
+	}
+	if ms, id, ok := s.OldestLine(net, lidChat, "mid."); !ok || id != "mid.$invented-1" || ms != base+1000 {
+		t.Fatalf("OldestLine = %d, %q, %v", ms, id, ok)
+	}
+	if _, _, ok := s.OldestLine(net, otherChat, "mid."); ok {
+		t.Fatalf("OldestLine found a line in a chat that holds none")
+	}
+}
+
+func TestAliasTargetIsOnlyAnAliasesChat(t *testing.T) {
+	s := openTest(t)
+	put(t, s, text(phoneChat, "3EB0A0001", base+1000, ""))
+	if err := s.Alias(net, lidChat, phoneChat); err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := s.AliasTarget(net, lidChat); !ok || got != phoneChat {
+		t.Fatalf("AliasTarget = %q, %v", got, ok)
+	}
+	if _, ok := s.AliasTarget(net, phoneChat); ok {
+		t.Fatalf("a chat of its own reads as an alias")
+	}
+}

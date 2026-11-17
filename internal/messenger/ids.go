@@ -130,15 +130,33 @@ func (m *Messenger) keep(name, v string) error {
 }
 
 // alias makes the unencrypted thread key an alias of chat, and keeps the
-// key as the thread whose history FetchOlder pages for it.
-func (m *Messenger) alias(key, chat string) {
+// key as the thread whose history FetchOlder pages for it; it reports
+// whether it made a new alias. A key that already leads to an encrypted
+// chat is never re-pointed by a row's own placement, only by a pointer
+// (fromPointer): an older one-to-one listed again without its pointer stays
+// where the pointer put it (Review Focus 4).
+func (m *Messenger) alias(key, chat string, fromPointer bool) bool {
 	if key == "" || chat == "" || key == chat {
-		return
+		return false
 	}
-	if got, ok := m.st.ChatFor(Name, key); !ok || got != chat {
-		_ = m.st.Alias(Name, key, chat)
+	if got, ok := m.st.AliasTarget(Name, key); ok {
+		if got == chat || !fromPointer && isEncryptedChat(got) {
+			_ = m.keep("thread."+got, key)
+			return false
+		}
+	}
+	if m.st.Alias(Name, key, chat) != nil {
+		return false
 	}
 	_ = m.keep("thread."+chat, key)
+	return true
+}
+
+// encryptedAlias is the encrypted chat an unencrypted thread key already
+// leads to, if any.
+func (m *Messenger) encryptedAlias(key int64) (string, bool) {
+	got, ok := m.st.AliasTarget(Name, keyID(key))
+	return got, ok && isEncryptedChat(got)
 }
 
 // chatOfKey is the chat an unencrypted thread key's lines belong to, from

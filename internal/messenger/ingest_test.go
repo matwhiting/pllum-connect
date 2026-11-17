@@ -261,6 +261,11 @@ func TestAnOldOneToOneIsAnAliasOfItsEncryptedChat(t *testing.T) {
 	if !slices.Equal(ids, want) {
 		t.Errorf("chats %v, want %v", ids, want)
 	}
+	// The gate counts chats after aliasing (review I3): Alice, Bob, Carol
+	// and Dave; two groups and the encrypted group.
+	if c := h.m.GateCounts().(GateCounts); c.OneToOneChats != 4 || c.GroupChats != 3 {
+		t.Errorf("one-to-one chats %d, group chats %d; want 4 and 3", c.OneToOneChats, c.GroupChats)
+	}
 }
 
 func TestLoadErrorsBecomeKinds(t *testing.T) {
@@ -524,6 +529,8 @@ func TestOlderPagesFetchesTheOlderThread(t *testing.T) {
 		thread(aliceFBID, table.ONE_TO_ONE, at, "e2ee_cutover"),
 		thread(encGroup, table.ENCRYPTED_OVER_WA_GROUP, at, "inbox"),
 	}
+	// A line of Alice's older thread, from the socket (no range).
+	tbl.LSInsertMessage = []*table.LSInsertMessage{{ThreadKey: aliceFBID, MessageId: "mid.$invented-a0", SenderId: aliceFBID, TimestampMs: at.Add(-time.Hour).UnixMilli(), Text: "x"}}
 	h.f.table = tbl
 	h.f.older[groupOne] = []*table.LSTable{history(groupOne, true, line("mid.$invented-o1", selfFBID, at.Add(-48*time.Hour), "older"))}
 	// The first sign-in's backfill is done (an earlier run's), so only
@@ -579,5 +586,13 @@ func TestOlderPagesFetchesTheOlderThread(t *testing.T) {
 	alice := fmt.Sprint(aliceFBID) + "@msgr"
 	if _, err := h.m.FetchOlder(context.Background(), alice); kindErr(err) != wire.Timeout {
 		t.Errorf("an unanswered page = %v, want timeout", err)
+	}
+	// With no range held, the page was anchored on the oldest line held, as
+	// the library's connector does (review I1).
+	h.f.mu.Lock()
+	last = h.f.messageTasks[len(h.f.messageTasks)-1]
+	h.f.mu.Unlock()
+	if last.ReferenceMessageId != "mid.$invented-a0" {
+		t.Errorf("the page was asked from %q, want the oldest line held", last.ReferenceMessageId)
 	}
 }

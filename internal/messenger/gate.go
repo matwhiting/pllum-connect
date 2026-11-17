@@ -74,6 +74,14 @@ type GateCounts struct {
 	OtherParents        int            `json:"otherParents"`
 	InOtherParents      int            `json:"inOtherParents"`
 	NoActivity          int            `json:"noActivity"`
+
+	// OneToOneChats and GroupChats are the distinct chats the threads listed
+	// make, after aliasing (review I3): one-to-ones (<FBID>@msgr, encrypted
+	// or not) and groups (unencrypted and <id>@g.us). These, not the
+	// encrypted one-to-ones alone, compare with Beeper's one-to-ones and
+	// groups. Spam, folders and Marketplace or page threads are in neither.
+	OneToOneChats int `json:"oneToOneChats"`
+	GroupChats    int `json:"groupChats"`
 }
 
 // GateCounts is the gate's counts now.
@@ -107,7 +115,36 @@ func (m *Messenger) GateCounts() any {
 			c.OtherParents++
 		}
 	}
+	type placed struct {
+		key    int64
+		tt     table.ThreadType
+		folder string
+	}
+	threads := make([]placed, 0, len(m.listing.threads))
+	for t, s := range m.listing.threads {
+		threads = append(threads, placed{t.key, s.tt, s.folder})
+	}
 	m.cmu.Unlock()
+	ones, groups := map[string]bool{}, map[string]bool{}
+	for _, t := range threads {
+		p, ok := placeThread(t.key, t.tt)
+		if !ok || t.folder == folderSpam {
+			continue
+		}
+		chat := p.chat
+		if !p.enc {
+			if got, ok := m.st.AliasTarget(Name, keyID(t.key)); ok {
+				chat = got
+			}
+		}
+		switch {
+		case strings.HasSuffix(chat, oneToOneSuffix):
+			ones[chat] = true
+		case strings.HasSuffix(chat, groupSuffix) || p.kind == "group":
+			groups[chat] = true
+		}
+	}
+	c.OneToOneChats, c.GroupChats = len(ones), len(groups)
 	c.LiveEncryptedReceived = m.liveEncryptedReceived.Load()
 	c.LiveUndecryptable = m.liveUndecryptable.Load()
 	return c
@@ -180,6 +217,10 @@ type listing struct {
 	pointers map[int64]bool
 	parents  map[int64]bool
 	ranges   map[folderKey]folderRange
+	// configParents are the parents the messages page names
+	// (LSThreadsRangesQuery): the only ones the library lists sync group 95
+	// under.
+	configParents map[int64]bool
 }
 
 type listedThread struct {
@@ -208,6 +249,7 @@ func (m *Messenger) addTable(tbl *table.LSTable) {
 	if l.threads == nil {
 		l.threads, l.pointers = map[listedThread]*seenThread{}, map[int64]bool{}
 		l.parents, l.ranges = map[int64]bool{}, map[folderKey]folderRange{}
+		l.configParents = map[int64]bool{}
 	}
 	c := &m.counts
 	add := func(key int64, tt table.ThreadType, folder string, group, parent, lastMs int64) {
@@ -270,6 +312,7 @@ func (m *Messenger) addTable(tbl *table.LSTable) {
 	for _, q := range tbl.LSThreadsRangesQuery {
 		if q.ParentThreadKey != 0 {
 			l.parents[q.ParentThreadKey] = true
+			l.configParents[q.ParentThreadKey] = true
 		}
 	}
 	for _, f := range tbl.LSUpsertFolder {

@@ -446,6 +446,18 @@ func (s *Store) ChatFor(network, jid string) (chatID string, ok bool) {
 	return chat, true
 }
 
+// AliasTarget is the chat an alias leads to; ok is false when jid is no
+// alias (a chat of its own, or unknown).
+func (s *Store) AliasTarget(network, jid string) (chatID string, ok bool) {
+	if s.ready() != nil || jid == "" {
+		return "", false
+	}
+	if err := s.db.QueryRow(`SELECT chat_id FROM aliases WHERE network = ? AND alias_jid = ?`, network, jid).Scan(&chatID); err != nil {
+		return "", false
+	}
+	return chatID, true
+}
+
 // Alias makes alias another name for chatID (itself resolved through its own
 // alias), so lines for either land in the one chat. A chat's ID never changes.
 func (s *Store) Alias(network, alias, chatID string) error {

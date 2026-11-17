@@ -189,14 +189,18 @@ type tableCtx struct {
 }
 
 // placeKey is the chat a thread key's lines and changes belong to: the
-// encrypted chat a pointer names, the chat its row in this table places it
-// in, or the chat the store already holds for it. ok is false for a thread
+// encrypted chat a pointer names (in this table, or kept from an earlier
+// one), the chat its row in this table places it in, or the chat the store
+// already holds for it. ok is false for a thread
 // that is no chat (spam, a folder) or was never placed.
 func (m *Messenger) placeKey(tc *tableCtx, key int64) (string, bool) {
 	if key == 0 {
 		return "", false
 	}
 	if c, ok := tc.hybrid[key]; ok {
+		return c, true
+	}
+	if c, ok := m.encryptedAlias(key); ok {
 		return c, true
 	}
 	if rows := tc.rows[key]; len(rows) > 0 {
@@ -274,8 +278,9 @@ func (m *Messenger) ingest(tbl *table.LSTable, source string) {
 	}
 	for key, chat := range tc.hybrid {
 		_ = m.keep("encrypted."+chat, "1")
-		m.alias(keyID(key), chat)
-		changed = true
+		if m.alias(keyID(key), chat, true) {
+			changed = true
+		}
 	}
 
 	for _, rows := range tc.rows {
@@ -314,7 +319,9 @@ func (m *Messenger) ingest(tbl *table.LSTable, source string) {
 			continue
 		}
 		added[w.ThreadKey] += n
-		changed = true
+		if n > 0 {
+			changed = true // a line held already, sent again, changes nothing
+		}
 	}
 	for _, d := range tbl.LSDeleteMessage {
 		if chat, ok := m.placeKey(tc, d.ThreadKey); ok && d.MessageId != "" {
@@ -393,7 +400,7 @@ func (m *Messenger) ingest(tbl *table.LSTable, source string) {
 		m.answer(r.ThreadKey, rangeNote{lines: got[r.ThreadKey], added: added[r.ThreadKey], minMs: r.MinTimestampMs, minID: r.MinMessageId, more: r.HasMoreBefore})
 	}
 	for _, r := range tbl.LSUpdateExistingMessageRange {
-		m.answer(r.ThreadKey, rangeNote{lines: got[r.ThreadKey], added: added[r.ThreadKey], existing: true, b2: r.UnknownBool2, b3: r.UnknownBool3})
+		m.answer(r.ThreadKey, rangeNote{lines: got[r.ThreadKey], added: added[r.ThreadKey], existing: true, ts: r.TimestampMS, b2: r.UnknownBool2, b3: r.UnknownBool3})
 	}
 	if changed {
 		m.changed()
@@ -456,7 +463,13 @@ func (m *Messenger) writeThread(tc *tableCtx, r threadRow) bool {
 		return false
 	}
 	person := r.key // a one-to-one's thread key is the other person's FBID
-	if c, mapped := tc.hybrid[r.key]; mapped && !p.enc {
+	c, mapped := tc.hybrid[r.key]
+	if !mapped {
+		// A pointer from an earlier table: the row stays with it.
+		c, mapped = m.encryptedAlias(r.key)
+		mapped = mapped && c != p.chat
+	}
+	if mapped && !p.enc {
 		p.chat, p.alias = c, keyID(r.key)
 		p.kind = "single"
 		if strings.HasSuffix(c, groupSuffix) {
@@ -466,13 +479,14 @@ func (m *Messenger) writeThread(tc *tableCtx, r threadRow) bool {
 		// chat's.
 		person, _ = strconv.ParseInt(strings.TrimSuffix(c, oneToOneSuffix), 10, 64)
 	}
+	cutover := strings.HasPrefix(r.folder, cutoverFolder)
 	if p.alias != "" {
-		m.alias(p.alias, p.chat)
+		m.alias(p.alias, p.chat, false)
 	}
-	if p.enc {
+	if p.enc || cutover {
+		// An older thread moved aside: its chat has an encrypted side.
 		_ = m.keep("encrypted."+p.chat, "1")
 	}
-	cutover := strings.HasPrefix(r.folder, cutoverFolder)
 	info := store.ChatInfo{ID: p.chat, Kind: p.kind, LastActivityMs: r.lastMs}
 	title := r.name
 	if p.kind == "single" {
@@ -685,6 +699,7 @@ func (m *Messenger) reached(chat string, minMs int64, minID string, more bool) {
 	held, _, ok := m.cursorOf(chat)
 	if !ok || minMs < held {
 		_ = m.keep("cursor."+chat, strconv.FormatInt(minMs, 10)+"\n"+minID)
+		_ = m.keep("stalled."+chat, "") // it moved: no longer held
 	}
 	if !more && (!ok || minMs <= held) {
 		m.olderDone(chat)
