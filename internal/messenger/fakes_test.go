@@ -517,6 +517,12 @@ type fakeHistory struct {
 	asks  map[string][]int64
 	given map[*securehistory.MessageRange][]*securehistory.DecryptedMessage
 	rec   func(name string)
+	// failWith fails every page of the backup with Meta's answer; fail
+	// fails one thread's. endless gives every thread a new page, reaching
+	// back an hour, every time.
+	failWith error
+	fail     map[string]error
+	endless  bool
 }
 
 // fakePage is one page of an invented backup: its lines, and its range.
@@ -603,6 +609,18 @@ func (h *fakeHistory) FetchMessages(ctx context.Context, device *securehistory.D
 		h.given = map[*securehistory.MessageRange][]*securehistory.DecryptedMessage{}
 	}
 	h.asks[threadID] = append(h.asks[threadID], ts)
+	if h.failWith != nil {
+		return nil, h.failWith
+	}
+	if err := h.fail[threadID]; err != nil {
+		return nil, err
+	}
+	if h.endless {
+		yes := true
+		r := &securehistory.MessageRange{BackupID: device.BackupID, Range: &securehistory.MessageRangeInfo{HasMoreBefore: &yes, HasMoreAfter: &no, Before: ts - time.Hour.Milliseconds()}}
+		h.given[r] = nil
+		return r, nil
+	}
 	p := fakePage{}
 	if pages := h.pages[threadID]; len(pages) > 0 {
 		p, h.pages[threadID] = pages[0], pages[1:]

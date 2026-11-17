@@ -873,12 +873,34 @@ func (m *Messenger) onFBMessage(evt *events.FBMessage) (bool, error) {
 	if evt == nil || evt.Info.ID == "" {
 		return false, nil
 	}
+	if m.testPrep != nil {
+		m.testPrep(evt)
+	}
 	chat, ok, err := m.encryptedChatFor(evt.Info.Chat)
 	if err != nil || !ok {
 		return false, err
 	}
-	_, err = m.applyEnc(chat, m.encPrep(chat, evt, store.SourceLive, nil))
-	return err == nil, err
+	w := m.encPrep(chat, evt, store.SourceLive, nil)
+	added, err := m.applyEnc(chat, w)
+	if err != nil {
+		return false, err
+	}
+	return added > 0 || w.news(), nil
+}
+
+// news reports whether w changes something already there: an edit, a
+// revoke or a reaction. A whole line changes something only when it is
+// new (review M1).
+func (w encWrites) news() bool {
+	if len(w.reactions) > 0 {
+		return true
+	}
+	for _, l := range w.puts {
+		if l.Edited || l.Deleted {
+			return true
+		}
+	}
+	return false
 }
 
 // applyEnc writes what encPrep worked out, and counts the new lines.

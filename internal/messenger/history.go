@@ -404,17 +404,52 @@ func (m *Messenger) sample(ctx context.Context, gen int, cli msgrClient, fbid in
 //
 // The first page is asked from a minute from now, as the library's
 // connector does; each next one from where the last ended
-// ("ecursor.<chat>"). A page that does not reach back past where it was
-// asked from, that fails to parse, or that cannot be decrypted, holds the
-// chat for stallHold ("estalled.<chat>", kept across restarts), during
-// which nothing of its backup is asked. A page that moves Meta's backup on
-// to newer keys has them kept, as the connector does.
+// ("ecursor.<chat>").
+//
+// Nothing of the backup is asked twice the same way (review I2):
+//
+//   - a page that does not reach back past where it was asked from, cannot
+//     be read or cannot be decrypted, or a request Meta fails, holds the
+//     chat ("estalled.<chat>", kept across restarts), for 6 h the first
+//     time, 24 h the second and 7 days after that ("estallN.<chat>");
+//   - two failed requests in a row, across any chats, pause the whole
+//     backup the same way ("epause", "epauseN"; "efails" counts them), and
+//     end the first restore's read: a failure of the whole backup is asked
+//     at most twice, not once per chat. Any answer Meta gives ends the run
+//     of failures and starts the pause's growth over; a page that reaches
+//     back starts its chat's holds over;
+//   - "thread not found" means that chat has no backup: it is done;
+//   - "no longer available", "a different backup" or a device Meta no
+//     longer knows means the backup his PIN opened is gone: the history
+//     device is dropped and the history state is needsPIN again, so
+//     nothing of it is asked until he restores it again;
+//   - every request that reached Meta counts towards the first restore's
+//     cap, failures included; reading to the oldest line (FetchOlder) asks
+//     at most onDemandPages pages in a day, across every chat ("eod");
+//   - nothing is asked while Meta has ended the encrypted session.
+//
+// A page that moves Meta's backup on to newer keys has them kept, as the
+// connector does.
 
 const (
 	encPageSize      = 50  // lines one page of the backup asks for
 	encHistoryPages  = 2   // pages of one chat's backup at the first restore
 	encBackfillPages = 100 // pages of the whole backup at the first restore
+	onDemandPages    = 100 // pages of the backup FetchOlder may ask in a day
+	encFailsInARow   = 2   // failed requests in a row that pause the whole backup
 )
+
+// holdLadder is how long the nth hold in a row lasts: 6 h, 24 h, then 7
+// days.
+func holdLadder(n int) time.Duration {
+	switch {
+	case n <= 1:
+		return stallHold
+	case n == 2:
+		return 24 * time.Hour
+	}
+	return 7 * 24 * time.Hour
+}
 
 // encPaging reports whether reading to the oldest line of chat asks for its
 // backup: his history is restored, the chat has an encrypted side, and its
@@ -432,10 +467,13 @@ func encThread(chat string) (thread string, group bool) {
 	return strings.TrimSuffix(chat, oneToOneSuffix), false
 }
 
-// encStall holds a chat whose backup page did not move: nothing of its
-// backup is asked for stallHold, across restarts.
+// encStall holds a chat's backup, longer each time in a row: nothing of it
+// is asked until the hold ends, across restarts.
 func (m *Messenger) encStall(chat string) {
-	_ = m.keep("estalled."+chat, strconv.FormatInt(m.now().Add(stallHold).UnixMilli(), 10))
+	n, _ := strconv.Atoi(m.value("estallN." + chat))
+	n++
+	_ = m.keep("estallN."+chat, strconv.Itoa(n))
+	_ = m.keep("estalled."+chat, strconv.FormatInt(m.now().Add(holdLadder(n)).UnixMilli(), 10))
 }
 
 // encHeld reports whether a chat's backup is held.
@@ -444,25 +482,137 @@ func (m *Messenger) encHeld(chat string) bool {
 	return err == nil && m.now().UnixMilli() < until
 }
 
+// encMoved records a page of a chat's backup that reached back: its holds
+// start over.
+func (m *Messenger) encMoved(chat string) {
+	_ = m.keep("estalled."+chat, "")
+	_ = m.keep("estallN."+chat, "")
+}
+
 // encDone records that a chat's backup has nothing older.
 func (m *Messenger) encDone(chat string) {
 	_ = m.keep("encDone."+chat, "1")
-	_ = m.keep("estalled."+chat, "")
+	m.encMoved(chat)
 	m.maybeComplete(chat)
 }
 
+// encFailed records a request of the backup that Meta failed; two in a row
+// pause the whole backup, longer each time.
+func (m *Messenger) encFailed() {
+	m.efmu.Lock()
+	defer m.efmu.Unlock()
+	f, _ := strconv.Atoi(m.value("efails"))
+	f++
+	_ = m.keep("efails", strconv.Itoa(f))
+	if f < encFailsInARow {
+		return
+	}
+	n, _ := strconv.Atoi(m.value("epauseN"))
+	n++
+	_ = m.keep("epauseN", strconv.Itoa(n))
+	_ = m.keep("epause", strconv.FormatInt(m.now().Add(holdLadder(n)).UnixMilli(), 10))
+}
+
+// encAnswered records a request of the backup that Meta answered: the run
+// of failures, and the growing pause, start over.
+func (m *Messenger) encAnswered() {
+	m.efmu.Lock()
+	defer m.efmu.Unlock()
+	_ = m.keep("efails", "")
+	_ = m.keep("epauseN", "")
+}
+
+// encPaused reports whether the whole backup is paused after failures.
+func (m *Messenger) encPaused() bool {
+	until, err := strconv.ParseInt(m.value("epause"), 10, 64)
+	return err == nil && m.now().UnixMilli() < until
+}
+
+// The answers of the library's FetchMessages that say something lasting,
+// by their text (the library gives them as plain errors).
+const (
+	answerNone = iota
+	answerNoThread
+	answerGone
+)
+
+func backupAnswer(err error) int {
+	if err == nil {
+		return answerNone
+	}
+	e := err.Error()
+	switch {
+	case strings.Contains(e, "archive thread was not found"):
+		return answerNoThread
+	case strings.Contains(e, "archive is no longer available"),
+		strings.Contains(e, "belongs to a different backup"),
+		strings.Contains(e, "archive device is not enrolled"):
+		return answerGone
+	}
+	return answerNone
+}
+
+// dropHistory forgets the history device after Meta said the backup it
+// opened is gone: the history state is needsPIN again, and nothing of the
+// backup is asked until his PIN restores it again.
+func (m *Messenger) dropHistory() {
+	_ = m.keepHistory(nil)
+	m.setHistory(historyNeedsPIN)
+	m.hmu.Lock()
+	m.backup = nil // a restore asks for the backup afresh
+	m.hmu.Unlock()
+}
+
+// onDemand takes one of the day's pages of the backup FetchOlder may ask:
+// false when the day's are spent. give puts back one not asked.
+func (m *Messenger) onDemand() bool {
+	m.odmu.Lock()
+	defer m.odmu.Unlock()
+	start, n := m.onDemandDay()
+	if n >= onDemandPages {
+		return false
+	}
+	_ = m.keep("eod", strconv.FormatInt(start, 10)+"\n"+strconv.Itoa(n+1))
+	return true
+}
+
+func (m *Messenger) giveOnDemand() {
+	m.odmu.Lock()
+	defer m.odmu.Unlock()
+	start, n := m.onDemandDay()
+	if n > 0 {
+		_ = m.keep("eod", strconv.FormatInt(start, 10)+"\n"+strconv.Itoa(n-1))
+	}
+}
+
+// onDemandDay is the day the on-demand pages are counted in (it starts at
+// the first of them) and how many it has had. m.odmu is held.
+func (m *Messenger) onDemandDay() (start int64, n int) {
+	now := m.now().UnixMilli()
+	s, c, ok := strings.Cut(m.value("eod"), "\n")
+	start, err1 := strconv.ParseInt(s, 10, 64)
+	n, err2 := strconv.Atoi(c)
+	if !ok || err1 != nil || err2 != nil || now-start >= (24*time.Hour).Milliseconds() || now < start {
+		return now, 0
+	}
+	return start, n
+}
+
 // fetchEncPage reads one page of a chat's backup, older than the last, and
-// stores its lines.
-func (m *Messenger) fetchEncPage(ctx context.Context, gen int, cli msgrClient, fbid int64, chat string) (added int, out pageOutcome, err error) {
+// stores its lines. asked reports whether the request reached Meta.
+func (m *Messenger) fetchEncPage(ctx context.Context, gen int, cli msgrClient, fbid int64, chat string) (added int, out pageOutcome, asked bool, err error) {
+	if m.encryptedEnded() {
+		return 0, pageHeld, false, errNotConnected
+	}
 	lock := m.chatLock(chat)
 	lock.Lock()
 	defer lock.Unlock()
-	if m.value("encDone."+chat) != "" || m.encHeld(chat) {
-		return 0, pageHeld, nil
+	if m.value("encDone."+chat) != "" || m.encHeld(chat) || m.encPaused() {
+		return 0, pageHeld, false, nil
 	}
 	device := m.historyDevice()
-	if device == nil || device.ID == "" || fbid == 0 {
-		return 0, pageHeld, nil
+	if device == nil || device.ID == "" || fbid == 0 || m.HistoryState() != historyRestored {
+		return 0, pageHeld, false, nil
 	}
 	thread, group := encThread(chat)
 	ref := m.now().Add(time.Minute).UnixMilli()
@@ -471,48 +621,70 @@ func (m *Messenger) fetchEncPage(ctx context.Context, gen int, cli msgrClient, f
 	}
 	h := cli.History()
 	var page *securehistory.MessageRange
+	var answer error
 	err = m.request(ctx, gen, func(ctx context.Context) (err error) {
+		asked = true
 		page, err = h.FetchMessages(ctx, device, thread, true, ref, encPageSize)
+		answer = err
 		return err
 	})
 	if err != nil {
-		// As fetchPage (review N1): a page that fails in the library would
-		// fail the same way at the next read, so it is held; no
-		// connection, a rate limit or Meta pushing back is not.
+		if !asked {
+			return 0, pageHeld, false, err
+		}
+		switch backupAnswer(answer) {
+		case answerNoThread:
+			m.encAnswered()
+			m.encDone(chat)
+			return 0, pageDone, true, nil
+		case answerGone:
+			m.encAnswered()
+			m.dropHistory()
+			return 0, pageHeld, true, errNotFound
+		}
+		// As fetchPage (review N1): a request that fails in the library
+		// would fail the same way at the next read, so it is held, longer
+		// each time; no connection, a rate limit or Meta pushing back is
+		// not, as the pace holds the last two.
 		if k := kindOf(err); ctx.Err() == nil && (k == wire.Internal || k == wire.Timeout) {
 			m.encStall(chat)
+			m.encFailed()
 		}
-		return 0, pageHeld, err
+		return 0, pageHeld, true, err
 	}
 	if page == nil || page.Range == nil || page.Range.HasMoreBefore == nil {
 		m.encStall(chat)
-		return 0, pageStall, errInternal
+		m.encFailed()
+		return 0, pageStall, true, errInternal
 	}
 	device = m.saveEpochs(device, page)
 	msgs, err := h.Decrypt(page, device, thread, fbid, group)
 	if err != nil {
 		m.encStall(chat)
-		return 0, pageStall, errInternal
+		m.encFailed()
+		return 0, pageStall, true, errInternal
 	}
 	added, ok := m.storeArchive(chat, thread, group, fbid, msgs)
 	if !ok {
 		m.encStall(chat)
-		return added, pageStall, errInternal
+		m.encFailed()
+		return added, pageStall, true, errInternal
 	}
+	m.encAnswered()
 	next, more := page.Range.Before, *page.Range.HasMoreBefore
 	switch {
 	case !more:
 		m.encDone(chat)
-		return added, pageDone, nil
+		return added, pageDone, true, nil
 	case next <= 0 || next >= ref:
 		// It did not reach back past where it was asked from: as the
 		// connector's "history cursor did not move backwards".
 		m.encStall(chat)
-		return added, pageStall, nil
+		return added, pageStall, true, nil
 	}
 	_ = m.keep("ecursor."+chat, strconv.FormatInt(next, 10))
-	_ = m.keep("estalled."+chat, "")
-	return added, pageMoved, nil
+	m.encMoved(chat)
+	return added, pageMoved, true, nil
 }
 
 // saveEpochs keeps the newer keys a page of the backup moved on to, as the
@@ -684,8 +856,9 @@ func decodeArchive(msg *waArmadilloBackupMessage.BackupMessage, at int64, chat w
 
 // encryptedBackfill reads, at the first restore, up to encHistoryPages
 // pages of the backup of each encrypted chat active in the last 90 days,
-// newest first, encBackfillPages in all, keeping its progress as it goes.
-// One runs at a time; never with --gate.
+// newest first, encBackfillPages requests in all (failures included),
+// keeping its progress as it goes. Two failures in a row end it: the whole
+// backup is failing. One runs at a time; never with --gate.
 func (m *Messenger) encryptedBackfill(ctx context.Context, gen int, cli msgrClient, fbid int64) {
 	if m.gate || m.HistoryState() != historyRestored || m.value("ebackfilled") != "" {
 		return
@@ -711,10 +884,21 @@ func (m *Messenger) encryptedBackfill(ctx context.Context, gen int, cli msgrClie
 		}
 		n, _ := strconv.Atoi(m.value("ebf." + chat))
 		for n < encHistoryPages && total < encBackfillPages {
-			_, out, err := m.fetchEncPage(ctx, gen, cli, fbid, chat)
-			if out != pageHeld {
+			_, out, asked, err := m.fetchEncPage(ctx, gen, cli, fbid, chat)
+			if asked {
 				total++
 				_ = m.keep("ebfPages", strconv.Itoa(total))
+			}
+			switch {
+			case m.HistoryState() != historyRestored:
+				return // the backup is gone: a restore again starts afresh
+			case m.encPaused():
+				// The whole backup is failing: the first restore's read
+				// ends, and reading to the oldest line asks again once the
+				// pause ends.
+				_ = m.keep("ebf."+chat, strconv.Itoa(n))
+				_ = m.keep("ebackfilled", "1")
+				return
 			}
 			if err != nil {
 				if k := kindOf(err); !m.current(gen) || ctx.Err() != nil || k != wire.Internal && k != wire.Timeout {

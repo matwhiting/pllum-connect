@@ -58,6 +58,7 @@ import (
 	"go.mau.fi/mautrix-meta/pkg/messagix/types"
 	wastore "go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/store/sqlstore"
+	"go.mau.fi/whatsmeow/types/events"
 
 	"github.com/matwhiting/pllum-connect/internal/meta"
 	"github.com/matwhiting/pllum-connect/internal/network"
@@ -169,6 +170,8 @@ type Messenger struct {
 	history  string      // historyState: "", noBackup, needsPIN, restored, skipped
 	epmu     sync.Mutex  // one change to the history device's keys at a time
 	ebActive atomic.Bool // the first read of his backup is running
+	efmu     sync.Mutex  // the run of failed backup requests
+	odmu     sync.Mutex  // the day's pages of the backup asked on demand
 
 	// what the gate counts (gate.go)
 	cmu                   sync.Mutex
@@ -198,6 +201,10 @@ type Messenger struct {
 	chmu      sync.Mutex
 	chPending bool
 	chLast    time.Time
+
+	// testPrep, set only by tests, sees each encrypted message before it is
+	// worked out.
+	testPrep func(evt *events.FBMessage)
 }
 
 var (

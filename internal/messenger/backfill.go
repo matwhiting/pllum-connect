@@ -418,6 +418,11 @@ func (m *Messenger) FetchOlder(ctx context.Context, chatID string) (int, error) 
 	if !ok {
 		return 0, errNotFound
 	}
+	if m.encryptedEnded() {
+		// Meta ended the encrypted session: no history is asked until a
+		// new sign-in (review I1).
+		return 0, errNotConnected
+	}
 	// It ends with the run, or with the caller.
 	ctx2, cancel := context.WithCancel(runCtx)
 	defer cancel()
@@ -426,7 +431,13 @@ func (m *Messenger) FetchOlder(ctx context.Context, chatID string) (int, error) 
 		m.mu.Lock()
 		fbid := m.fbid
 		m.mu.Unlock()
-		added, _, err := m.fetchEncPage(ctx2, gen, cli, fbid, chat)
+		if !m.onDemand() {
+			return 0, nil // the day's pages are spent (review M10)
+		}
+		added, _, asked, err := m.fetchEncPage(ctx2, gen, cli, fbid, chat)
+		if !asked {
+			m.giveOnDemand()
+		}
 		return added, err
 	}
 	key, ok := m.threadOfChat(chat)
@@ -453,6 +464,9 @@ const (
 // fetchPage fetches one page of a thread's history older than the chat's
 // cursor (else its oldest line of the thread held) and stores it.
 func (m *Messenger) fetchPage(ctx context.Context, gen int, cli msgrClient, chat string, key int64) (added int, out pageOutcome, err error) {
+	if m.encryptedEnded() {
+		return 0, pageHeld, errNotConnected
+	}
 	lock := m.chatLock(chat)
 	lock.Lock()
 	defer lock.Unlock()

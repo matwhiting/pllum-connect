@@ -12,7 +12,9 @@ import (
 	"go.mau.fi/whatsmeow/types/events"
 	waLog "go.mau.fi/whatsmeow/util/log"
 
+	"github.com/matwhiting/pllum-connect/internal/meta"
 	"github.com/matwhiting/pllum-connect/internal/store"
+	"github.com/matwhiting/pllum-connect/internal/wire"
 )
 
 // The encrypted side: Messenger's end-to-end encrypted chats run over
@@ -151,14 +153,18 @@ func (m *Messenger) connectE2EE(ctx context.Context, gen int, cli msgrClient, fb
 // e2eeHandler is the encrypted socket's event handler for run gen: the
 // connection's state, and the encrypted chats' lines, receipts and
 // undecryptable messages, each written to the store before it returns.
-// whatsmeow (with SynchronousAck) acks a message only when every handler
-// reports true, so one not kept (a store error, a panic, or an event for a
-// run that has ended) is sent again.
+// whatsmeow (with SynchronousAck) acks a message or receipt only when every
+// handler reports true, so one not kept for a passing reason (a store
+// error, or a run that has ended) comes again at the next connect. One that
+// can never be kept (it panics, or the store refuses it) is acked, kept as
+// a hidden notice where it can be, so it does not come back at every
+// connect for ever (review M2). An undecryptable message is acked by
+// whatsmeow before it is handed over, so it never comes again either way.
 func (m *Messenger) e2eeHandler(gen int) func(evt any) bool {
 	return func(evt any) (ok bool) {
 		defer func() {
 			if recover() != nil {
-				ok = false
+				ok = true // a state event that panicked: nothing to keep
 			}
 		}()
 		if !m.current(gen) {
@@ -175,36 +181,72 @@ func (m *Messenger) e2eeHandler(gen int) func(evt any) bool {
 			m.e2eeUp(gen, false)
 		case *events.FBMessage:
 			m.liveEncryptedReceived.Add(1)
-			return m.kept(m.onFBMessage(e))
+			return m.keptOr(e.Info, func() (bool, error) { return m.onFBMessage(e) })
 		case *events.Receipt:
-			return m.kept(m.onEncReceipt(e))
+			return m.keptOr(watypes.MessageInfo{}, func() (bool, error) { return m.onEncReceipt(e) })
 		case *events.UndecryptableMessage:
 			m.liveUndecryptable.Add(1)
-			return m.kept(m.onUndecryptable(e))
+			return m.keptOr(watypes.MessageInfo{}, func() (bool, error) { return m.onUndecryptable(e) })
+		case *events.TemporaryBan:
+			// Meta suspended the encrypted device: a suspension of
+			// Messenger, as a ban on the main socket is. Nothing is asked
+			// until he signs in again (review I1).
+			m.e2eeEnded(gen)
+			m.pace.Fail(meta.Banned)
+			m.pushedBack(gen, meta.Banned)
+		case *events.LoggedOut:
+			// Meta logged the encrypted device out: the session is over.
+			m.e2eeEnded(gen)
+			m.pace.Fail(meta.ReconnectNeeded)
+			m.pushedBack(gen, meta.ReconnectNeeded)
 		case events.PermanentDisconnect:
-			// Meta ended the encrypted session (logged out, an unknown
-			// device, a token it would not refresh). Nothing re-registers or
-			// reconnects on its own.
+			// Meta ended the encrypted session otherwise (an unknown device,
+			// a token it would not refresh). Nothing re-registers or
+			// reconnects on its own, and no history is asked until a new
+			// sign-in; groups stay up.
 			m.e2eeEnded(gen)
 		}
 		return true
 	}
 }
 
-// kept is a handler's answer for a write: true when it was kept, telling
-// Pllum there is something to re-read when it wrote anything.
-func (m *Messenger) kept(wrote bool, err error) bool {
-	if err != nil {
+// keptOr is a handler's answer for a write: true when it was kept, telling
+// Pllum there is something to re-read when it wrote anything. A write that
+// can never succeed (a panic, or the store refusing it) is acked too, with
+// a hidden notice under the message's ID where info names one; only a
+// passing failure is not.
+func (m *Messenger) keptOr(info watypes.MessageInfo, write func() (bool, error)) bool {
+	wrote, err, panicked := safeWrite(write)
+	if !panicked && err == nil {
+		if wrote {
+			m.changed()
+		}
+		return true
+	}
+	if !panicked && wire.KindOf(err) != wire.BadRequest {
 		return false
 	}
-	if wrote {
-		m.changed()
+	if info.ID != "" {
+		if wrote, _, _ := safeWrite(func() (bool, error) { return m.onUndecryptable(&events.UndecryptableMessage{Info: info}) }); wrote {
+			m.changed()
+		}
 	}
 	return true
 }
 
+// safeWrite runs write, turning a panic into panicked.
+func safeWrite(write func() (bool, error)) (wrote bool, err error, panicked bool) {
+	defer func() {
+		if recover() != nil {
+			wrote, err, panicked = false, nil, true
+		}
+	}()
+	wrote, err = write()
+	return wrote, err, false
+}
+
 // e2eeEnded records that Meta ended run gen's encrypted session: failed,
-// until a new sign-in.
+// and no history asked, until a new sign-in.
 func (m *Messenger) e2eeEnded(gen int) {
 	m.cmu.Lock()
 	m.counts.E2EEFailed = true
@@ -252,4 +294,12 @@ func (m *Messenger) e2eeConnected() bool {
 	m.cmu.Lock()
 	defer m.cmu.Unlock()
 	return m.counts.E2EEConnected
+}
+
+// encryptedEnded reports whether Meta has ended the encrypted session of
+// the run in force: then no history is asked, encrypted or not.
+func (m *Messenger) encryptedEnded() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.e2eeFailed
 }

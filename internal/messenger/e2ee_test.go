@@ -345,7 +345,7 @@ func TestLiveNeedsBothConnections(t *testing.T) {
 	h.f.last().dispatch(&messagix.ReconnectedEvent{})
 	check("main back", network.Live, "", "live")
 
-	h.deliver(t, &events.LoggedOut{})
+	h.deliver(t, &events.ConnectFailure{Reason: events.ConnectFailureGeneric})
 	check("encrypted ended by Meta", network.Offline, "unsupported", "failed")
 
 	// Over the wire, `status` carries it.
@@ -393,5 +393,137 @@ func backup(id string, sender int64, at time.Time, app *waConsumerApplication.Co
 			Payload:  &waArmadilloBackupMessage.BackupMessage_EncryptedTransportMessage{EncryptedTransportMessage: b},
 		},
 		TimestampMS: at.UnixMilli(),
+	}
+}
+
+// restoredAndSettled signs in (not the gate), restores his history over a
+// scripted backup for Alice, and waits for the first read of it to end.
+func restoredAndSettled(t *testing.T) *harness {
+	t.Helper()
+	h := newHarness(t)
+	h.m.gate = false
+	h.f.history.script(fmt.Sprint(aliceFBID), fakePage{more: true, before: 1}, fakePage{more: true, before: 0})
+	h.signIn(t)
+	if err := h.m.RestoreHistory(context.Background(), []byte(canaryPIN)); err != nil {
+		t.Fatalf("RestoreHistory: %v", err)
+	}
+	h.waitValue(t, "ebackfilled")
+	h.settle()
+	return h
+}
+
+// askEverything reads every chat to its oldest line, with Alice's backup
+// made askable again, and reports how many requests that made.
+func (h *harness) askEverything(t *testing.T) int {
+	t.Helper()
+	alice := fmt.Sprint(aliceFBID) + "@msgr"
+	_ = h.m.keep("estalled."+alice, "")
+	_ = h.m.keep("encDone."+alice, "")
+	before := len(h.f.requests())
+	for _, chat := range []string{alice, fmt.Sprint(groupOne), fmt.Sprint(bobFBID) + "@msgr"} {
+		_, _ = h.m.FetchOlder(context.Background(), chat)
+	}
+	h.settle()
+	return len(h.f.requests()) - before
+}
+
+// Review I1 (the reviewer's probe): Meta suspending the encrypted device
+// is a suspension of Messenger. It is banned, the pace is blocked, the run
+// ends, and nothing is asked: no backup page, no history page, and no
+// sign-in with the same cookies, even after a restart.
+func TestABannedEncryptedDeviceStopsEveryRequest(t *testing.T) {
+	h := restoredAndSettled(t)
+	h.deliver(t, &events.TemporaryBan{Code: events.TempBanSentToTooManyPeople})
+	eventually(t, "banned", func() bool { s, _ := h.state(); return s == network.Banned })
+	if _, blocked := h.m.pace.Blocked(); !blocked {
+		t.Fatalf("the pace is not blocked after a ban")
+	}
+	if n := h.askEverything(t); n != 0 {
+		t.Errorf("after a ban, reading every chat made %d requests", n)
+	}
+	before := len(h.f.requests())
+	h.login(t, validSession())
+	h.f.clock.Advance(48 * time.Hour)
+	if n := len(h.f.requests()) - before; n != 0 {
+		t.Errorf("signing in again with the same cookies made %d requests", n)
+	}
+	if s, _ := h.state(); s != network.Banned {
+		t.Errorf("state after the same cookies again is %s, want banned", s)
+	}
+	h.close()
+	again := newHarnessOver(t, h.dir, h.f)
+	again.m.gate = false
+	before = len(h.f.requests())
+	again.login(t, validSession())
+	if n := len(h.f.requests()) - before; n != 0 {
+		t.Errorf("after a restart, the same cookies made %d requests", n)
+	}
+}
+
+// Review I1: Meta logging the encrypted device out ends the session
+// (reconnectNeeded, nothing asked until he signs in again); any other end
+// of the encrypted session leaves groups up but asks no history, encrypted
+// or not, until a new sign-in.
+func TestAnEndedEncryptedSessionAsksNothing(t *testing.T) {
+	t.Run("logged out", func(t *testing.T) {
+		h := restoredAndSettled(t)
+		h.deliver(t, &events.LoggedOut{Reason: events.ConnectFailureLoggedOut})
+		eventually(t, "reconnectNeeded", func() bool { s, _ := h.state(); return s == network.ReconnectNeeded })
+		if _, blocked := h.m.pace.Blocked(); !blocked {
+			t.Fatalf("the pace is not blocked after the device was logged out")
+		}
+		if n := h.askEverything(t); n != 0 {
+			t.Errorf("after a log-out, reading every chat made %d requests", n)
+		}
+	})
+	t.Run("ended otherwise", func(t *testing.T) {
+		h := restoredAndSettled(t)
+		h.deliver(t, &events.ConnectFailure{Reason: events.ConnectFailureGeneric})
+		eventually(t, "offline", func() bool { s, k := h.state(); return s == network.Offline && k == "unsupported" })
+		if n := h.askEverything(t); n != 0 {
+			t.Errorf("with the encrypted session ended, reading every chat made %d requests", n)
+		}
+		if h.m.Status().Encrypted != "failed" {
+			t.Errorf("encrypted is %q, want failed", h.m.Status().Encrypted)
+		}
+	})
+}
+
+// Review M2: a message that can never be stored (it panics, or the store
+// refuses it) is not left unacked to come back at every connect: it is kept
+// as a hidden notice under its ID when that can be stored, and acked.
+// Review M1: only a message that writes something tells Pllum to re-read.
+func TestAMessageThatCannotBeStoredIsNotLostForever(t *testing.T) {
+	h := newHarness(t)
+	h.signIn(t)
+	at := time.Date(2026, 3, 2, 8, 0, 0, 0, time.UTC)
+	alice := fmt.Sprint(aliceFBID) + "@msgr"
+	h.m.testPrep = func(evt *events.FBMessage) {
+		if evt.Info.ID == "WAINVENTED60" {
+			panic("invented")
+		}
+	}
+	h.deliver(t, fbMessage(oneToOne(aliceFBID), person(aliceFBID), "WAINVENTED60", at, textContent("x"), ""))
+	if l, ok := h.line(t, alice, "WAINVENTED60"); !ok || l.Kind != "notice" || l.Hidden == nil || !*l.Hidden {
+		t.Errorf("the message that panicked reads %+v (ok %v), want a hidden notice", l, ok)
+	}
+	// An ID the store refuses: acked, nothing stored.
+	h.deliver(t, fbMessage(oneToOne(aliceFBID), person(aliceFBID), "beeper:invented", at, textContent("x"), ""))
+
+	// Nothing written, nothing to re-read: a poll vote, a signal, a line
+	// already held sent again.
+	h.deliver(t, fbMessage(oneToOne(aliceFBID), person(aliceFBID), "WAINVENTED61", at, textContent("y"), ""))
+	time.Sleep(700 * time.Millisecond)
+	before := h.changedEvents()
+	vote := content(&waConsumerApplication.ConsumerApplication_Content{Content: &waConsumerApplication.ConsumerApplication_Content_PollUpdateMessage{
+		PollUpdateMessage: &waConsumerApplication.ConsumerApplication_PollUpdateMessage{}}})
+	h.deliver(t, fbMessage(oneToOne(aliceFBID), person(aliceFBID), "WAINVENTED62", at, vote, ""))
+	signal := &waConsumerApplication.ConsumerApplication{Payload: &waConsumerApplication.ConsumerApplication_Payload{
+		Payload: &waConsumerApplication.ConsumerApplication_Payload_Signal{Signal: &waConsumerApplication.ConsumerApplication_Signal{}}}}
+	h.deliver(t, fbMessage(oneToOne(aliceFBID), person(aliceFBID), "WAINVENTED63", at, signal, ""))
+	h.deliver(t, fbMessage(oneToOne(aliceFBID), person(aliceFBID), "WAINVENTED61", at, textContent("y"), ""))
+	time.Sleep(700 * time.Millisecond)
+	if n := h.changedEvents() - before; n != 0 {
+		t.Errorf("messages that wrote nothing sent %d changed events", n)
 	}
 }
