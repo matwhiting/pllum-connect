@@ -219,6 +219,15 @@ func TestRateLimitedBacksOffAndDoubles(t *testing.T) {
 	}
 }
 
+func TestBackoffDoublesFromFifteenMinutesToFourHours(t *testing.T) {
+	want := []time.Duration{15 * time.Minute, 15 * time.Minute, 30 * time.Minute, 60 * time.Minute, 120 * time.Minute, 240 * time.Minute, 240 * time.Minute}
+	for i, step := range []int{-1, 0, 1, 2, 3, 4, 50} {
+		if got := Backoff(step); got != want[i] {
+			t.Errorf("Backoff(%d) = %v, want %v", step, got, want[i])
+		}
+	}
+}
+
 func TestARateLimitedDuringABlockDoesNotLengthenIt(t *testing.T) {
 	c := newClock()
 	p := c.pace()
