@@ -322,12 +322,12 @@ func (m *Messenger) ingest(tbl *table.LSTable, source string) {
 		if w.upsert {
 			src = store.SourceSync
 		}
-		n, err := m.storeLine(chat, w, src)
+		n, c, err := m.storeLine(chat, w, src)
 		if err != nil {
 			continue
 		}
 		added[w.ThreadKey] += n
-		if n > 0 {
+		if c {
 			changed = true // a line held already, sent again, changes nothing
 		}
 	}
@@ -608,8 +608,12 @@ func (m *Messenger) members(tc *tableCtx, tbl *table.LSTable) bool {
 }
 
 // storeLine writes one line (and, for a line Meta shows as edited, the
-// edit): 1 when it made a new row.
-func (m *Messenger) storeLine(chat string, w *wrapped, source string) (int, error) {
+// edit): 1 when it made a new row; changed when anything Pllum shows
+// changed: a new row, or a row whose state differs after the write (an
+// early row from its edit or revoke taken over by the line, a new text,
+// kind, edit or revoke). The same line sent again changes nothing (review
+// C1; fix round 3).
+func (m *Messenger) storeLine(chat string, w *wrapped, source string) (n int, changed bool, err error) {
 	b := bodyOf(w)
 	hidden := b.hidden
 	sender, fromMe := m.personOf(w.SenderId)
@@ -635,9 +639,10 @@ func (m *Messenger) storeLine(chat string, w *wrapped, source string) (int, erro
 	if b.keepRaw {
 		line.Raw = w.rawOf()
 	}
+	before, held := m.st.LineState(Name, chat, w.MessageId)
 	added, err := m.st.PutMessage(Name, line)
 	if err != nil {
-		return 0, err
+		return 0, false, err
 	}
 	m.seenLine(w.MessageId, chat)
 	if w.IsUnsent {
@@ -646,9 +651,10 @@ func (m *Messenger) storeLine(chat string, w *wrapped, source string) (int, erro
 		_, _ = m.st.PutMessage(Name, store.Message{ID: w.MessageId, ChatID: chat, Text: b.text, Edited: true})
 	}
 	if added {
-		return 1, nil
+		return 1, true, nil
 	}
-	return 0, nil
+	after, _ := m.st.LineState(Name, chat, w.MessageId)
+	return 0, !held || after != before, nil
 }
 
 // readThrough moves his read marker forward to ms.

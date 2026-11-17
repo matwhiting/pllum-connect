@@ -596,3 +596,33 @@ func TestOlderPagesFetchesTheOlderThread(t *testing.T) {
 		t.Errorf("the page was asked from %q, want the oldest line held", last.ReferenceMessageId)
 	}
 }
+
+// Fix round 3: a Meta line that lands in a row its revoke made first (an
+// early row) is a change Pllum must re-read; the same line again is not.
+func TestAMetaLineOverItsEarlyRowTellsPllum(t *testing.T) {
+	h := newHarness(t)
+	h.signIn(t)
+	at := time.Date(2026, 3, 1, 8, 0, 0, 0, time.UTC)
+	quiet := func() int {
+		time.Sleep(700 * time.Millisecond)
+		return h.changedEvents()
+	}
+	h.f.last().dispatch(&table.LSTable{LSDeleteMessage: []*table.LSDeleteMessage{{ThreadKey: groupOne, MessageId: "mid.$invented-r1"}}})
+	before := quiet()
+	newLine := func() *table.LSTable {
+		return &table.LSTable{LSInsertMessage: []*table.LSInsertMessage{{
+			ThreadKey: groupOne, MessageId: "mid.$invented-r1", SenderId: aliceFBID, TimestampMs: at.UnixMilli(), Text: canary + " revoked"}}}
+	}
+	h.f.last().dispatch(newLine())
+	if n := quiet() - before; n != 1 {
+		t.Errorf("a line landing in its revoke's row sent %d changed events, want 1", n)
+	}
+	if l, ok := h.lines(t, fmt.Sprint(groupOne))["mid.$invented-r1"]; !ok || !l.Deleted {
+		t.Errorf("the line reads %+v (ok %v), want it held and deleted", l, ok)
+	}
+	before = h.changedEvents()
+	h.f.last().dispatch(newLine())
+	if n := quiet() - before; n != 0 {
+		t.Errorf("the same line again sent %d changed events, want 0", n)
+	}
+}
