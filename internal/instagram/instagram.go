@@ -930,9 +930,10 @@ func (g *Instagram) savedState(session network.Session) (json.RawMessage, bool) 
 }
 
 // resnapshot: Meta says the socket is too far behind to resume. The library
-// has stopped it; the inbox is loaded again (through the pace) and it
-// connects anew. If that fails, the run ends offline (with rateLimited
-// while a block is in force), for a nudge or the block's end to retry.
+// has stopped it; the inbox is loaded again and caught up from (reload),
+// and it connects anew. If the inbox reload fails, the run ends offline
+// (with rateLimited while a block is in force), for a nudge or the block's
+// end to retry.
 func (g *Instagram) resnapshot(gen int) {
 	cur, cli, ctx := g.running()
 	if cur != gen || cli == nil || ctx == nil {
@@ -943,30 +944,48 @@ func (g *Instagram) resnapshot(gen int) {
 	go func() {
 		defer g.work.Done()
 		defer g.busy.Add(-1)
-		var mailbox *slidetypes.Mailbox
-		err := g.request(ctx, gen, func(ctx context.Context) (err error) {
-			_, mailbox, err = cli.LoadIndex(ctx)
-			return err
-		})
-		if err != nil {
+		if err := g.reload(ctx, gen, cli); err != nil {
 			g.mu.Lock()
 			g.failed(gen, network.Offline, kindOf(err))
 			g.mu.Unlock()
-			return
 		}
-		if !g.current(gen) {
-			return
-		}
-		if mailbox != nil {
-			g.storeListing(mailbox.ThreadsByFolder.Edges)
-			g.changed()
-		}
-		g.work.Add(1)
-		go func() {
-			defer g.work.Done()
-			cli.Connect(ctx)
-		}()
 	}()
+}
+
+// reload loads the inbox again on a client whose socket has stopped, and
+// connects it anew. Every request goes through the pace: the LoadIndex,
+// then, for each thread of its first page active since the store last saw
+// it, the newest pages until a line the store holds (up to threadPages), as
+// at a sign-in. That catch-up runs before the socket connects, so no live
+// line can stop it short of what came while the socket was away, and a
+// thread it does not finish stays marked behind for the next inbox load.
+// The error is the LoadIndex's; a catch-up cut short is not one.
+func (g *Instagram) reload(ctx context.Context, gen int, cli igClient) error {
+	var mailbox *slidetypes.Mailbox
+	err := g.request(ctx, gen, func(ctx context.Context) (err error) {
+		_, mailbox, err = cli.LoadIndex(ctx)
+		return err
+	})
+	if err != nil {
+		return err
+	}
+	if !g.current(gen) {
+		return nil
+	}
+	if mailbox != nil {
+		threads := g.storeListing(mailbox.ThreadsByFolder.Edges, true)
+		g.changed()
+		_ = g.catchUpListing(ctx, gen, cli, threads)
+	}
+	if !g.current(gen) {
+		return nil
+	}
+	g.work.Add(1)
+	go func() {
+		defer g.work.Done()
+		cli.Connect(ctx)
+	}()
+	return nil
 }
 
 // changed tells Pllum there is something to re-read: at once, or when 500 ms

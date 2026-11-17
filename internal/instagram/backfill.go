@@ -15,9 +15,10 @@ import (
 //   - at the first sign-in, the inbox, page by page (folder INBOX) until a
 //     thread older than 365 days, no next page, or 40 pages; then, for each
 //     thread active in the last 90 days, up to 5 pages of its messages;
-//   - at every later sign-in, only the threads the inbox's first page shows
-//     active since the store last saw them, newest first, until a line the
-//     store holds (up to 5 pages);
+//   - at every later sign-in, and at every inbox reload after a resnapshot,
+//     only the threads the inbox's first page shows active since the store
+//     last saw them (or that a catch-up cut short left marked behind),
+//     newest first, until a line the store holds (up to 5 pages);
 //   - when Pllum reads to the oldest line of a chat (FetchOlder), one more
 //     page, older than the last.
 //
@@ -40,9 +41,9 @@ func (g *Instagram) backfill(ctx context.Context, gen int, cli igClient, first *
 		return
 	}
 	now := g.clock.Now()
-	threads := g.storeListing(first.ThreadsByFolder.Edges)
-	g.changed()
 	done := g.value("backfilled") != ""
+	threads := g.storeListing(first.ThreadsByFolder.Edges, done)
+	g.changed()
 
 	if !done {
 		page := first.ThreadsByFolder.PageInfo
@@ -60,7 +61,7 @@ func (g *Instagram) backfill(ctx context.Context, gen int, cli igClient, first *
 			if resp == nil || resp.Mailbox == nil {
 				break
 			}
-			more := g.storeListing(resp.Mailbox.ThreadsByFolder.Edges)
+			more := g.storeListing(resp.Mailbox.ThreadsByFolder.Edges, false)
 			g.changed()
 			threads = append(threads, more...)
 			reached = olderThan(more, now.Add(-inboxReach).UnixMilli())
@@ -75,10 +76,10 @@ func (g *Instagram) backfill(ctx context.Context, gen int, cli igClient, first *
 		}
 		var err error
 		switch {
+		case g.behind(t.chat):
+			err = g.catchUp(ctx, gen, cli, t)
 		case !done && t.activity >= active:
 			_, _, err = g.fetchPages(ctx, gen, cli, t.chat, t.igChatID, threadPages, false)
-		case done && t.activity > t.held:
-			_, _, err = g.fetchPages(ctx, gen, cli, t.chat, t.igChatID, threadPages, true)
 		}
 		if err != nil {
 			return
@@ -88,6 +89,39 @@ func (g *Instagram) backfill(ctx context.Context, gen int, cli igClient, first *
 		_ = g.keep("backfilled", "1")
 	}
 }
+
+// catchUpListing catches up every thread of a listing that is marked
+// behind, in order, and stops at the first that fails (it stays marked).
+func (g *Instagram) catchUpListing(ctx context.Context, gen int, cli igClient, threads []listed) error {
+	for _, t := range threads {
+		if ctx.Err() != nil || !g.current(gen) {
+			return errNotConnected
+		}
+		if !g.behind(t.chat) {
+			continue
+		}
+		if err := g.catchUp(ctx, gen, cli, t); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// catchUp fetches a thread's newest pages until a line the store holds (up
+// to threadPages, each through the pace), then forgets that it was behind.
+// Until that has worked the mark stays, so a catch-up cut short (a failed
+// page, a block, a restart) is done again at the next inbox load, though the
+// chat's activity has already moved on.
+func (g *Instagram) catchUp(ctx context.Context, gen int, cli igClient, t listed) error {
+	if _, _, err := g.fetchPages(ctx, gen, cli, t.chat, t.igChatID, threadPages, true); err != nil {
+		return err
+	}
+	return g.keep("behind."+t.chat, "")
+}
+
+// behind reports whether a chat was listed as active since the store last
+// saw it and has not been caught up since.
+func (g *Instagram) behind(chat string) bool { return g.value("behind."+chat) != "" }
 
 // olderThan reports whether a listing holds a thread last active before ms.
 func olderThan(threads []listed, ms int64) bool {

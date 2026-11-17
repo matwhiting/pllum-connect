@@ -360,8 +360,11 @@ type listed struct {
 	held     int64 // the chat's last activity before the listing; 0 for a chat new here
 }
 
-// storeListing writes the threads of an inbox page, in order.
-func (g *Instagram) storeListing(edges []slidetypes.Node[slidetypes.WrappedThreadInfo]) []listed {
+// storeListing writes the threads of an inbox page, in order. With mark set
+// (a listing that is caught up from), a thread listed as active since the
+// store last saw it is first marked behind (behind): writing its activity
+// would otherwise hide that its newest lines are still to fetch.
+func (g *Instagram) storeListing(edges []slidetypes.Node[slidetypes.WrappedThreadInfo], mark bool) []listed {
 	out := make([]listed, 0, len(edges))
 	for _, e := range edges {
 		t := e.Node.AsIGDirectThread
@@ -371,6 +374,11 @@ func (g *Instagram) storeListing(edges []slidetypes.Node[slidetypes.WrappedThrea
 		var held int64
 		if c, ok, err := g.st.Chat(Name, chatIDOf(t.ThreadKey)); err == nil && ok {
 			held = c.LastActivityMs
+		}
+		if mark && t.LastActivityTimestampMS.UnixMilli() > held {
+			if err := g.keep("behind."+chatIDOf(t.ThreadKey), "1"); err != nil {
+				continue // not written either, so the next listing still sees the gap
+			}
 		}
 		chat, ok, err := g.storeThread(t)
 		if err != nil || !ok {
