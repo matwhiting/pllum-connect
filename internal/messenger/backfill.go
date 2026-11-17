@@ -265,7 +265,11 @@ func (m *Messenger) listFolder(ctx context.Context, gen int, cli msgrClient, f f
 		if err != nil || !m.current(gen) {
 			return stopFailed, err
 		}
-		m.ingest(tbl, store.SourceSync)
+		if !m.safeIngest(tbl) {
+			// A page that cannot be read fails its folder, as an error of
+			// its own does (review N4).
+			return stopFailed, errInternal
+		}
 		next, hasRange := rangeIn(tbl, f)
 		oldestKey, oldestAt, rows := oldest(tbl)
 		if !hasRange {
@@ -456,9 +460,20 @@ func (m *Messenger) fetchPage(ctx context.Context, gen int, cli msgrClient, chat
 		return err
 	})
 	if err != nil {
+		// A page that fails to parse or times out in the library would fail
+		// the same way at the next read: held, like a page that never came
+		// (review N1). No connection, a rate limit or Meta pushing back is
+		// not held here: the pace already holds the last two, and the first
+		// never reached Meta.
+		if k := kindOf(err); ctx.Err() == nil && (k == wire.Internal || k == wire.Timeout) {
+			m.stall(chat)
+		}
 		return 0, pageHeld, err
 	}
-	m.ingest(resp, store.SourceSync)
+	if !m.safeIngest(resp) {
+		m.stall(chat)
+		return 0, pageStall, errInternal
+	}
 	note, got := m.wait(ctx, ch)
 	switch {
 	case !got && ctx.Err() != nil:
@@ -480,11 +495,25 @@ func (m *Messenger) fetchPage(ctx context.Context, gen int, cli msgrClient, chat
 	case !note.more:
 		m.olderDone(chat)
 		return note.added, pageDone, nil
-	case note.minMs == ms && note.minID == id:
+	case note.minMs <= 0 || note.minMs >= ms:
+		// It moved only if it reached back past what is held, as the
+		// cursor moves (review N2).
 		m.stall(chat)
 		return note.added, pageStall, nil
 	}
 	return note.added, pageMoved, nil
+}
+
+// safeIngest ingests a page's answer, and reports false when ingesting it
+// panicked (a page the helper cannot read): the panic ends there.
+func (m *Messenger) safeIngest(tbl *table.LSTable) (ok bool) {
+	defer func() {
+		if recover() != nil {
+			ok = false
+		}
+	}()
+	m.ingest(tbl, store.SourceSync)
+	return true
 }
 
 // stall holds a chat whose page did not move: nothing is asked for it for

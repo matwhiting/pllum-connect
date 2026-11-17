@@ -358,3 +358,103 @@ func TestAnOlderKeyListedAgainStaysAnAlias(t *testing.T) {
 		}
 	}
 }
+
+// Review N1: a history request that fails (a page the library cannot
+// parse, the library's own timeout) holds the chat too, so FetchOlder at
+// the oldest line does not send it again on every read.
+func TestAPageThatFailsIsHeld(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"cannot parse", errors.New("invented: failed to parse response")},
+		{"library timeout", context.DeadlineExceeded},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t)
+			at := time.Date(2026, 3, 1, 8, 0, 0, 0, time.UTC)
+			tbl := history(groupOne, true, line("mid.$invented-f1", aliceFBID, at, "newest"))
+			tbl.LSDeleteThenInsertThread = []*table.LSDeleteThenInsertThread{thread(groupOne, table.GROUP_THREAD, at, "inbox")}
+			h.f.table = tbl
+			h.f.taskErr = func(task socket.Task) error {
+				if _, ok := task.(*socket.FetchMessagesTask); ok {
+					return tc.err
+				}
+				return nil
+			}
+			h.signIn(t)
+			h.settle()
+			for i := 0; i < 3; i++ {
+				_, _ = h.m.FetchOlder(context.Background(), fmt.Sprint(groupOne))
+				h.f.clock.Advance(10 * time.Second)
+			}
+			if n := h.f.messageAsks(groupOne); n != 1 {
+				t.Errorf("%d requests for a page that fails, want 1", n)
+			}
+		})
+	}
+}
+
+// Review N2: a page counts as moved only when it reaches back past what is
+// held, the way the cursor moves: an answer newer than the reference (a
+// range that landed for the thread while waiting) holds the chat.
+func TestAPageThatDoesNotReachBackIsHeld(t *testing.T) {
+	h := newHarness(t)
+	at := time.Date(2026, 3, 1, 8, 0, 0, 0, time.UTC)
+	tbl := history(groupOne, true, line("mid.$invented-n1", aliceFBID, at, "newest"))
+	tbl.LSDeleteThenInsertThread = []*table.LSDeleteThenInsertThread{thread(groupOne, table.GROUP_THREAD, at, "inbox")}
+	h.f.table = tbl
+	h.f.olderFn = func(key int64) *table.LSTable {
+		return history(key, true, line("mid.$invented-n2", aliceFBID, at.Add(time.Hour), "later"))
+	}
+	h.signIn(t)
+	h.settle()
+	for i := 0; i < 3; i++ {
+		_, _ = h.m.FetchOlder(context.Background(), fmt.Sprint(groupOne))
+	}
+	if n := h.f.messageAsks(groupOne); n != 1 {
+		t.Errorf("%d requests for a page that did not reach back, want 1", n)
+	}
+}
+
+// Review N4: a page whose ingest panics fails its folder, as an error of
+// its own does: the listing goes on and ends, and no later launch asks
+// that page again.
+func TestAPageThatPanicsFailsItsFolder(t *testing.T) {
+	f := newFakeMeta()
+	dir := filepath.Join(t.TempDir(), "connect")
+	h := newHarnessOver(t, dir, f)
+	h.m.gate = false
+	// A nil row: ingesting it panics.
+	f.folders[inboxOne] = []*table.LSTable{{LSDeleteThenInsertThread: []*table.LSDeleteThenInsertThread{nil}}}
+	h.login(t, validSession())
+	h.waitValue(t, "listed")
+	asked95 := false
+	f.mu.Lock()
+	for _, task := range f.threadTasks {
+		asked95 = asked95 || task.SyncGroup == 95
+	}
+	f.mu.Unlock()
+	if !asked95 {
+		t.Errorf("the listing stopped at the page that panicked")
+	}
+	if c := h.m.GateCounts().(GateCounts); c.FolderStops[stopFailed] != 1 {
+		t.Errorf("folder stops %v, want one failed", c.FolderStops)
+	}
+	h.close()
+
+	before := countThreadTasks(f.requests())
+	next := newHarnessOver(t, dir, f)
+	next.m.gate = false
+	next.login(t, validSession())
+	eventually(t, "the encrypted socket", func() bool {
+		f.e2ee.mu.Lock()
+		defer f.e2ee.mu.Unlock()
+		return f.e2ee.connects == 2
+	})
+	time.Sleep(300 * time.Millisecond)
+	next.settle()
+	if got := countThreadTasks(f.requests()); got != before {
+		t.Errorf("the next launch asked %d thread pages, want none", got-before)
+	}
+}
