@@ -419,8 +419,8 @@ func (m *Messenger) sample(ctx context.Context, gen int, cli msgrClient, fbid in
 //     of failures and starts the pause's growth over; a page that reaches
 //     back starts its chat's holds over;
 //   - "thread not found" means that chat has no backup: it is done;
-//   - "no longer available", "a different backup" or a device Meta no
-//     longer knows means the backup his PIN opened is gone: the history
+//   - "no longer available" or "a different backup" means the backup his
+//     PIN opened is gone: the history
 //     device is dropped and the history state is needsPIN again, so
 //     nothing of it is asked until he restores it again;
 //   - every request that reached Meta counts towards the first restore's
@@ -545,8 +545,7 @@ func backupAnswer(err error) int {
 	case strings.Contains(e, "archive thread was not found"):
 		return answerNoThread
 	case strings.Contains(e, "archive is no longer available"),
-		strings.Contains(e, "belongs to a different backup"),
-		strings.Contains(e, "archive device is not enrolled"):
+		strings.Contains(e, "belongs to a different backup"):
 		return answerGone
 	}
 	return answerNone
@@ -712,6 +711,7 @@ func (m *Messenger) saveEpochs(device *securehistory.Device, page *securehistory
 // latest reaction, from its supplementals), with source sync. ok is false
 // when a line could not be read or stored.
 func (m *Messenger) storeArchive(chat, thread string, group bool, fbid int64, msgs []*securehistory.DecryptedMessage) (added int, ok bool) {
+	changed := false
 	defer func() {
 		if recover() != nil {
 			ok = false
@@ -745,13 +745,14 @@ func (m *Messenger) storeArchive(chat, thread string, group bool, fbid int64, ms
 		}
 		w := m.encPrep(chat, evt, store.SourceSync, paths)
 		w = m.withSupplementals(chat, w, evt, dm, jid, fbid)
-		n, err := m.applyEnc(chat, w)
+		n, c, err := m.applyEnc(chat, w)
 		added += n
+		changed = changed || c
 		if err != nil {
 			ok = false
 		}
 	}
-	if added > 0 {
+	if changed {
 		m.changed()
 	}
 	return added, ok

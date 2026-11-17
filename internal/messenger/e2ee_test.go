@@ -527,3 +527,59 @@ func TestAMessageThatCannotBeStoredIsNotLostForever(t *testing.T) {
 		t.Errorf("messages that wrote nothing sent %d changed events", n)
 	}
 }
+
+// Review N1 (the reviewer's probe): a line that lands in a row already
+// there (an undecryptable notice taken over, an edit's early row, a
+// restored line over a notice) is a change Pllum must re-read; only a line
+// sent again unchanged is not.
+func TestATakenOverRowTellsPllum(t *testing.T) {
+	h := newHarness(t)
+	h.m.gate = false
+	at := time.Date(2026, 3, 2, 8, 0, 0, 0, time.UTC)
+	alice := fmt.Sprint(aliceFBID) + "@msgr"
+	h.f.history.script(fmt.Sprint(aliceFBID), fakePage{msgs: []*securehistory.DecryptedMessage{
+		archived("WAINVENTED72", aliceFBID, at.Add(-time.Hour), textContent(canary+" restored over a notice"))}})
+	h.signIn(t)
+	quiet := func() int {
+		time.Sleep(700 * time.Millisecond)
+		return h.changedEvents()
+	}
+	info := func(id string) watypes.MessageInfo {
+		return watypes.MessageInfo{MessageSource: watypes.MessageSource{Chat: oneToOne(aliceFBID), Sender: person(aliceFBID)}, ID: id, Timestamp: at}
+	}
+
+	h.deliver(t, &events.UndecryptableMessage{Info: info("WAINVENTED70")})
+	before := quiet()
+	h.deliver(t, fbMessage(oneToOne(aliceFBID), person(aliceFBID), "WAINVENTED70", at, textContent(canary+" readable now"), ""))
+	if n := quiet() - before; n != 1 {
+		t.Errorf("the readable message over its notice sent %d changed events, want 1", n)
+	}
+	before = h.changedEvents()
+	h.deliver(t, fbMessage(oneToOne(aliceFBID), person(aliceFBID), "WAINVENTED70", at, textContent(canary+" readable now"), ""))
+	if n := quiet() - before; n != 0 {
+		t.Errorf("the same line sent again sent %d changed events, want 0", n)
+	}
+
+	// An edit that comes before its line: the line, landing in the edit's
+	// early row, shows.
+	h.deliver(t, fbMessage(oneToOne(aliceFBID), person(aliceFBID), "WAINVENTED71-edit", at, editContent("WAINVENTED71", canary+" edited first"), ""))
+	before = quiet()
+	h.deliver(t, fbMessage(oneToOne(aliceFBID), person(aliceFBID), "WAINVENTED71", at, textContent("x"), ""))
+	if n := quiet() - before; n != 1 {
+		t.Errorf("a line landing in its edit's row sent %d changed events, want 1", n)
+	}
+
+	// A restored line over a notice.
+	h.deliver(t, &events.UndecryptableMessage{Info: info("WAINVENTED72")})
+	before = quiet()
+	if err := h.m.RestoreHistory(context.Background(), []byte(canaryPIN)); err != nil {
+		t.Fatal(err)
+	}
+	h.waitValue(t, "ebackfilled")
+	if n := quiet() - before; n < 1 {
+		t.Errorf("a restored line over its notice sent no changed event")
+	}
+	if l, _ := h.line(t, alice, "WAINVENTED72"); l.Hidden == nil || *l.Hidden || l.Text != canary+" restored over a notice" {
+		t.Errorf("the restored line reads %+v", l)
+	}
+}

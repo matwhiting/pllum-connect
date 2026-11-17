@@ -880,46 +880,42 @@ func (m *Messenger) onFBMessage(evt *events.FBMessage) (bool, error) {
 	if err != nil || !ok {
 		return false, err
 	}
-	w := m.encPrep(chat, evt, store.SourceLive, nil)
-	added, err := m.applyEnc(chat, w)
+	_, changed, err := m.applyEnc(chat, m.encPrep(chat, evt, store.SourceLive, nil))
 	if err != nil {
 		return false, err
 	}
-	return added > 0 || w.news(), nil
+	return changed, nil
 }
 
-// news reports whether w changes something already there: an edit, a
-// revoke or a reaction. A whole line changes something only when it is
-// new (review M1).
-func (w encWrites) news() bool {
-	if len(w.reactions) > 0 {
-		return true
-	}
+// applyEnc writes what encPrep worked out. added counts the new rows;
+// changed reports whether anything Pllum shows changed: a new row, a row
+// whose state differs after the write (a hidden notice or an edit's early
+// row taken over by its line, a new text, kind, edit or revoke), or a
+// reaction. Only a line sent again unchanged changes nothing (reviews M1,
+// N1).
+func (m *Messenger) applyEnc(chat string, w encWrites) (added int, changed bool, err error) {
 	for _, l := range w.puts {
-		if l.Edited || l.Deleted {
-			return true
-		}
-	}
-	return false
-}
-
-// applyEnc writes what encPrep worked out, and counts the new lines.
-func (m *Messenger) applyEnc(chat string, w encWrites) (added int, err error) {
-	for _, l := range w.puts {
+		before, held := m.st.LineState(Name, l.ChatID, l.ID)
 		got, err := m.st.PutMessage(Name, l)
 		if err != nil {
-			return added, err
+			return added, changed, err
 		}
 		if got {
 			added++
+			changed = true
+			continue
+		}
+		if after, _ := m.st.LineState(Name, l.ChatID, l.ID); !held || after != before {
+			changed = true
 		}
 	}
 	for _, r := range w.reactions {
 		if err := m.st.SetReaction(Name, chat, r.msgID, r.r); err != nil {
-			return added, err
+			return added, changed, err
 		}
+		changed = true
 	}
-	return added, nil
+	return added, changed, nil
 }
 
 // encPrep works out what one encrypted message writes into chat. paths are

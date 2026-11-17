@@ -152,3 +152,44 @@ func TestAliasTargetIsOnlyAnAliasesChat(t *testing.T) {
 		t.Fatalf("a chat of its own reads as an alias")
 	}
 }
+
+// LineState is what shows of a row, so a network can tell whether a write
+// changed it: an early row, a hidden notice, the line itself, edited,
+// deleted.
+func TestLineStateReadsWhatShows(t *testing.T) {
+	s := openTest(t)
+	if _, ok := s.LineState(net, phoneChat, "3EB0S0001"); ok {
+		t.Fatalf("LineState found a row nothing holds")
+	}
+	if _, err := s.PutMessage(net, Message{ID: "3EB0S0001", ChatID: phoneChat, Text: "invented edit", Edited: true}); err != nil {
+		t.Fatal(err)
+	}
+	early, ok := s.LineState(net, phoneChat, "3EB0S0001")
+	if !ok || !early.Early {
+		t.Fatalf("an edit before its line reads %+v, %v", early, ok)
+	}
+	hidden := true
+	put(t, s, Message{ID: "3EB0S0002", ChatID: phoneChat, TimeMs: base, Kind: "notice", Hidden: &hidden, Source: SourceLive})
+	notice, _ := s.LineState(net, phoneChat, "3EB0S0002")
+	readable := text(phoneChat, "3EB0S0002", base, "invented now readable")
+	shownFlag := false
+	readable.Hidden = &shownFlag
+	put(t, s, readable)
+	shown, _ := s.LineState(net, phoneChat, "3EB0S0002")
+	if notice == shown || !notice.Hidden || shown.Hidden || shown.Text != "invented now readable" || shown.Kind != "text" {
+		t.Fatalf("a notice taken over reads %+v, then %+v", notice, shown)
+	}
+	put(t, s, readable)
+	if again, _ := s.LineState(net, phoneChat, "3EB0S0002"); again != shown {
+		t.Fatalf("the same line again reads %+v, was %+v", again, shown)
+	}
+	if err := s.Alias(net, lidChat, phoneChat); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.PutMessage(net, Message{ID: "3EB0S0002", ChatID: phoneChat, Deleted: true}); err != nil {
+		t.Fatal(err)
+	}
+	if gone, ok := s.LineState(net, lidChat, "3EB0S0002"); !ok || !gone.Deleted {
+		t.Fatalf("a revoked line read through an alias is %+v, %v", gone, ok)
+	}
+}

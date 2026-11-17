@@ -742,7 +742,7 @@ func (h *harness) signIn(t *testing.T) {
 
 func eventually(t *testing.T, what string, ok func() bool) {
 	t.Helper()
-	deadline := time.Now().Add(20 * time.Second)
+	deadline := time.Now().Add(60 * time.Second) // only a failure waits this long; the race detector under load is slow
 	for !ok() {
 		if time.Now().After(deadline) {
 			t.Fatalf("timed out waiting for %s", what)

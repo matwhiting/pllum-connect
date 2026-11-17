@@ -221,6 +221,29 @@ func TestADefinitiveBackupAnswerIsKept(t *testing.T) {
 			t.Errorf("after it was gone, the backup was asked %d times in all, want once", n)
 		}
 	})
+	t.Run("a local check is not Meta's answer", func(t *testing.T) {
+		// Review R1: the library's own "not enrolled" check never reached
+		// Meta's backup: his history device is kept, and the chat is held.
+		h := newHarness(t)
+		h.m.gate = false
+		h.f.history.script("0")
+		h.f.history.fail = map[string]error{fmt.Sprint(aliceFBID): errors.New("archive device is not enrolled")}
+		h.signIn(t)
+		if err := h.m.RestoreHistory(context.Background(), []byte(canaryPIN)); err != nil {
+			t.Fatal(err)
+		}
+		h.waitValue(t, "ebackfilled")
+		h.settle()
+		if h.m.HistoryState() != "restored" {
+			t.Errorf("history state %q, want restored", h.m.HistoryState())
+		}
+		if v, _, _ := h.st.NetworkValue(Name, "history"); v == "" {
+			t.Errorf("the history device was dropped")
+		}
+		if !h.m.encHeld(fmt.Sprint(aliceFBID) + "@msgr") {
+			t.Errorf("the chat is not held")
+		}
+	})
 	t.Run("a failure holds longer each time", func(t *testing.T) {
 		h := newHarness(t)
 		h.m.gate = false

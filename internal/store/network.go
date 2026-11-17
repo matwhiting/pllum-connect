@@ -187,3 +187,31 @@ func (s *Store) SeenThrough(network, chatID string, throughMs int64) error {
 		return err
 	})
 }
+
+// LineState is what shows of one row: enough for a network to tell whether
+// a write changed it (a hidden notice or an early row becoming a line, a
+// different text or kind, an edit, a revoke) or was the same line again.
+type LineState struct {
+	Kind, Text                     string
+	Hidden, Early, Deleted, Edited bool
+}
+
+// LineState is what shows of a row the chat (or the chat an alias names)
+// holds, early rows included; ok is false when it holds none by that ID.
+func (s *Store) LineState(network, chatID, msgID string) (LineState, bool) {
+	if s.ready() != nil || chatID == "" || msgID == "" {
+		return LineState{}, false
+	}
+	chat, err := resolve(s.db, network, chatID)
+	if err != nil {
+		return LineState{}, false
+	}
+	var st LineState
+	err = s.db.QueryRow(`SELECT kind, COALESCE(text, ''), hidden, early, deleted, edited FROM messages
+			WHERE network = ? AND chat_id = ? AND msg_id = ?`,
+		network, chat, msgID).Scan(&st.Kind, &st.Text, &st.Hidden, &st.Early, &st.Deleted, &st.Edited)
+	if err != nil {
+		return LineState{}, false
+	}
+	return st, true
+}
