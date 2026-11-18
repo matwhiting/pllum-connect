@@ -9,7 +9,9 @@
 // through one meta.Pace: one at a time, 2 to 4 s apart, none for a while
 // after a rateLimited, and none at all after a checkpoint, an ended session
 // or a suspension until he signs in again (a new `login`). The socket's own
-// reconnect timing is the library's.
+// reconnect timing is the library's, until it fails six times in a row
+// without subscribing: then the helper stops it and tries once more itself,
+// through the pace (redial).
 //
 // Nothing here logs: the client gets zerolog.Nop(), and every error returned
 // carries only a fixed kind. The cookies are held in memory only; the store
@@ -52,6 +54,9 @@ const (
 	// catchUpLimit is how long after the socket subscribes the state stays
 	// catchingUp when no sequence ID update comes.
 	catchUpLimit = 60 * time.Second
+	// maxDrops is how many socket failures in a row, without it subscribing
+	// in between, the library may dial again after; the next stops it.
+	maxDrops = 5
 	// changedEvery is the least time between two changed events.
 	changedEvery = 500 * time.Millisecond
 )
@@ -134,7 +139,10 @@ type Instagram struct {
 	session     network.Session // the cookies held now (the login's, as Meta rotated them); never written anywhere
 	hashes      []string        // sessionHash of every version of the session held since the login
 	retry       bool            // the run ended for a passing reason: a nudge may start another
-	stopRetry   func() bool     // the timer for the rate limit's end
+	stopRetry   func() bool     // the timer for the next try: the rate limit's end, or a redial
+	drops       int             // socket failures in a row since it last subscribed
+	redials     int             // redials since the socket last subscribed: the next waits meta.Backoff(redials)
+	redialDue   bool            // the socket is stopped and a redial is waiting: a nudge runs it now
 	gen         int             // counts runs: events and results of an older one are dropped
 	cli         igClient
 	runCtx      context.Context // the current run's: ended when it is replaced
@@ -331,9 +339,16 @@ func (g *Instagram) Logout(ctx context.Context) error {
 // reload failed for a passing reason: no connection or a timeout. A rate
 // limit is retried when its block ends (not before), a dropped socket is
 // the library's to reconnect, anything else waits for a new login.
+//
+// A socket the helper stopped after repeated failures waits for its redial;
+// a nudge (the Mac woke) runs that one redial now instead.
 func (g *Instagram) Nudge() {
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	if g.redialDue {
+		g.redial(g.gen)
+		return
+	}
 	if g.retry {
 		g.again()
 	}
@@ -421,6 +436,7 @@ func (g *Instagram) Stop() {
 func (g *Instagram) retire() {
 	g.gen++
 	g.retry = false
+	g.drops, g.redials, g.redialDue = 0, 0, false
 	if g.stopRetry != nil {
 		g.stopRetry()
 		g.stopRetry = nil
@@ -844,6 +860,7 @@ func (g *Instagram) connected(gen int) {
 	if g.stopCatchUp != nil {
 		g.stopCatchUp()
 	}
+	g.drops, g.redials = 0, 0
 	g.setState(network.CatchingUp, "")
 	g.stopCatchUp = g.clock.AfterFunc(catchUpLimit, func() { g.caughtUp(gen) })
 }
@@ -864,8 +881,14 @@ func (g *Instagram) caughtUp(gen int) {
 }
 
 // disconnected: the socket dropped; the library reconnects it, on its own
-// timing. A socket Meta refused as unauthorized is an ended session: the
-// library is told to stop.
+// timing (2 s, doubling to 60 s, while it fails to subscribe). A socket Meta
+// refused as unauthorized is an ended session: the library is told to stop.
+// So is a socket that has failed more than maxDrops times in a row: each
+// dial is a handshake with his cookies that the pace never sees, and a
+// checkpoint or a dead session can look like any other failure at the
+// socket. It goes offline and waits for one redial, through the pace, which
+// a checkpoint found then stops as any request's would. (igconnector stops
+// after more than 5 failures in a row too.)
 func (g *Instagram) disconnected(gen int, err error) error {
 	if dgw.IsUnauthorized(err) || errors.Is(err, instameow.ErrUserIDMissing) {
 		g.pace.Fail(meta.ReconnectNeeded)
@@ -881,11 +904,73 @@ func (g *Instagram) disconnected(gen int, err error) error {
 		g.stopCatchUp()
 		g.stopCatchUp = nil
 	}
+	g.drops++
+	if g.drops > maxDrops {
+		g.drops = 0
+		g.setState(network.Offline, "")
+		g.scheduleRedial(gen)
+		return errStop
+	}
 	switch g.state {
 	case network.Connecting, network.CatchingUp, network.Live:
 		g.setState(network.Offline, "")
 	}
 	return nil
+}
+
+// scheduleRedial: the socket of run gen is stopped; one redial is due
+// meta.Backoff(redials) on (15 minutes, doubling to 4 hours while redials
+// fail; a subscribe starts it over). g.mu is held.
+func (g *Instagram) scheduleRedial(gen int) {
+	if g.stopRetry != nil {
+		g.stopRetry()
+	}
+	g.redialDue = true
+	g.stopRetry = g.clock.AfterFunc(meta.Backoff(g.redials), func() {
+		g.mu.Lock()
+		defer g.mu.Unlock()
+		g.redial(gen)
+	})
+}
+
+// redial runs the redial due for run gen, once: the inbox is loaded through
+// the pace (refused, with no request, while a block is in force), what came
+// meanwhile is caught up, and the socket connects anew (reload). A
+// checkpoint, ended session or suspension it meets ends the run as any
+// request's does; any other failure waits for the next redial, twice as
+// long. g.mu is held.
+func (g *Instagram) redial(gen int) {
+	if gen != g.gen || g.stopped || !g.redialDue || g.cli == nil || g.runCtx == nil {
+		return
+	}
+	g.redialDue = false
+	if g.stopRetry != nil {
+		g.stopRetry()
+		g.stopRetry = nil
+	}
+	g.redials++
+	cli, ctx := g.cli, g.runCtx
+	g.work.Add(1)
+	g.busy.Add(1)
+	go func() {
+		defer g.work.Done()
+		defer g.busy.Add(-1)
+		err := g.reload(ctx, gen, cli)
+		if err == nil {
+			return
+		}
+		g.mu.Lock()
+		defer g.mu.Unlock()
+		if gen != g.gen || g.stopped {
+			return // Meta stopped the session: pushedBack has ended the run
+		}
+		kind := kindOf(err)
+		if kind == wire.Offline {
+			kind = ""
+		}
+		g.setState(network.Offline, kind)
+		g.scheduleRedial(gen)
+	}()
 }
 
 // seqUpdated keeps where the socket got to, so a restart can resume there,
@@ -930,9 +1015,10 @@ func (g *Instagram) savedState(session network.Session) (json.RawMessage, bool) 
 }
 
 // resnapshot: Meta says the socket is too far behind to resume. The library
-// has stopped it; the inbox is loaded again (through the pace) and it
-// connects anew. If that fails, the run ends offline (with rateLimited
-// while a block is in force), for a nudge or the block's end to retry.
+// has stopped it; the inbox is loaded again and caught up from (reload),
+// and it connects anew. If the inbox reload fails, the run ends offline
+// (with rateLimited while a block is in force), for a nudge or the block's
+// end to retry.
 func (g *Instagram) resnapshot(gen int) {
 	cur, cli, ctx := g.running()
 	if cur != gen || cli == nil || ctx == nil {
@@ -943,30 +1029,48 @@ func (g *Instagram) resnapshot(gen int) {
 	go func() {
 		defer g.work.Done()
 		defer g.busy.Add(-1)
-		var mailbox *slidetypes.Mailbox
-		err := g.request(ctx, gen, func(ctx context.Context) (err error) {
-			_, mailbox, err = cli.LoadIndex(ctx)
-			return err
-		})
-		if err != nil {
+		if err := g.reload(ctx, gen, cli); err != nil {
 			g.mu.Lock()
 			g.failed(gen, network.Offline, kindOf(err))
 			g.mu.Unlock()
-			return
 		}
-		if !g.current(gen) {
-			return
-		}
-		if mailbox != nil {
-			g.storeListing(mailbox.ThreadsByFolder.Edges)
-			g.changed()
-		}
-		g.work.Add(1)
-		go func() {
-			defer g.work.Done()
-			cli.Connect(ctx)
-		}()
 	}()
+}
+
+// reload loads the inbox again on a client whose socket has stopped, and
+// connects it anew. Every request goes through the pace: the LoadIndex,
+// then, for each thread of its first page active since the store last saw
+// it, the newest pages until a line the store holds (up to threadPages), as
+// at a sign-in. That catch-up runs before the socket connects, so no live
+// line can stop it short of what came while the socket was away, and a
+// thread it does not finish stays marked behind for the next inbox load.
+// The error is the LoadIndex's; a catch-up cut short is not one.
+func (g *Instagram) reload(ctx context.Context, gen int, cli igClient) error {
+	var mailbox *slidetypes.Mailbox
+	err := g.request(ctx, gen, func(ctx context.Context) (err error) {
+		_, mailbox, err = cli.LoadIndex(ctx)
+		return err
+	})
+	if err != nil {
+		return err
+	}
+	if !g.current(gen) {
+		return nil
+	}
+	if mailbox != nil {
+		threads := g.storeListing(mailbox.ThreadsByFolder.Edges, true)
+		g.changed()
+		_ = g.catchUpListing(ctx, gen, cli, threads)
+	}
+	if !g.current(gen) {
+		return nil
+	}
+	g.work.Add(1)
+	go func() {
+		defer g.work.Done()
+		cli.Connect(ctx)
+	}()
+	return nil
 }
 
 // changed tells Pllum there is something to re-read: at once, or when 500 ms

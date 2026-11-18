@@ -29,6 +29,13 @@ const Banned wire.Kind = "banned"
 // row; the last holds from then on.
 var rateBackoff = []time.Duration{15 * time.Minute, 30 * time.Minute, time.Hour, 2 * time.Hour, 4 * time.Hour}
 
+// Backoff is the wait after the step-th failure in a row, counted from 0:
+// the rate limit's own schedule, 15 minutes doubling to 4 hours, which it
+// never passes. A network uses it to space a retry it makes by itself.
+func Backoff(step int) time.Duration {
+	return rateBackoff[min(max(step, 0), len(rateBackoff)-1)]
+}
+
 // Pace keeps the helper's requests to Meta slow and quiet, and stops them
 // when Meta pushes back. Meta bans accounts that look like a script, and a
 // ban costs him the account, so after a rateLimited the helper waits (15
