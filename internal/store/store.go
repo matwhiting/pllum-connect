@@ -496,6 +496,30 @@ func (s *Store) Alias(network, alias, chatID string) error {
 	})
 }
 
+// Twins are the chats "<alias><suffix>" whose alias already leads to
+// another chat, by chat: the chat each should join.
+func (s *Store) Twins(network, suffix string) (map[string]string, error) {
+	if err := s.ready(); err != nil {
+		return nil, err
+	}
+	rows, err := s.db.Query(`SELECT c.chat_id, a.chat_id FROM aliases a
+			JOIN chats c ON c.network = a.network AND c.chat_id = a.alias_jid || ?
+			WHERE a.network = ? AND a.chat_id <> c.chat_id`, suffix, network)
+	if err != nil {
+		return nil, dbErr(err)
+	}
+	defer rows.Close()
+	out := map[string]string{}
+	for rows.Next() {
+		var from, into string
+		if err := rows.Scan(&from, &into); err != nil {
+			return nil, dbErr(err)
+		}
+		out[from] = into
+	}
+	return out, dbErr(rows.Err())
+}
+
 // mergeChat moves every line, reaction, member and mapping of chat from into
 // chat into, folding in lines into already holds, and deletes from.
 func mergeChat(tx *sql.Tx, network, from, into string) error {

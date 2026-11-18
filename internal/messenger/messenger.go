@@ -211,6 +211,8 @@ type Messenger struct {
 	epmu     sync.Mutex      // one change to the history device's keys at a time
 	ebActive atomic.Bool     // the first read of his backup is running
 	efmu     sync.Mutex      // the run of failed backup requests
+	diagmu   sync.Mutex      // diagnostics.txt (diag.go)
+	checked  atomic.Bool     // this run's self-check has run (diag.go)
 	fillmu   sync.Mutex      // filling
 	filling  map[string]bool // chats whose newest backup page is due (catchup.go)
 	odmu     sync.Mutex      // the day's pages of the backup asked on demand
@@ -781,6 +783,8 @@ func (m *Messenger) beginE2EE(gen int, cli msgrClient, fbid int64) {
 			return
 		}
 		m.checkHistory(ctx, gen, cli, fbid)
+		// a twin "<key>@msgr" of a chat its key already belongs to joins it (ids.go)
+		m.foldTwins()
 		if m.gate || m.value("listed") == "" {
 			if !m.listThreads(ctx, gen, cli) {
 				return

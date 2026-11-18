@@ -145,6 +145,10 @@ func (m *Messenger) connectE2EE(ctx context.Context, gen int, cli msgrClient, fb
 	if err != nil {
 		return errInternal
 	}
+	if wc, ok := e.(waClient); ok {
+		// the library's warnings about decrypting go to diagnostics.txt, without numbers (diag.go)
+		wc.Client.Log = m.diagLogger()
+	}
 	e.AddEventHandlerWithSuccessStatus(m.e2eeHandler(gen))
 	m.mu.Lock()
 	if gen != m.gen || m.stopped {
@@ -183,6 +187,15 @@ func (m *Messenger) e2eeHandler(gen int) func(evt any) bool {
 		switch e := evt.(type) {
 		case *events.Connected:
 			m.e2eeUp(gen, true)
+			m.mu.Lock()
+			client := m.e2ee
+			m.mu.Unlock()
+			if client != nil && m.checked.CompareAndSwap(false, true) {
+				go func() {
+					m.selfCheck(gen, client)
+					m.askAgain(gen, client)
+				}()
+			}
 		case *events.Disconnected:
 			m.e2eeUp(gen, false)
 		case *events.FBMessage:

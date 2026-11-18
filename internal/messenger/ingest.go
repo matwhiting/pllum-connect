@@ -483,7 +483,13 @@ func (m *Messenger) writeThread(tc *tableCtx, r threadRow) bool {
 		c, mapped = m.encryptedAlias(r.key)
 		mapped = mapped && c != p.chat
 	}
-	if mapped && !p.enc {
+	if mapped {
+		if p.enc {
+			// Meta lists this person's encrypted thread under a key of its
+			// own: it is their chat, and "<key>@msgr" an alias of it, so a
+			// twin made before the pointer came folds in.
+			_ = m.st.Alias(Name, p.chat, c)
+		}
 		p.chat, p.alias = c, keyID(r.key)
 		p.kind = "single"
 		if strings.HasSuffix(c, groupSuffix) {

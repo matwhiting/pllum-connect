@@ -216,3 +216,23 @@ func (m *Messenger) learnName(fbid int64, name string) {
 	defer m.nmu.Unlock()
 	m.names[fbid] = name
 }
+
+// foldTwins makes every "<key>@msgr" chat whose key already leads to
+// another chat an alias of that chat, its lines and state joining it: the
+// nameless twin an encrypted thread listed under a key of its own made
+// before its pointer came (or before writeThread knew to follow one).
+func (m *Messenger) foldTwins() {
+	twins, err := m.st.Twins(Name, oneToOneSuffix)
+	if err != nil {
+		return
+	}
+	folded := false
+	for from, into := range twins {
+		if m.st.Alias(Name, from, into) == nil {
+			folded = true
+		}
+	}
+	if folded {
+		m.changed()
+	}
+}

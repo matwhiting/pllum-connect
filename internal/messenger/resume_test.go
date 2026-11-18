@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 
@@ -13,6 +14,7 @@ import (
 	"go.mau.fi/mautrix-meta/pkg/messagix/table"
 
 	"github.com/matwhiting/pllum-connect/internal/network"
+	"github.com/matwhiting/pllum-connect/internal/store"
 	"github.com/matwhiting/pllum-connect/internal/wire"
 )
 
@@ -456,5 +458,38 @@ func TestAPageThatPanicsFailsItsFolder(t *testing.T) {
 	next.settle()
 	if got := countThreadTasks(f.requests()); got != before {
 		t.Errorf("the next launch asked %d thread pages, want none", got-before)
+	}
+}
+
+// Meta can list a person's encrypted thread under a key of its own, not
+// their FBID. Once that key is theirs (a pointer named it), an encrypted
+// row under it is their chat: no nameless "<key>@msgr" twin. A twin made
+// before the pointer came is folded into the person's chat at the next run.
+func TestAnEncryptedThreadUnderAnotherKeyIsItsPersonsChat(t *testing.T) {
+	h := newHarness(t)
+	at := time.Date(2026, 3, 1, 10, 0, 0, 0, time.UTC)
+	const otherKey int64 = 7700000000000002
+	twin := fmt.Sprint(otherKey) + "@msgr"
+	// a twin made before the pointer, as an earlier helper did
+	if err := h.st.PutChat(Name, store.ChatInfo{ID: twin, Kind: "single", LastActivityMs: at.Add(-time.Hour).UnixMilli()}); err != nil {
+		t.Fatal(err)
+	}
+	tbl := inbox()
+	tbl.LSVerifyHybridThreadExists = append(tbl.LSVerifyHybridThreadExists,
+		&table.LSVerifyHybridThreadExists{ThreadKey: otherKey, ThreadJID: carolFBID, ThreadType: table.ENCRYPTED_OVER_WA_ONE_TO_ONE})
+	h.f.table = tbl
+	h.signIn(t)
+	h.settle()
+	carol := fmt.Sprint(carolFBID) + "@msgr"
+	eventually(t, "the twin folded into Carol's chat", func() bool {
+		got, _ := h.st.ChatFor(Name, twin)
+		return got == carol && !slices.Contains(h.chatIDs(t), twin)
+	})
+
+	later := &table.LSTable{LSDeleteThenInsertThread: []*table.LSDeleteThenInsertThread{thread(otherKey, table.ENCRYPTED_OVER_WA_ONE_TO_ONE, at, "inbox")}}
+	h.f.last().dispatch(later)
+	eventually(t, "Carol's chat active at the row's time", func() bool { return h.chat(t, carol).LastActivityMs >= at.UnixMilli() })
+	if slices.Contains(h.chatIDs(t), twin) {
+		t.Errorf("an encrypted row under the other key made chat %s", twin)
 	}
 }
