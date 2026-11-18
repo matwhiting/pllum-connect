@@ -151,6 +151,7 @@ type Messenger struct {
 	now           func() time.Time
 	gate          bool          // started with --gate: every sign-in lists every folder, and one page of restored history is sampled
 	pageWait      time.Duration // how long a page of history may take to come back on the socket
+	writeWait     time.Duration // how long one write's request may wait for its turn and its answer
 
 	mu        sync.Mutex
 	started   bool
@@ -261,6 +262,7 @@ func New(st *store.Store, dir string, key [32]byte, emit network.Emit) *Messenge
 		diff:          meta.NewSessionDiff(meta.FacebookPage),
 		now:           time.Now,
 		pageWait:      pageWaitDefault,
+		writeWait:     writeWait,
 		state:         network.NotConnected,
 		values:        map[string]string{},
 		names:         map[int64]string{},

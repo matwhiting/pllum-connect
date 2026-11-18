@@ -207,6 +207,7 @@ type fakeMeta struct {
 	fbUploads   []whatsmeow.MediaType
 	writeErrs   map[string]error
 	answer      func(t *socket.SendMessageTask) *table.LSTable
+	hook        func(name string) // called once a write is answered, outside the fake's lock
 	files       map[string][]byte
 
 	// clock is the time the pace runs on; calls are the requests made, with
@@ -834,8 +835,21 @@ func (f *fakeMeta) written() []socket.Task {
 	return append([]socket.Task{}, f.tasks...)
 }
 
+// after calls the test's hook for a write just answered.
+func (f *fakeMeta) after(name string) {
+	f.mu.Lock()
+	hook := f.hook
+	f.mu.Unlock()
+	if hook != nil {
+		hook(name)
+	}
+}
+
 func (w fakeWriter) ExecuteTasks(ctx context.Context, tasks ...socket.Task) (*table.LSTable, error) {
 	f := w.f
+	if len(tasks) == 1 {
+		defer f.after(taskName(tasks[0]))
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.tasks = append(f.tasks, tasks...)
@@ -861,6 +875,7 @@ func (w fakeWriter) ExecuteTasks(ctx context.Context, tasks ...socket.Task) (*ta
 
 func (w fakeWriter) SendFBMessage(ctx context.Context, to watypes.JID, message armadillo.RealMessageApplicationSub, metadata *waMsgApplication.MessageApplication_Metadata, extra ...whatsmeow.SendRequestExtra) (whatsmeow.SendResponse, error) {
 	f := w.f
+	defer f.after("SendFBMessage")
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.record("SendFBMessage")
@@ -902,6 +917,7 @@ func (w fakeWriter) DownloadFB(ctx context.Context, transport *waMediaTransport.
 
 func (w fakeWriter) Upload(ctx context.Context, threadID int64, media *httpclient.MercuryUploadMedia) (*types.MercuryUploadResponse, error) {
 	f := w.f
+	defer f.after("Upload")
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.record("Upload")

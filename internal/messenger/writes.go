@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"cmp"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"image"
@@ -145,10 +146,21 @@ func writerFor(cli msgrClient, e e2eeClient) msgrWriter {
 // one of the four writes is refused before anything is asked. ran reports
 // whether the request reached the client (raw is then its own error).
 func (m *Messenger) execute(ctx context.Context, gen int, w msgrWriter, task socket.Task) (resp *table.LSTable, ran bool, raw, err error) {
+	return m.executeThen(ctx, gen, w, task, nil)
+}
+
+// executeThen is execute with first run just before the task leaves, after
+// the pace; if first fails, nothing is asked.
+func (m *Messenger) executeThen(ctx context.Context, gen int, w msgrWriter, task socket.Task, first func() error) (resp *table.LSTable, ran bool, raw, err error) {
 	if task == nil || !allowedWrite(task) {
 		return nil, false, nil, errNotAllowed
 	}
 	ran, raw, err = m.ask(ctx, gen, func(ctx context.Context) (err error) {
+		if first != nil {
+			if err := first(); err != nil {
+				return err
+			}
+		}
 		resp, err = w.ExecuteTasks(ctx, task)
 		return err
 	})
@@ -179,24 +191,26 @@ func (m *Messenger) ask(ctx context.Context, gen int, fn func(ctx context.Contex
 // line is stored under. An encrypted chat takes SendFBMessage under a
 // whatsmeow message ID (as GenerateMessageID makes it in Messenger mode),
 // which is the line's ID. A send is kept in the outbox under the ID of its
-// last message ("otid:<n>", or the whatsmeow ID): text with a file is two
-// messages, the file then the text, the file's own ID kept in the request.
+// text ("otid:<n>", or the whatsmeow ID), or of its file when it has no
+// text: text with a file is two messages, the text then the file, as
+// Instagram's writes send them, the file's own ID kept in the request.
 // Sends go in the background, one at a time in the order made.
 //
-//	Meta answered with the message          sent (lineID: the last message's)
+//	Meta answered with every message        sent (lineID: the text's, else the file's)
 //	nothing reached Meta, or Meta said no   failed, refused
-//	  (after the file of a file-and-text went: unclear)
+//	  (after the text of a text-and-file went: unclear)
 //	no answer in time, or no readable one   sending; at the next start unknown
 //
 // What a send has done is kept in its row before the next step (its
 // progress): the upload, so a send tried again reuses it and never uploads
-// twice; the file's message, so the text alone goes after; and, before
-// every message is asked, that it is being asked. At start a send whose
+// twice; the text's message, so the file alone goes after; and, as every
+// message's request leaves, that it is being asked. At start a send whose
 // message was being asked becomes unknown and is never sent again (a later
 // echo, or the line coming back under its ID, still settles it); one that
 // never asked a message (its turn never came, or only its upload went) is
 // failed, refused, and its key sends it again with what it has (unclear,
-// when its file went). ExecuteTasks goes over the main socket as one
+// when its text went). The echo of a text whose file is still to go
+// settles nothing. ExecuteTasks goes over the main socket as one
 // stream, which the library never sends again; whatsmeow sends an
 // encrypted message again only after its socket drops mid-send, under the
 // same message ID, which the other side drops as a copy.
@@ -231,8 +245,8 @@ type sendRequest struct {
 	Kind     string `json:"kind,omitempty"` // text, photo, video or file
 	Mimetype string `json:"mimetype,omitempty"`
 	OTID     string `json:"otid,omitempty"`     // a send on an unencrypted thread: its last message's offline threading ID
-	FileOTID string `json:"fileOTID,omitempty"` // a file sent before its text there: the file's own
-	FileID   string `json:"fileID,omitempty"`   // a file sent before its text in an encrypted chat: the file's message ID
+	FileOTID string `json:"fileOTID,omitempty"` // a file sent after its text there: the file's own
+	FileID   string `json:"fileID,omitempty"`   // a file sent after its text in an encrypted chat: the file's message ID
 	Target   string `json:"target,omitempty"`   // the line a reaction is to
 	Emoji    string `json:"emoji,omitempty"`
 	WAID     string `json:"waID,omitempty"` // an encrypted chat's reaction: the message ID it goes under
@@ -243,10 +257,10 @@ type sendRequest struct {
 type sendProgress struct {
 	Attachment int64  `json:"attachment,omitempty"` // the unencrypted upload's attachment ID
 	Upload     []byte `json:"upload,omitempty"`     // the encrypted upload: its WAMediaTransport, marshalled
-	Width      int    `json:"width,omitempty"`      // a photo's size, for the encrypted message
+	Width      int    `json:"width,omitempty"`      // a photo's or video's size, for the encrypted message
 	Height     int    `json:"height,omitempty"`
-	FileSent   bool   `json:"fileSent,omitempty"` // the file's message of a file-and-text went
-	FileLineID string `json:"fileLineID,omitempty"`
+	TextSent   bool   `json:"textSent,omitempty"` // the text of a text-and-file went
+	TextLineID string `json:"textLineID,omitempty"`
 	Asking     bool   `json:"asking,omitempty"` // a message is asked and its answer not yet kept
 }
 
@@ -336,7 +350,8 @@ func (m *Messenger) writableChat(chatID string) (string, error) {
 	return chat, nil
 }
 
-// writeCtx is a write's context: the network's, for at most writeWait.
+// writeCtx is one request's context: the network's, for at most
+// m.writeWait (writeWait). Every request of a write has its own.
 func (m *Messenger) writeCtx() (context.Context, context.CancelFunc) {
 	m.mu.Lock()
 	base := m.ctx
@@ -344,7 +359,7 @@ func (m *Messenger) writeCtx() (context.Context, context.CancelFunc) {
 	if base == nil {
 		base = context.Background()
 	}
-	return context.WithTimeout(base, writeWait)
+	return context.WithTimeout(base, cmp.Or(m.writeWait, writeWait))
 }
 
 // writer is the current run's number and writer; the writer is nil when no
@@ -433,7 +448,7 @@ func writeErr(ran bool, raw, err error) error {
 // returns that ID at once, and sends it in the background. A send repeated
 // with the caller's key (o.ClientID) of one kept and not failed gives that
 // send's ID and sends nothing more. One that failed after its upload or its
-// file went is the same send, and goes on with what it has; any other
+// text went is the same send, and goes on with what it has; any other
 // failed send is done, and the key makes a new send.
 func (m *Messenger) Send(ctx context.Context, o network.Outgoing) (string, error) {
 	if o.ClientID != "" {
@@ -527,7 +542,7 @@ func (m *Messenger) SendFor(clientID string) (string, error) {
 }
 
 // keyed is the send the caller's key still holds: one sending, sent or
-// unknown, or one that failed after its upload or its file went. Any other
+// unknown, or one that failed after its upload or its text went. Any other
 // failed send frees the key. A key naming a send to another chat is a bad
 // request.
 func (m *Messenger) keyed(client, chat string) (store.Outgoing, bool, error) {
@@ -535,7 +550,7 @@ func (m *Messenger) keyed(client, chat string) (store.Outgoing, bool, error) {
 	if err != nil || !ok {
 		return store.Outgoing{}, false, err
 	}
-	if p := progressOf(o); o.State == store.OutFailed && !p.uploaded() && !p.FileSent {
+	if p := progressOf(o); o.State == store.OutFailed && !p.uploaded() && !p.TextSent {
 		return store.Outgoing{}, false, nil
 	}
 	if o.ChatID != chat || o.Kind != outMessage {
@@ -545,8 +560,8 @@ func (m *Messenger) keyed(client, chat string) (store.Outgoing, bool, error) {
 }
 
 // resume sends again what is left of a failed send that holds its upload
-// or whose file went: under the same row and ID, reusing the upload, the
-// text alone after a file. Once in line it is not put in line again.
+// or whose text went: under the same row and ID, reusing the upload, the
+// file alone after its text. Once in line it is not put in line again.
 func (m *Messenger) resume(o store.Outgoing) (string, error) {
 	if err := m.writeGate(); err != nil {
 		return "", err
@@ -598,7 +613,7 @@ func (m *Messenger) SendState(messageID string) network.SendState {
 // One that may have reached Meta (a reaction, or a message being asked) is
 // unknown and never sent again. A send that never asked a message (its
 // turn never came, or only its upload went) failed: refused, or unclear
-// when its file went; its key sends it again with what it has.
+// when its text went; its key sends it again with what it has.
 func (m *Messenger) forgetCutOff() {
 	rows, err := m.st.OutgoingSending(Name)
 	if err != nil {
@@ -609,7 +624,7 @@ func (m *Messenger) forgetCutOff() {
 		switch {
 		case o.Kind != outMessage || p.Asking:
 			_ = m.st.SetOutgoingState(Name, o.ID, store.OutUnknown, "")
-		case p.FileSent:
+		case p.TextSent:
 			_ = m.st.SetOutgoingState(Name, o.ID, store.OutFailed, string(wire.Unclear))
 		default:
 			_ = m.st.SetOutgoingState(Name, o.ID, store.OutFailed, string(wire.Refused))
@@ -751,12 +766,13 @@ func (m *Messenger) settle(id, lineID string) {
 	_ = m.st.SetOutgoingState(Name, id, store.OutSent, "")
 }
 
-// deliver sends one send, if it is still sending: its file (uploaded
-// first, unless an earlier try uploaded it), then its text, each a message
-// of its own, on the chat's unencrypted thread when the send was made with
-// an offline threading ID, else through the encrypted side. The first
-// message carries the reply. A message whose answer may have reached him
-// leaves the send sending.
+// deliver sends one send, if it is still sending: its file uploaded first
+// (unless an earlier try uploaded it), then its text, then the file, each
+// a message of its own, as Instagram's writes send them; on the chat's
+// unencrypted thread when the send was made with an offline threading ID,
+// else through the encrypted side. The text carries the reply. Each
+// request has its own budget (writeWait). A message whose answer may have
+// reached Meta leaves the send sending.
 func (m *Messenger) deliver(id string) {
 	o, ok, err := m.st.Outgoing(Name, id)
 	if err != nil || !ok || o.State != store.OutSending {
@@ -767,14 +783,12 @@ func (m *Messenger) deliver(id string) {
 		m.fail(id, wire.Internal)
 		return
 	}
-	ctx, cancel := m.writeCtx()
-	defer cancel()
 	gen, w := m.writer()
 	if w == nil {
 		m.fail(id, wire.Refused)
 		return
 	}
-	s := &sender{m: m, ctx: ctx, gen: gen, w: w, o: o, req: req, p: progressOf(o)}
+	s := &sender{m: m, gen: gen, w: w, o: o, req: req, p: progressOf(o)}
 	if s.encrypted() {
 		if s.jid, err = watypes.ParseJID(o.ChatID); err != nil {
 			m.fail(id, wire.Internal)
@@ -785,8 +799,9 @@ func (m *Messenger) deliver(id string) {
 		return
 	}
 	reply, _ := s.replyLine()
-	if req.File != "" && !s.p.FileSent {
-		data, err := readSendFile(req)
+	var data []byte
+	if req.File != "" {
+		data, err = readSendFile(req)
 		if err != nil && !s.p.uploaded() {
 			m.fail(id, wire.KindOf(err))
 			return
@@ -797,7 +812,9 @@ func (m *Messenger) deliver(id string) {
 				return
 			}
 		}
-		lineID, ms, out := s.message(true, reply)
+	}
+	if req.Text != "" && !s.p.TextSent {
+		lineID, ms, out := s.message(false, reply)
 		switch out {
 		case sentMaybe:
 			return // it stays sending
@@ -805,42 +822,41 @@ func (m *Messenger) deliver(id string) {
 			m.fail(id, wire.Refused)
 			return
 		}
-		m.storeSent(o.ChatID, lineID, req.Kind, "", reply.ID, data, ms)
-		if req.Text == "" {
+		m.storeSent(o.ChatID, lineID, "text", req.Text, reply.ID, nil, ms)
+		if req.File == "" {
 			m.settle(id, lineID)
 			m.changed()
 			return
 		}
-		s.p.FileSent, s.p.FileLineID, s.p.Asking = true, lineID, false
+		s.p.TextSent, s.p.TextLineID, s.p.Asking = true, lineID, false
 		if m.keepProgress(id, s.p) != nil {
-			return // the file went but that is not kept: it stays sending, and is unknown at the next start
+			return // the text went but that is not kept: it stays sending, and is unknown at the next start
 		}
 		m.changed()
-		reply = store.Line{} // the reply went with the file
-	} else if s.p.FileSent {
-		reply = store.Line{}
 	}
-	lineID, ms, out := s.message(false, reply)
+	if s.p.TextSent {
+		reply = store.Line{} // the reply went with the text
+	}
+	lineID, ms, out := s.message(true, reply)
 	switch out {
 	case sentMaybe:
 		return // it stays sending
 	case sentRefused:
-		if s.p.FileSent {
-			m.fail(id, wire.Unclear) // its file went, the text did not: the key's next send is the text alone
+		if s.p.TextSent {
+			m.fail(id, wire.Unclear) // its text went, the file did not: the key's next send is the file alone
 		} else {
 			m.fail(id, wire.Refused)
 		}
 		return
 	}
-	m.storeSent(o.ChatID, lineID, "text", req.Text, reply.ID, nil, ms)
-	m.settle(id, lineID)
+	m.storeSent(o.ChatID, lineID, req.Kind, "", reply.ID, data, ms)
+	m.settle(id, cmp.Or(s.p.TextLineID, lineID)) // the send's line is its text's, as its ID is
 	m.changed()
 }
 
 // sender is one delivery of a send.
 type sender struct {
 	m      *Messenger
-	ctx    context.Context
 	gen    int
 	w      msgrWriter
 	o      store.Outgoing
@@ -875,14 +891,26 @@ func (s *sender) replyLine() (store.Line, bool) {
 	return l, true
 }
 
-// upload uploads the send's file once and keeps what Meta gave for it in
-// the row before any message goes: the attachment ID on an unencrypted
-// thread (meta.Upload), else the encrypted file's transport (UploadFB),
-// built as the connector's reuploadMediaToWhatsApp builds it.
+// asking keeps in the row that a message is being asked. It runs inside
+// the request, after the pace let it go, just before the client is asked,
+// so a stop while the send waits its turn leaves it resendable.
+func (s *sender) asking() error {
+	s.p.Asking = true
+	return s.m.keepProgress(s.o.ID, s.p)
+}
+
+// upload uploads the send's file once, with a budget of its own, and keeps
+// what Meta gave for it in the row before any message goes: the
+// attachment ID on an unencrypted thread (meta.Upload), else the encrypted
+// file's transport (UploadFB), built as the connector's
+// reuploadMediaToWhatsApp builds it, with a thumbnail size Messenger's
+// apps need: a photo's or video's own (clamped to 400), else 400×400.
 func (s *sender) upload(data []byte) error {
+	ctx, cancel := s.m.writeCtx()
+	defer cancel()
 	if s.encrypted() {
 		var up whatsmeow.UploadResponse
-		if _, _, err := s.m.ask(s.ctx, s.gen, func(ctx context.Context) (err error) {
+		if _, _, err := s.m.ask(ctx, s.gen, func(ctx context.Context) (err error) {
 			up, err = s.w.UploadFB(ctx, data, mediaTypeOf(s.req.Kind))
 			return err
 		}); err != nil {
@@ -891,15 +919,13 @@ func (s *sender) upload(data []byte) error {
 		if up.DirectPath == "" {
 			return errRefused
 		}
-		width, height := 0, 0
-		if s.req.Kind == "photo" {
-			if cfg, _, err := image.DecodeConfig(bytes.NewReader(data)); err == nil {
-				width, height = cfg.Width, cfg.Height
-			}
-		}
+		width, height := mediaSize(s.req.Kind, data)
 		tw, th := clampTo400(width, height)
-		if tw == 0 && s.req.Kind == "photo" {
+		if tw <= 0 || th <= 0 {
 			tw, th = 400, 400
+		}
+		if width <= 0 || height <= 0 {
+			width, height = tw, th // never 0×0
 		}
 		mimetype := s.req.Mimetype
 		b, err := proto.Marshal(&waMediaTransport.WAMediaTransport{
@@ -921,7 +947,7 @@ func (s *sender) upload(data []byte) error {
 		s.p.Upload, s.p.Width, s.p.Height = b, width, height
 	} else {
 		var resp *types.MercuryUploadResponse
-		if _, _, err := s.m.ask(s.ctx, s.gen, func(ctx context.Context) (err error) {
+		if _, _, err := s.m.ask(ctx, s.gen, func(ctx context.Context) (err error) {
 			resp, err = s.w.Upload(ctx, s.thread, &httpclient.MercuryUploadMedia{Filename: s.req.FileName, MimeType: s.req.Mimetype, MediaData: data})
 			return err
 		}); err != nil {
@@ -937,6 +963,65 @@ func (s *sender) upload(data []byte) error {
 		s.p.Attachment = fbid
 	}
 	return s.m.keepProgress(s.o.ID, s.p)
+}
+
+// mediaSize is a photo's or video's size, read from the file, or 0, 0.
+func mediaSize(kind string, data []byte) (int, int) {
+	switch kind {
+	case "photo":
+		if cfg, _, err := image.DecodeConfig(bytes.NewReader(data)); err == nil {
+			return cfg.Width, cfg.Height
+		}
+	case "video":
+		return mp4Size(data)
+	}
+	return 0, 0
+}
+
+// mp4Size is an MP4 or QuickTime video's size: the first track header
+// (moov/trak/tkhd) with one, or 0, 0. A track header's width and height
+// are 16.16 fixed-point numbers at its end (ISO/IEC 14496-12 §8.3.2).
+func mp4Size(data []byte) (int, int) {
+	var walk func(b []byte) (int, int)
+	walk = func(b []byte) (int, int) {
+		for len(b) >= 8 {
+			size, head := uint64(binary.BigEndian.Uint32(b)), uint64(8)
+			typ := string(b[4:8])
+			switch size {
+			case 0:
+				size = uint64(len(b))
+			case 1:
+				if len(b) < 16 {
+					return 0, 0
+				}
+				size, head = binary.BigEndian.Uint64(b[8:16]), 16
+			}
+			if size < head || size > uint64(len(b)) {
+				return 0, 0
+			}
+			body := b[head:size]
+			switch typ {
+			case "moov", "trak":
+				if w, h := walk(body); w > 0 && h > 0 {
+					return w, h
+				}
+			case "tkhd":
+				at := 4 + 72 // version 0: after version and flags, 72 bytes to the width
+				if len(body) > 0 && body[0] == 1 {
+					at = 4 + 84
+				}
+				if len(body) >= at+8 {
+					w, h := int(binary.BigEndian.Uint32(body[at:])>>16), int(binary.BigEndian.Uint32(body[at+4:])>>16)
+					if w > 0 && h > 0 {
+						return w, h
+					}
+				}
+			}
+			b = b[size:]
+		}
+		return 0, 0
+	}
+	return walk(data)
 }
 
 // mediaTypeOf is the media type an encrypted file is uploaded as.
@@ -965,13 +1050,9 @@ func clampTo400(w, h int) (int, int) {
 }
 
 // message asks Meta one message of the send, the file's or the text's,
-// keeping in the row first that it is being asked (so a stop during it is
-// unknown at the next start, never sent again).
+// keeping in the row, as its request leaves, that it is being asked (so a
+// stop during it is unknown at the next start, never sent again).
 func (s *sender) message(file bool, reply store.Line) (lineID string, ms int64, out sendOutcome) {
-	s.p.Asking = true
-	if s.m.keepProgress(s.o.ID, s.p) != nil {
-		return "", 0, sentRefused // nothing asked
-	}
 	if s.encrypted() {
 		id := s.o.ID
 		if file && s.req.FileID != "" {
@@ -1011,7 +1092,7 @@ func (s *sender) message(file bool, reply store.Line) (lineID string, ms int64, 
 }
 
 // content is an encrypted message's content: the text, or the uploaded
-// file as a photo, video or document (no caption: its text goes after it).
+// file as a photo, video or document (no caption: its text went before it).
 func (s *sender) content(file bool) (*waConsumerApplication.ConsumerApplication, error) {
 	if !file {
 		return consumerApp(&waConsumerApplication.ConsumerApplication_Content{
@@ -1053,8 +1134,13 @@ func (s *sender) content(file bool) (*waConsumerApplication.ConsumerApplication,
 // sendFB asks whatsmeow to send one encrypted message under id, which is
 // then its line's ID.
 func (s *sender) sendFB(id string, app *waConsumerApplication.ConsumerApplication, md *waMsgApplication.MessageApplication_Metadata) (string, int64, sendOutcome) {
+	ctx, cancel := s.m.writeCtx()
+	defer cancel()
 	var resp whatsmeow.SendResponse
-	ran, raw, err := s.m.ask(s.ctx, s.gen, func(ctx context.Context) (err error) {
+	ran, raw, err := s.m.ask(ctx, s.gen, func(ctx context.Context) (err error) {
+		if err := s.asking(); err != nil {
+			return err // nothing asked
+		}
 		resp, err = s.w.SendFBMessage(ctx, s.jid, app, md, whatsmeow.SendRequestExtra{ID: watypes.MessageID(id)})
 		return err
 	})
@@ -1075,7 +1161,9 @@ func (s *sender) sendFB(id string, app *waConsumerApplication.ConsumerApplicatio
 // ID its optimistic message became (sent), a failure (refused), or neither
 // (its echo settles it).
 func (s *sender) sendTask(task *socket.SendMessageTask, otid string) (string, int64, sendOutcome) {
-	resp, ran, raw, err := s.m.execute(s.ctx, s.gen, s.w, task)
+	ctx, cancel := s.m.writeCtx()
+	defer cancel()
+	resp, ran, raw, err := s.m.executeThen(ctx, s.gen, s.w, task, s.asking)
 	if err != nil {
 		if ran && unsure(raw) {
 			return "", 0, sentMaybe
@@ -1161,7 +1249,7 @@ func (m *Messenger) echoed(otid, lineID string) {
 		return
 	}
 	o, ok, err := m.st.Outgoing(Name, otidPrefix+otid)
-	if err != nil || !ok || o.Kind != outMessage || (o.State == store.OutSent && o.LineID == lineID) {
+	if err != nil || !ok || o.Kind != outMessage || o.State == store.OutSent || withFile(o) {
 		return
 	}
 	m.settle(o.ID, lineID)
@@ -1175,10 +1263,17 @@ func (m *Messenger) echoedEncrypted(id string) {
 		return
 	}
 	o, ok, err := m.st.Outgoing(Name, id)
-	if err != nil || !ok || o.Kind != outMessage || o.State == store.OutSent {
+	if err != nil || !ok || o.Kind != outMessage || o.State == store.OutSent || withFile(o) {
 		return
 	}
 	m.settle(o.ID, id)
+}
+
+// withFile reports whether a send is a text with a file: its text's echo
+// says nothing of its file, so only its delivery settles it.
+func withFile(o store.Outgoing) bool {
+	var req sendRequest
+	return json.Unmarshal(o.Request, &req) == nil && req.File != "" && req.Text != ""
 }
 
 // React sends his reaction to a held line, or with an empty emoji removes
@@ -1363,14 +1458,16 @@ func (m *Messenger) MarkRead(ctx context.Context, chatID, through string) error 
 	}
 	key, threaded := m.threadOfChat(chat)
 	if (metaAt > 0 && threaded) || len(senders) > 0 {
-		wctx, cancel := m.writeCtx()
-		defer cancel()
 		gen, w := m.writer()
 		if w == nil {
 			return errNotConnected
 		}
+		// Each receipt has a budget of its own, as each waits its turn.
 		if metaAt > 0 && threaded {
-			if _, ran, raw, err := m.execute(wctx, gen, w, &socket.ThreadMarkReadTask{ThreadId: key, LastReadWatermarkTs: metaAt, SyncGroup: 1}); err != nil {
+			wctx, cancel := m.writeCtx()
+			_, ran, raw, err := m.execute(wctx, gen, w, &socket.ThreadMarkReadTask{ThreadId: key, LastReadWatermarkTs: metaAt, SyncGroup: 1})
+			cancel()
+			if err != nil {
 				return writeErr(ran, raw, err)
 			}
 		}
@@ -1385,9 +1482,12 @@ func (m *Messenger) MarkRead(ctx context.Context, chatID, through string) error 
 				if by != "" {
 					sender = watypes.NewJID(by, watypes.MessengerServer)
 				}
-				if ran, raw, err := m.ask(wctx, gen, func(ctx context.Context) error {
+				wctx, cancel := m.writeCtx()
+				ran, raw, err := m.ask(wctx, gen, func(ctx context.Context) error {
 					return w.MarkRead(ctx, ids[by], now, jid, sender)
-				}); err != nil {
+				})
+				cancel()
+				if err != nil {
 					return writeErr(ran, raw, err)
 				}
 			}
