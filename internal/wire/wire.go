@@ -44,6 +44,10 @@ const (
 	Checkpoint Kind = "checkpoint"
 	PinWrong   Kind = "pinWrong"
 	PinLimit   Kind = "pinLimit"
+	// RegistrationUnclear: Messenger's registration of Pllum's device was
+	// asked and its answer lost, so a device may exist; a `state` kind on
+	// reconnectNeeded, kept until a new sign-in.
+	RegistrationUnclear Kind = "registrationUnclear"
 )
 
 // Kinds lists every kind of protocol 1.
@@ -51,7 +55,7 @@ var Kinds = []Kind{
 	BadRequest, UnknownMethod, UnknownNetwork, NotConnected, Offline, NotFound,
 	NotOnNetwork, Refused, Unclear, RateLimited, TooLarge, MediaGone,
 	Unsupported, StoreKey, Outdated, Timeout, Internal,
-	Checkpoint, PinWrong, PinLimit,
+	Checkpoint, PinWrong, PinLimit, RegistrationUnclear,
 }
 
 // Error is an error that carries only its kind, so nothing private can ride

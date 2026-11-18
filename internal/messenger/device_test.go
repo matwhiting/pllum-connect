@@ -45,9 +45,11 @@ func TestTheDeviceIsRegisteredOnce(t *testing.T) {
 	}
 }
 
-// A registration whose answer was lost is unclear (never "sign in again"),
-// and the next sign-in registers the same keys and the same Facebook device
-// ID, so Meta sees the same device, not a second one.
+// A registration whose answer was lost may have made a device: it is
+// reconnectNeeded with kind registrationUnclear (he checks Facebook's
+// devices before signing in again), and a new sign-in in the same helper
+// registers the same keys and Facebook device ID, so Meta sees the same
+// device, not a second one.
 func TestAFailedRegistrationReusesItsKeys(t *testing.T) {
 	h := newHarness(t)
 	h.f.registerErrs = []error{errors.New("invented: the answer was lost")}
@@ -56,13 +58,19 @@ func TestAFailedRegistrationReusesItsKeys(t *testing.T) {
 	}
 	eventually(t, "the failed registration", func() bool {
 		s, k := h.state()
-		return s == network.NotConnected && k == string(wire.Unclear)
+		return s == network.ReconnectNeeded && k == string(wire.RegistrationUnclear)
 	})
 	if c := h.m.GateCounts().(GateCounts); c.Registered {
 		t.Fatalf("a failed registration counts as registered")
 	}
 
-	h.signIn(t)
+	if err := h.m.Login(context.Background(), network.LoginParams{Method: network.LoginSession, Session: newSession()}); err != nil {
+		t.Fatalf("Login: %v", err)
+	}
+	eventually(t, "the encrypted connection", func() bool {
+		c := h.m.GateCounts().(GateCounts)
+		return c.Registered && c.E2EEConnected
+	})
 	h.f.mu.Lock()
 	keys, ids, n := h.f.regKeys, h.f.regUUIDs, h.f.registers
 	h.f.mu.Unlock()
@@ -71,6 +79,83 @@ func TestAFailedRegistrationReusesItsKeys(t *testing.T) {
 	}
 	if keys[0] != keys[1] || ids[0] != ids[1] {
 		t.Fatalf("the retry registered new keys or a new device ID")
+	}
+}
+
+// newSession is an invented session of a new sign-in: other cookies.
+func newSession() network.Session {
+	return network.Session{"xs": "xs-invented-new", "c_user": "2000001", "datr": "datr-invented-new"}
+}
+
+// B4 review I2: a registration whose answer was lost is kept as a block. A
+// restart, and the same session sent again (Pllum sends the saved session
+// at every start), ask Meta nothing, so no second device is registered on
+// their own. A new sign-in (another session) registers exactly once, and
+// that clears it.
+func TestAnUnclearRegistrationIsKeptUntilANewSignIn(t *testing.T) {
+	f := newFakeMeta()
+	dir := filepath.Join(t.TempDir(), "connect")
+	h := newHarnessOver(t, dir, f)
+	f.registerErrs = []error{errors.New("invented: the answer was lost")}
+	if err := h.m.Login(context.Background(), network.LoginParams{Method: network.LoginSession, Session: validSession()}); err != nil {
+		t.Fatalf("Login: %v", err)
+	}
+	eventually(t, "the failed registration", func() bool {
+		s, k := h.state()
+		return s == network.ReconnectNeeded && k == string(wire.RegistrationUnclear)
+	})
+	if k, blocked := h.m.pace.Blocked(); !blocked || k != meta.ReconnectNeeded {
+		t.Errorf("the pace is %s, %v; want blocked", k, blocked)
+	}
+	h.close()
+
+	from := len(f.requests())
+	h = newHarnessOver(t, dir, f)
+	if s, k := h.state(); s != network.ReconnectNeeded || k != string(wire.RegistrationUnclear) {
+		t.Errorf("after a restart the state is %s/%s, want reconnectNeeded/registrationUnclear", s, k)
+	}
+	if err := h.m.Login(context.Background(), network.LoginParams{Method: network.LoginSession, Session: validSession()}); err != nil {
+		t.Fatalf("Login: %v", err)
+	}
+	h.settle()
+	if n := len(f.requests()) - from; n != 0 {
+		t.Errorf("the same session after a restart made %d requests, want none", n)
+	}
+	f.mu.Lock()
+	n := f.registers
+	f.mu.Unlock()
+	if n != 1 {
+		t.Fatalf("Meta was asked to register %d times, want 1", n)
+	}
+	if s, k := h.state(); s != network.ReconnectNeeded || k != string(wire.RegistrationUnclear) {
+		t.Errorf("after the same session the state is %s/%s", s, k)
+	}
+
+	// He signs in again in the window: one registration, and it clears.
+	if err := h.m.Login(context.Background(), network.LoginParams{Method: network.LoginSession, Session: newSession()}); err != nil {
+		t.Fatalf("Login: %v", err)
+	}
+	eventually(t, "the encrypted connection", func() bool {
+		c := h.m.GateCounts().(GateCounts)
+		return c.Registered && c.E2EEConnected
+	})
+	h.close()
+	h = newHarnessOver(t, dir, f)
+	if s, _ := h.state(); s == network.ReconnectNeeded {
+		t.Errorf("after a registration that went, a restart is still %s", s)
+	}
+	if err := h.m.Login(context.Background(), network.LoginParams{Method: network.LoginSession, Session: newSession()}); err != nil {
+		t.Fatalf("Login: %v", err)
+	}
+	eventually(t, "the encrypted connection", func() bool {
+		c := h.m.GateCounts().(GateCounts)
+		return c.Registered && c.E2EEConnected
+	})
+	f.mu.Lock()
+	n = f.registers
+	f.mu.Unlock()
+	if n != 2 {
+		t.Errorf("Meta was asked to register %d times, want 2 (the lost one, then the new sign-in's)", n)
 	}
 }
 

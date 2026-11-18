@@ -78,6 +78,9 @@ var (
 	errNotFound     = &wire.Error{Kind: wire.NotFound}
 	errUnsupported  = &wire.Error{Kind: wire.Unsupported}
 	errUnclear      = &wire.Error{Kind: wire.Unclear}
+	// errRegistrationUnclear is a registration asked of Meta whose answer was
+	// lost (or whose device could not be saved): a device may exist.
+	errRegistrationUnclear = &wire.Error{Kind: wire.RegistrationUnclear}
 )
 
 // msgrClient is what the adapter uses of messagix's client: the messages
@@ -604,6 +607,19 @@ func (m *Messenger) beginE2EE(gen int, cli msgrClient, fbid int64) {
 		// standard error, as in the main handler.
 		defer func() { _ = recover() }()
 		if err := m.connectE2EE(ctx, gen, cli, fbid); err != nil {
+			if wire.KindOf(err) == wire.RegistrationUnclear {
+				// A device may exist: kept as the session's block, so
+				// nothing registers again (with new keys, after a restart)
+				// until he signs in again.
+				m.mu.Lock()
+				if gen == m.gen {
+					m.e2eeFailed = true
+				}
+				m.mu.Unlock()
+				m.pace.Fail(meta.ReconnectNeeded)
+				m.pushedBack(gen, wire.RegistrationUnclear)
+				return
+			}
 			if k := wire.KindOf(err); k == wire.Unclear || k == wire.Internal {
 				m.mu.Lock()
 				if gen == m.gen {
@@ -774,8 +790,19 @@ func stateFor(kind wire.Kind) (s network.State, k wire.Kind, ok bool) {
 		return network.ReconnectNeeded, "", true
 	case meta.Banned:
 		return network.Banned, "", true
+	case wire.RegistrationUnclear:
+		return network.ReconnectNeeded, wire.RegistrationUnclear, true
 	}
 	return "", "", false
+}
+
+// paceKind is what a block stops the pace with: a registration whose
+// answer was lost stops it as an ended session does.
+func paceKind(kind wire.Kind) wire.Kind {
+	if kind == wire.RegistrationUnclear {
+		return meta.ReconnectNeeded
+	}
+	return kind
 }
 
 // pushedBack: Meta asked him to confirm it is him, ended the session or
@@ -830,7 +857,7 @@ func (m *Messenger) keptBlock() (kind wire.Kind, hashes []string, ok bool) {
 // (never Clear: only a new session lifts it). m.mu is held.
 func (m *Messenger) holdBlock(kind wire.Kind) {
 	st, k, _ := stateFor(kind)
-	m.pace.Fail(kind)
+	m.pace.Fail(paceKind(kind))
 	m.setState(st, k)
 }
 

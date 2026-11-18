@@ -62,7 +62,10 @@ func (c realClient) PrepareE2EE() (e2eeClient, error) {
 // after it) keeps its unsaved device, keys and Facebook device ID, for the
 // next sign-in in this helper to register again: Meta finds the same keys
 // and keeps one device, where new keys would add a second. Its error is
-// unclear: it may have happened, and signing in again is not the fix. The
+// registrationUnclear: it may have happened, and the network keeps it as
+// the session's block (messenger.go), so neither a restart nor the same
+// session sent again registers anything (a restart would have only new
+// keys) until he signs in again. A registration that went clears it. The
 // device database is opened the first time, never at Start, so nothing is
 // made on disk until he signs in.
 func (m *Messenger) device(ctx context.Context, gen int, cli msgrClient, fbid int64) (dev *wastore.Device, registerMs int64, err error) {
@@ -112,14 +115,17 @@ func (m *Messenger) device(ctx context.Context, gen int, cli msgrClient, fbid in
 		case err != nil && !asked:
 			return nil, 0, err // refused before Meta was asked
 		case err != nil, dev.ID == nil:
-			return nil, 0, errUnclear
+			return nil, 0, errRegistrationUnclear
 		}
 	}
 	if err := dev.Save(ctx); err != nil {
-		return nil, 0, errUnclear
+		return nil, 0, errRegistrationUnclear
 	}
 	m.pending, m.pendingFor = nil, 0
 	m.dev = dev
+	if kind, _, ok := m.keptBlock(); ok && kind == wire.RegistrationUnclear {
+		_ = m.keep("block", "") // the device is registered and saved now
+	}
 	return dev, registerMs, nil
 }
 
