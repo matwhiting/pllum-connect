@@ -330,6 +330,12 @@ func (m *Messenger) ingest(tbl *table.LSTable, source string) {
 		if c {
 			changed = true // a line held already, sent again, changes nothing
 		}
+		if _, mine := m.personOf(w.SenderId); mine {
+			m.echoed(w.OfflineThreadingId, w.MessageId) // his send's echo settles it (writes.go)
+		}
+	}
+	for _, r := range tbl.LSReplaceOptimsiticMessage {
+		m.echoed(r.OfflineThreadingId, r.MessageId)
 	}
 	for _, d := range tbl.LSDeleteMessage {
 		if chat, ok := m.placeKey(tc, d.ThreadKey); ok && d.MessageId != "" {
@@ -905,6 +911,9 @@ func (m *Messenger) applyEnc(chat string, w encWrites) (added int, changed bool,
 		got, err := m.st.PutMessage(Name, l)
 		if err != nil {
 			return added, changed, err
+		}
+		if l.FromMe {
+			m.echoedEncrypted(l.ID) // his send coming back settles it (writes.go)
 		}
 		if got {
 			added++

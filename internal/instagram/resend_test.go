@@ -159,7 +159,7 @@ func TestAnUploadIsAskedOnce(t *testing.T) {
 		{"a 500", &fakeOnce{err: fmt.Errorf("%w %d", httpclient.ErrUnexpectedError, 500)}, wire.Internal},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			resp, err := uploadOnce(context.Background(), tc.f, at, http.Header{}, media)
+			resp, err := meta.UploadOnce(context.Background(), tc.f, at, http.Header{}, media)
 			if tc.f.calls != 1 {
 				t.Errorf("%d requests, want exactly 1", tc.f.calls)
 			}
@@ -174,7 +174,7 @@ func TestAnUploadIsAskedOnce(t *testing.T) {
 
 	t.Run("a photo", func(t *testing.T) {
 		f := &fakeOnce{status: 200, body: `for (;;);{"payload":{"uploadID":"invented","metadata":[{"image_id":5550000000000002,"filename":"invented.png"}]}}`}
-		resp, err := uploadOnce(context.Background(), f, at, http.Header{}, media)
+		resp, err := meta.UploadOnce(context.Background(), f, at, http.Header{}, media)
 		if err != nil || f.calls != 1 {
 			t.Fatalf("uploadOnce = %v after %d requests", err, f.calls)
 		}

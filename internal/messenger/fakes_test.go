@@ -14,11 +14,16 @@ import (
 	"github.com/google/uuid"
 	"go.mau.fi/mautrix-meta/pkg/messagix"
 	"go.mau.fi/mautrix-meta/pkg/messagix/cookies"
+	"go.mau.fi/mautrix-meta/pkg/messagix/httpclient"
 	"go.mau.fi/mautrix-meta/pkg/messagix/securehistory"
 	"go.mau.fi/mautrix-meta/pkg/messagix/socket"
 	"go.mau.fi/mautrix-meta/pkg/messagix/table"
 	"go.mau.fi/mautrix-meta/pkg/messagix/types"
+	"go.mau.fi/whatsmeow"
+	armadillo "go.mau.fi/whatsmeow/proto"
 	"go.mau.fi/whatsmeow/proto/waAdv"
+	"go.mau.fi/whatsmeow/proto/waMediaTransport"
+	"go.mau.fi/whatsmeow/proto/waMsgApplication"
 	wastore "go.mau.fi/whatsmeow/store"
 	watypes "go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
@@ -186,6 +191,23 @@ type fakeMeta struct {
 	// taskErr fails the reads it returns an error for.
 	taskErr func(task socket.Task) error
 
+	// The writes (fakeWriter): every task ExecuteTasks was handed, write
+	// or not; the encrypted sends and read receipts; the files asked of
+	// the encrypted side (by direct path) and of the CDN (by address); the
+	// uploads. writeErrs fails a write by its name (a task's type, or the
+	// method's); answer is Meta's answer to a send (by default it takes it
+	// as "mid.$invented-sent-<otid>"); files are the bytes each direct path
+	// or address gives.
+	tasks       []socket.Task
+	fbSends     []fbSend
+	marks       []markCall
+	fbDownloads []string
+	cdnGets     []string
+	uploads     int
+	writeErrs   map[string]error
+	answer      func(t *socket.SendMessageTask) *table.LSTable
+	files       map[string][]byte
+
 	// clock is the time the pace runs on; calls are the requests made, with
 	// the time each went.
 	clock *fakeClock
@@ -200,7 +222,8 @@ type call struct {
 
 func newFakeMeta() *fakeMeta {
 	f := &fakeMeta{table: inbox(), e2ee: &fakeE2EE{}, history: &fakeHistory{},
-		folders: map[folderKey][]*table.LSTable{}, older: map[int64][]*table.LSTable{}, clock: newFakeClock()}
+		folders: map[folderKey][]*table.LSTable{}, older: map[int64][]*table.LSTable{}, clock: newFakeClock(),
+		writeErrs: map[string]error{}, files: map[string][]byte{}}
 	f.history.rec = func(name string) {
 		f.mu.Lock()
 		defer f.mu.Unlock()
@@ -697,6 +720,8 @@ func newHarnessOver(t *testing.T, dir string, f *fakeMeta) *harness {
 	})
 	h.m = New(st, h.dir, testKey, emit.For(Name)).WithGate()
 	h.m.newClient = h.f.newClient
+	h.m.newWriter = func(msgrClient, e2eeClient) msgrWriter { return fakeWriter{f} }
+	h.m.newDownloader = func(msgrClient) msgrDownloader { return fakeWriter{f} }
 	h.m.now = f.clock.Now
 	h.m.pageWait = 2 * time.Second
 	h.m.pace = &meta.Pace{Now: f.clock.Now, Sleep: f.clock.Sleep}
@@ -749,4 +774,157 @@ func eventually(t *testing.T, what string, ok func() bool) {
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
+}
+
+// fbSend is one encrypted send as SendFBMessage was asked it.
+type fbSend struct {
+	to   watypes.JID
+	msg  armadillo.RealMessageApplicationSub
+	meta *waMsgApplication.MessageApplication_Metadata
+	id   watypes.MessageID
+}
+
+// markCall is one encrypted read receipt as MarkRead was asked it.
+type markCall struct {
+	ids          []watypes.MessageID
+	chat, sender watypes.JID
+}
+
+// fakeWriter is Meta's side of every write, and of the files fetched.
+type fakeWriter struct{ f *fakeMeta }
+
+// taskName is a task's type, as the fake records it.
+func taskName(task socket.Task) string {
+	switch task.(type) {
+	case *socket.SendMessageTask:
+		return "SendMessageTask"
+	case *socket.SendReactionTask:
+		return "SendReactionTask"
+	case *socket.ThreadMarkReadTask:
+		return "ThreadMarkReadTask"
+	case *socket.MuteThreadTask:
+		return "MuteThreadTask"
+	}
+	return fmt.Sprintf("%T", task)
+}
+
+// setErr fails the write called name with err (nil clears it).
+func (f *fakeMeta) setErr(name string, err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.writeErrs[name] = err
+}
+
+// count is how many requests called name were made.
+func (f *fakeMeta) count(name string) int {
+	n := 0
+	for _, c := range f.requests() {
+		if c.name == name {
+			n++
+		}
+	}
+	return n
+}
+
+// written are the tasks ExecuteTasks was handed, by name.
+func (f *fakeMeta) written() []socket.Task {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]socket.Task{}, f.tasks...)
+}
+
+func (w fakeWriter) ExecuteTasks(ctx context.Context, tasks ...socket.Task) (*table.LSTable, error) {
+	f := w.f
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.tasks = append(f.tasks, tasks...)
+	if len(tasks) != 1 {
+		f.record("ExecuteTasks")
+		return nil, errors.New("invented: one task at a time")
+	}
+	name := taskName(tasks[0])
+	f.record(name)
+	if err := f.writeErrs[name]; err != nil {
+		return nil, err
+	}
+	if t, ok := tasks[0].(*socket.SendMessageTask); ok {
+		if f.answer != nil {
+			return f.answer(t), nil
+		}
+		otid := strconv.FormatInt(t.Otid, 10)
+		return &table.LSTable{LSReplaceOptimsiticMessage: []*table.LSReplaceOptimsiticMessage{
+			{OfflineThreadingId: otid, MessageId: "mid.$invented-sent-" + otid}}}, nil
+	}
+	return &table.LSTable{}, nil
+}
+
+func (w fakeWriter) SendFBMessage(ctx context.Context, to watypes.JID, message armadillo.RealMessageApplicationSub, metadata *waMsgApplication.MessageApplication_Metadata, extra ...whatsmeow.SendRequestExtra) (whatsmeow.SendResponse, error) {
+	f := w.f
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.record("SendFBMessage")
+	s := fbSend{to: to, msg: message, meta: metadata}
+	if len(extra) == 1 {
+		s.id = extra[0].ID
+	}
+	f.fbSends = append(f.fbSends, s)
+	if err := f.writeErrs["SendFBMessage"]; err != nil {
+		return whatsmeow.SendResponse{}, err
+	}
+	return whatsmeow.SendResponse{Timestamp: f.clock.Now(), ID: s.id}, nil
+}
+
+func (w fakeWriter) MarkRead(ctx context.Context, ids []watypes.MessageID, timestamp time.Time, chat, sender watypes.JID, receiptTypeExtra ...watypes.ReceiptType) error {
+	f := w.f
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.record("MarkRead")
+	f.marks = append(f.marks, markCall{ids: append([]watypes.MessageID{}, ids...), chat: chat, sender: sender})
+	return f.writeErrs["MarkRead"]
+}
+
+func (w fakeWriter) DownloadFB(ctx context.Context, transport *waMediaTransport.WAMediaTransport_Integral, mediaType whatsmeow.MediaType) ([]byte, error) {
+	f := w.f
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.record("DownloadFB")
+	f.fbDownloads = append(f.fbDownloads, transport.GetDirectPath())
+	if err := f.writeErrs["DownloadFB"]; err != nil {
+		return nil, err
+	}
+	data, ok := f.files[transport.GetDirectPath()]
+	if !ok {
+		return nil, whatsmeow.ErrMediaDownloadFailedWith404
+	}
+	return data, nil
+}
+
+func (w fakeWriter) Upload(ctx context.Context, threadID int64, media *httpclient.MercuryUploadMedia) (*types.MercuryUploadResponse, error) {
+	f := w.f
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.record("Upload")
+	f.uploads++
+	if err := f.writeErrs["Upload"]; err != nil {
+		return nil, err
+	}
+	fbid := int64(5550000000000001)
+	return &types.MercuryUploadResponse{Payload: types.MediaPayloads{RealMetadata: &types.FileMetadata{ImageID: types.StringOrInt(fbid)}}}, nil
+}
+
+// Download is the CDN: the file at an address, or a 404.
+func (w fakeWriter) Download(ctx context.Context, url string) ([]byte, error) {
+	f := w.f
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.record("Download")
+	f.cdnGets = append(f.cdnGets, url)
+	if err := f.writeErrs["Download"]; err != nil {
+		return nil, err
+	}
+	data, ok := f.files[url]
+	if !ok {
+		return nil, statusError(404)
+	}
+	return data, nil
 }

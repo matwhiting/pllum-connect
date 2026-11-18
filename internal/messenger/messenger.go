@@ -16,7 +16,9 @@
 // everything the encrypted socket says of the encrypted chats (their lines,
 // receipts and undecryptable messages) and, once his PIN has restored it,
 // his backup of them (history.go). The gate (gate.go) counts what it sees.
-// It sends nothing yet: every write method is `unsupported`.
+// It sends, reacts, marks read and mutes (writes.go: the group's main socket
+// tasks and whatsmeow's encrypted sends, nothing else, each sent at most
+// once), and fetches photos and stickers once each (media.go).
 //
 // Meta locks accounts that behave like a script, so every request goes
 // through one meta.Pace: one at a time, 2 to 4 s apart, none for a while
@@ -80,10 +82,11 @@ var (
 
 // msgrClient is what the adapter uses of messagix's client: the messages
 // page, the main (lightspeed) socket, the reads sent over it (ExecuteTasks
-// with FetchThreadsTask and FetchMessagesTask only, and the sync group
-// cursor those carry), the cookies (for the session event), and the
-// encrypted side's registration. *messagix.Client satisfies it through realClient; tests use
-// a fake.
+// with FetchThreadsTask and FetchMessagesTask only, which realClient
+// enforces, and the sync group cursor those carry), the cookies (for the
+// session event), and the encrypted side's registration. Its writes go
+// through msgrWriter (writes.go). *messagix.Client satisfies it through
+// realClient; tests use a fake.
 type msgrClient interface {
 	LoadMessagesPage(ctx context.Context) (types.UserInfo, *table.LSTable, error)
 	SetEventHandler(h messagix.EventHandler)
@@ -113,6 +116,21 @@ func newRealClient(ck *cookies.Cookies) msgrClient {
 	return realClient{messagix.NewClient(ck, zerolog.Nop(), &messagix.Config{LogRedactedLoginResponses: false})}
 }
 
+// ExecuteTasks hands Meta one of the two reads (a page of a folder's
+// threads, a page of a thread's history); any other task, a write above
+// all, is refused here and never reaches the client. The writes have their
+// own door, msgrWriter.
+func (c realClient) ExecuteTasks(ctx context.Context, tasks ...socket.Task) (*table.LSTable, error) {
+	if len(tasks) != 1 {
+		return nil, errNotAllowed
+	}
+	switch tasks[0].(type) {
+	case *socket.FetchThreadsTask, *socket.FetchMessagesTask:
+		return c.Client.ExecuteTasks(ctx, tasks...)
+	}
+	return nil, errNotAllowed
+}
+
 func (c realClient) History() historyClient {
 	return realHistory{c.Client.GetSecureHistoryClient()}
 }
@@ -125,12 +143,14 @@ type Messenger struct {
 	key  [32]byte
 	emit network.Emit
 
-	newClient func(ck *cookies.Cookies) msgrClient
-	pace      *meta.Pace
-	diff      *meta.SessionDiff
-	now       func() time.Time
-	gate      bool          // started with --gate: every sign-in lists every folder, and one page of restored history is sampled
-	pageWait  time.Duration // how long a page of history may take to come back on the socket
+	newClient     func(ck *cookies.Cookies) msgrClient
+	newWriter     func(cli msgrClient, e e2eeClient) msgrWriter // nil when the clients can't write
+	newDownloader func(cli msgrClient) msgrDownloader
+	pace          *meta.Pace
+	diff          *meta.SessionDiff
+	now           func() time.Time
+	gate          bool          // started with --gate: every sign-in lists every folder, and one page of restored history is sampled
+	pageWait      time.Duration // how long a page of history may take to come back on the socket
 
 	mu        sync.Mutex
 	started   bool
@@ -202,6 +222,17 @@ type Messenger struct {
 	chPending bool
 	chLast    time.Time
 
+	// the sends waiting their turn (writes.go)
+	smu      sync.Mutex
+	queue    []string
+	draining bool
+	busy     atomic.Int64 // sends in line or going
+
+	// the media files (media.go)
+	mmu      sync.Mutex
+	mlocks   map[string]*sync.Mutex
+	mediaCap int64
+
 	// testPrep, set only by tests, sees each encrypted message before it is
 	// worked out.
 	testPrep func(evt *events.FBMessage)
@@ -219,21 +250,25 @@ var (
 // Nothing is asked of Meta, and nothing is written, until a `login`.
 func New(st *store.Store, dir string, key [32]byte, emit network.Emit) *Messenger {
 	return &Messenger{
-		st:        st,
-		dir:       dir,
-		key:       key,
-		emit:      emit,
-		newClient: newRealClient,
-		pace:      &meta.Pace{},
-		diff:      meta.NewSessionDiff(meta.FacebookPage),
-		now:       time.Now,
-		pageWait:  pageWaitDefault,
-		state:     network.NotConnected,
-		values:    map[string]string{},
-		names:     map[int64]string{},
-		recent:    map[string]string{},
-		waiters:   map[int64]chan rangeNote{},
-		locks:     map[string]*sync.Mutex{},
+		st:            st,
+		dir:           dir,
+		key:           key,
+		emit:          emit,
+		newClient:     newRealClient,
+		newWriter:     writerFor,
+		newDownloader: downloaderFor,
+		pace:          &meta.Pace{},
+		diff:          meta.NewSessionDiff(meta.FacebookPage),
+		now:           time.Now,
+		pageWait:      pageWaitDefault,
+		state:         network.NotConnected,
+		values:        map[string]string{},
+		names:         map[int64]string{},
+		recent:        map[string]string{},
+		waiters:       map[int64]chan rangeNote{},
+		locks:         map[string]*sync.Mutex{},
+		mlocks:        map[string]*sync.Mutex{},
+		mediaCap:      mediaCap,
 	}
 }
 
@@ -271,6 +306,9 @@ func (m *Messenger) Start(ctx context.Context) error {
 	if kind, _, ok := m.keptBlock(); ok {
 		m.holdBlock(kind)
 	}
+	// A write that may have reached Meta before an earlier run stopped is
+	// never sent again.
+	m.forgetCutOff()
 	return nil
 }
 
@@ -370,37 +408,6 @@ func (m *Messenger) Logout(ctx context.Context) error {
 // Nudge does nothing: the gate never retries on its own, and the encrypted
 // socket reconnects on the library's timing.
 func (m *Messenger) Nudge() {}
-
-// The writes come with Task B3; until then each is unsupported, and nothing
-// is ever sent.
-
-func (m *Messenger) Send(ctx context.Context, o network.Outgoing) (string, error) {
-	return "", errUnsupported
-}
-
-func (m *Messenger) SendState(messageID string) network.SendState {
-	return network.SendState{State: network.SendUnknown}
-}
-
-func (m *Messenger) SendFor(clientID string) (string, error) { return "", nil }
-
-func (m *Messenger) React(ctx context.Context, chatID, messageID, emoji, transactionID string) error {
-	return errUnsupported
-}
-
-func (m *Messenger) MarkRead(ctx context.Context, chatID, through string) error {
-	return errUnsupported
-}
-
-func (m *Messenger) MarkUnread(ctx context.Context, chatID string) error { return errUnsupported }
-
-func (m *Messenger) SetMuted(ctx context.Context, chatID string, muted bool) error {
-	return errUnsupported
-}
-
-func (m *Messenger) Media(ctx context.Context, chatID, messageID string) (string, error) {
-	return "", errUnsupported
-}
 
 // Stop disconnects, waits briefly for the network's work to end, and closes
 // the device database. The store is the server's to close.

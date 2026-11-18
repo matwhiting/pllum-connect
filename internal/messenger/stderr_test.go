@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -32,7 +33,7 @@ import (
 const canaryCookie = "cookie-canary-msgr-3d7a"
 
 // A whole session over the wire, groups, older one-to-ones, the listing,
-// the backfill, older pages, a checkpoint and a sign-out, writes nothing to
+// the backfill, older pages, the writes, a checkpoint and a sign-out, writes nothing to
 // standard error, and the cookie goes out only in session events.
 func TestNothingReachesStderr(t *testing.T) {
 	quiet.Init()
@@ -75,6 +76,7 @@ func TestNothingReachesStderr(t *testing.T) {
 	tbl.LSDeleteThenInsertContact = []*table.LSDeleteThenInsertContact{{Id: aliceFBID, Name: canary + " Alice"}}
 	f.table = tbl
 	f.folders[inboxOne] = []*table.LSTable{threadsPage(inboxOne, false, thread(2000088, table.ONE_TO_ONE, at, "pending"))}
+	f.writeErrs["MuteThreadTask"] = errors.New(canary + " invented failure")
 	// Every thread's history goes on and on, so groups are never complete.
 	pages := 0
 	f.olderFn = func(key int64) *table.LSTable {
@@ -93,6 +95,8 @@ func TestNothingReachesStderr(t *testing.T) {
 			defer mmu.Unlock()
 			m = New(st, dir, key, emit.For(Name)).WithGate()
 			m.newClient = f.newClient
+			m.newWriter = func(msgrClient, e2eeClient) msgrWriter { return fakeWriter{f} }
+			m.newDownloader = func(msgrClient) msgrDownloader { return fakeWriter{f} }
 			m.now = f.clock.Now
 			m.pageWait = time.Second
 			m.pace = &meta.Pace{Now: f.clock.Now, Sleep: f.clock.Sleep}
@@ -194,6 +198,19 @@ func TestNothingReachesStderr(t *testing.T) {
 		{"search", map[string]any{"text": canary, "chatIDs": []string{}, "limit": 50}},
 		{"findChats", map[string]any{"query": canary, "limit": 20}},
 		{"encryptedHistory", map[string]any{}},
+		// The writes (Task B3): a group's send, an encrypted send, a
+		// reaction, read receipts, mutes (one Meta fails with a canary in
+		// its error), and media.
+		{"send", map[string]any{"chatID": fmt.Sprint(groupOne), "text": canary + " sent", "clientID": "key-" + canary}},
+		{"send", map[string]any{"chatID": fmt.Sprint(aliceFBID) + "@msgr", "text": canary + " sent encrypted", "clientID": "key-e-" + canary}},
+		{"sendStatus", map[string]any{"clientID": "key-" + canary}},
+		{"react", map[string]any{"chatID": fmt.Sprint(groupOne), "messageID": "mid.$invented-s2", "emoji": "👍", "transactionID": "txn-" + canary}},
+		{"markRead", map[string]any{"chatID": fmt.Sprint(groupOne), "through": "mid.$invented-s2"}},
+		{"markUnread", map[string]any{"chatID": fmt.Sprint(groupOne)}},
+		{"setMuted", map[string]any{"chatID": fmt.Sprint(groupOne), "muted": true}},
+		{"setMuted", map[string]any{"chatID": fmt.Sprint(aliceFBID) + "@msgr", "muted": true}},
+		{"media", map[string]any{"chatID": fmt.Sprint(groupOne), "messageID": "mid.$invented-s2"}},
+		{"media", map[string]any{"chatID": fmt.Sprint(groupOne), "messageID": "mid.$invented-" + canary}},
 		{"messages", map[string]any{"chatID": "unknown-" + canary, "limit": 5}},
 		{"login", map[string]any{"method": "session", "session": map[string]any{"xs": canaryCookie}}},
 	} {
@@ -204,6 +221,10 @@ func TestNothingReachesStderr(t *testing.T) {
 			}
 		}
 	}
+	eventually(t, "the writes to reach Meta", func() bool {
+		return f.count("SendMessageTask") == 1 && f.count("SendFBMessage") == 1 && f.count("SendReactionTask") == 1 &&
+			f.count("ThreadMarkReadTask") == 1 && f.count("MuteThreadTask") == 2
+	})
 	// A checkpoint on a read, then a sign-out.
 	f.mu.Lock()
 	f.taskErr = func(socket.Task) error { return httpclient.ErrCheckpointRequired }
