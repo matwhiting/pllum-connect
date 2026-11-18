@@ -200,6 +200,7 @@ func (m *Messenger) ask(ctx context.Context, gen int, fn func(ctx context.Contex
 //	nothing reached Meta, or Meta said no   failed, refused
 //	  (after the text of a text-and-file went: unclear)
 //	no answer in time, or no readable one   sending; at the next start unknown
+//	  (a text with a file: unknown at once)
 //
 // What a send has done is kept in its row before the next step (its
 // progress): the upload, so a send tried again reuses it and never uploads
@@ -278,6 +279,11 @@ func (p sendProgress) uploaded() bool { return p.Attachment != 0 || len(p.Upload
 
 // keepProgress keeps a send's progress in its row.
 func (m *Messenger) keepProgress(id string, p sendProgress) error {
+	if m.testKeep != nil {
+		if err := m.testKeep(p); err != nil {
+			return err
+		}
+	}
 	b, err := json.Marshal(p)
 	if err != nil {
 		return errInternal
@@ -741,12 +747,23 @@ func (m *Messenger) drain(ctx context.Context) {
 		m.queue = m.queue[1:]
 		m.smu.Unlock()
 		if ctx == nil || ctx.Err() != nil {
-			m.fail(id, wire.Refused)
+			m.failStopped(id)
 		} else {
 			m.deliver(id)
 		}
 		m.busy.Add(-1)
 	}
+}
+
+// failStopped fails a send whose turn came after the helper began
+// stopping: nothing of it was asked now, so refused, or unclear when its
+// text went in an earlier try (as forgetCutOff has it).
+func (m *Messenger) failStopped(id string) {
+	kind := wire.Refused
+	if o, ok, err := m.st.Outgoing(Name, id); err == nil && ok && progressOf(o).TextSent {
+		kind = wire.Unclear
+	}
+	m.fail(id, kind)
 }
 
 // fail marks a write still sending failed with kind; one already settled
@@ -817,7 +834,8 @@ func (m *Messenger) deliver(id string) {
 		lineID, ms, out := s.message(false, reply)
 		switch out {
 		case sentMaybe:
-			return // it stays sending
+			m.unsettled(id, req) // it may have gone
+			return
 		case sentRefused:
 			m.fail(id, wire.Refused)
 			return
@@ -830,7 +848,8 @@ func (m *Messenger) deliver(id string) {
 		}
 		s.p.TextSent, s.p.TextLineID, s.p.Asking = true, lineID, false
 		if m.keepProgress(id, s.p) != nil {
-			return // the text went but that is not kept: it stays sending, and is unknown at the next start
+			m.forget(id) // the text went but that is not kept: unknown, never sent again
+			return
 		}
 		m.changed()
 	}
@@ -840,7 +859,8 @@ func (m *Messenger) deliver(id string) {
 	lineID, ms, out := s.message(true, reply)
 	switch out {
 	case sentMaybe:
-		return // it stays sending
+		m.unsettled(id, req) // it may have gone
+		return
 	case sentRefused:
 		if s.p.TextSent {
 			m.fail(id, wire.Unclear) // its text went, the file did not: the key's next send is the file alone
@@ -852,6 +872,25 @@ func (m *Messenger) deliver(id string) {
 	m.storeSent(o.ChatID, lineID, req.Kind, "", reply.ID, data, ms)
 	m.settle(id, cmp.Or(s.p.TextLineID, lineID)) // the send's line is its text's, as its ID is
 	m.changed()
+}
+
+// unsettled ends a delivery whose message may have reached Meta. A send
+// of one message stays sending: its echo settles it. A text with a file
+// is unknown at once, never sent again: nothing is in flight, and no echo
+// settles it (the text's says nothing of the file), so Pllum goes by the
+// chat's lines, as for any unknown send.
+func (m *Messenger) unsettled(id string, req sendRequest) {
+	if req.File != "" && req.Text != "" {
+		m.forget(id)
+	}
+}
+
+// forget makes a send still sending unknown: it may have reached Meta, and
+// is never sent again.
+func (m *Messenger) forget(id string) {
+	if o, ok, err := m.st.Outgoing(Name, id); err == nil && ok && o.State == store.OutSending {
+		_ = m.st.SetOutgoingState(Name, id, store.OutUnknown, "")
+	}
 }
 
 // sender is one delivery of a send.
@@ -896,8 +935,16 @@ func (s *sender) replyLine() (store.Line, bool) {
 // so a stop while the send waits its turn leaves it resendable.
 func (s *sender) asking() error {
 	s.p.Asking = true
-	return s.m.keepProgress(s.o.ID, s.p)
+	if s.m.keepProgress(s.o.ID, s.p) != nil {
+		s.p.Asking = false
+		return errNotAsked // nothing is asked: the message is refused
+	}
+	return nil
 }
+
+// errNotAsked is a message that was not asked because its "being asked"
+// could not be kept: refused, so the send is never left sending.
+var errNotAsked = &wire.Error{Kind: wire.Refused}
 
 // upload uploads the send's file once, with a budget of its own, and keeps
 // what Meta gave for it in the row before any message goes: the

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"image"
 	"image/png"
@@ -1286,5 +1287,100 @@ func TestEachRequestOfASendHasItsOwnBudget(t *testing.T) {
 	}
 	if n := h.f.count("SendMessageTask"); n != 2 {
 		t.Errorf("SendMessageTask was asked %d times, want 2", n)
+	}
+}
+
+// Review N1: a text-and-file send whose answer is unsure, on either of its
+// two messages, is unknown as soon as its delivery ends, never left
+// sending: nothing is in flight, and no echo settles it. Pllum then goes by
+// the chat's lines (or offers Try again) as for any unknown send. A send of
+// one message stays sending: its own echo can settle it.
+func TestATextAndFileWithAnUnsureAnswerIsUnknownAtOnce(t *testing.T) {
+	for _, tc := range []struct {
+		name, chat string
+		set        func(f *fakeMeta)
+	}{
+		{"a group's text times out", groupChat, func(f *fakeMeta) { f.writeErrs["SendMessageTask"] = context.DeadlineExceeded }},
+		{"a group's file is answered without its ID", groupChat, func(f *fakeMeta) {
+			f.answer = func(t *socket.SendMessageTask) *table.LSTable {
+				if t.SendType == table.MEDIA {
+					return &table.LSTable{}
+				}
+				otid := strconv.FormatInt(t.Otid, 10)
+				return &table.LSTable{LSReplaceOptimsiticMessage: []*table.LSReplaceOptimsiticMessage{{OfflineThreadingId: otid, MessageId: "mid.$invented-sent-" + otid}}}
+			}
+		}},
+		{"an encrypted file times out", aliceChat, func(f *fakeMeta) {
+			f.hook = func(name string) {
+				if name == "SendFBMessage" {
+					f.setErr("SendFBMessage", whatsmeow.ErrMessageTimedOut) // the next one, the file's
+				}
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t)
+			h.signIn(t)
+			h.f.mu.Lock()
+			tc.set(h.f)
+			h.f.mu.Unlock()
+			id := h.send(t, network.Outgoing{ChatID: tc.chat, Text: canary + " unsure", File: writePhoto(t)})
+			if st := h.m.SendState(id); st.State != network.SendUnknown {
+				t.Errorf("after its delivery the send is %+v, want unknown", st)
+			}
+		})
+	}
+
+	h := newHarness(t)
+	h.signIn(t)
+	h.f.setErr("SendMessageTask", context.DeadlineExceeded)
+	id := h.send(t, network.Outgoing{ChatID: groupChat, Text: canary + " alone"})
+	if st := h.m.SendState(id); st.State != network.SendSending {
+		t.Errorf("a text alone with an unsure answer is %+v, want sending (its echo settles it)", st)
+	}
+}
+
+// Review N2: a resumed send whose text went, put in line as the helper
+// stops, fails unclear (its text arrived), not refused.
+func TestASendStoppedInLineAfterItsTextIsUnclear(t *testing.T) {
+	h := newHarness(t)
+	h.signIn(t)
+	const id = otidPrefix + "7000000000000094"
+	body, _ := json.Marshal(sendRequest{Text: canary + " before", File: writePhoto(t), FileName: "invented.png", Kind: "photo",
+		Mimetype: "image/png", OTID: "7000000000000094", FileOTID: "7000000000000095"})
+	if err := h.st.PutOutgoing(Name, store.Outgoing{ID: id, ChatID: groupChat, Kind: outMessage, MadeMs: 1, Request: body}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.m.keepProgress(id, sendProgress{Attachment: 5550000000000009, TextSent: true, TextLineID: "mid.$invented-kept-text"}); err != nil {
+		t.Fatal(err)
+	}
+	h.m.Stop()
+	h.m.enqueue(id)
+	if st := h.m.SendState(id); st.State != network.SendFailed || st.Kind != wire.Unclear {
+		t.Errorf("the send is %+v, want failed unclear", st)
+	}
+}
+
+// Review N3: a send whose "being asked" can't be kept asks nothing and is
+// failed (refused, or unclear after its text), never left sending.
+func TestASendWhoseAskingCannotBeKeptAsksNothing(t *testing.T) {
+	h := newHarness(t)
+	h.signIn(t)
+	h.m.testKeep = func(p sendProgress) error {
+		if p.Asking {
+			return errors.New("invented store failure") // a plain error, as the database gives
+		}
+		return nil
+	}
+	id := h.send(t, network.Outgoing{ChatID: groupChat, Text: canary + " not kept"})
+	if st := h.m.SendState(id); st.State != network.SendFailed || st.Kind != wire.Refused {
+		t.Errorf("the send is %+v, want failed refused", st)
+	}
+	eid := h.send(t, network.Outgoing{ChatID: aliceChat, Text: canary + " not kept"})
+	if st := h.m.SendState(eid); st.State != network.SendFailed || st.Kind != wire.Refused {
+		t.Errorf("the encrypted send is %+v, want failed refused", st)
+	}
+	if n := h.f.count("SendMessageTask") + h.f.count("SendFBMessage"); n != 0 {
+		t.Errorf("%d messages were asked", n)
 	}
 }

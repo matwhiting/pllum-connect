@@ -237,6 +237,9 @@ type Messenger struct {
 	// testPrep, set only by tests, sees each encrypted message before it is
 	// worked out.
 	testPrep func(evt *events.FBMessage)
+	// testKeep, set only by tests, fails a send's progress as the store
+	// would.
+	testKeep func(p sendProgress) error
 }
 
 var (
