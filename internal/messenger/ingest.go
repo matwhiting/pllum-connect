@@ -1127,9 +1127,10 @@ func (m *Messenger) onEncReceipt(e *events.Receipt) (bool, error) {
 }
 
 // onUndecryptable keeps a message whose encryption could not be undone as
-// an "undecryptable" line under its ID, shown (Pllum says it couldn't be
-// read): when it comes again readable, it lands in that row. One already
-// held is left as it is.
+// an "undecryptable" line under its ID, or, when Meta says it was sent
+// with no copy for this device, an "unavailable" one: shown (Pllum says
+// which), and when it comes again readable, it lands in that row. One
+// already held is left as it is.
 func (m *Messenger) onUndecryptable(e *events.UndecryptableMessage) (bool, error) {
 	if e.Info.ID == "" {
 		return false, nil
@@ -1142,8 +1143,11 @@ func (m *Messenger) onUndecryptable(e *events.UndecryptableMessage) (bool, error
 		return false, nil
 	}
 	sender, _, fromMe := m.fbSender(e.Info.Sender, e.Info.IsFromMe)
-	shown := false
+	shown, kind := false, "undecryptable"
+	if e.IsUnavailable {
+		kind = "unavailable"
+	}
 	_, err = m.st.PutMessage(Name, store.Message{ID: e.Info.ID, ChatID: chat, SenderID: sender, FromMe: fromMe,
-		TimeMs: max(e.Info.Timestamp.UnixMilli(), 0), Kind: "undecryptable", Hidden: &shown, Source: store.SourceLive})
+		TimeMs: max(e.Info.Timestamp.UnixMilli(), 0), Kind: kind, Hidden: &shown, Source: store.SourceLive})
 	return err == nil, err
 }

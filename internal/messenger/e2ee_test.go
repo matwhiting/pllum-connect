@@ -293,6 +293,13 @@ func TestUndecryptableIsAShownLineAndCounted(t *testing.T) {
 		t.Errorf("undecryptable count %d, want 1", n)
 	}
 
+	// Meta saying the message was sent with no copy for this device: an "unavailable" line, shown the same way
+	h.deliver(t, &events.UndecryptableMessage{Info: watypes.MessageInfo{MessageSource: info.MessageSource, ID: "WAINVENTED31", Timestamp: at},
+		IsUnavailable: true})
+	if l, ok := h.line(t, alice, "WAINVENTED31"); !ok || l.Kind != "unavailable" || (l.Hidden != nil && *l.Hidden) || l.Text != "" {
+		t.Errorf("the message with no copy for this device reads %+v (ok %v), want a shown unavailable line", l, ok)
+	}
+
 	h.deliver(t, fbMessage(oneToOne(aliceFBID), person(aliceFBID), "WAINVENTED30", at, textContent(canary+" readable now"), ""))
 	lines := h.lines(t, alice)
 	if l := lines["WAINVENTED30"]; l.Text != canary+" readable now" || l.Kind != "text" || l.Hidden == nil || *l.Hidden {
@@ -304,8 +311,9 @@ func TestUndecryptableIsAShownLineAndCounted(t *testing.T) {
 			n++
 		}
 	}
-	if n != 1 || len(lines) != 1 {
-		t.Errorf("Alice's chat holds %d lines, want the one", len(lines))
+	// the readable message took its own row over; the one with no copy stays apart
+	if n != 1 || len(lines) != 2 {
+		t.Errorf("Alice's chat holds %d lines, want the readable one and the unavailable one", len(lines))
 	}
 }
 
