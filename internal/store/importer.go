@@ -73,7 +73,7 @@ type Counts struct {
 
 // lineKinds are the protocol's kinds of line.
 var lineKinds = map[string]bool{
-	"text": true, "photo": true, "video": true, "voiceNote": true, "sticker": true, "file": true, "notice": true,
+	"text": true, "photo": true, "video": true, "voiceNote": true, "sticker": true, "file": true, "notice": true, "undecryptable": true,
 }
 
 func importMediaKind(m ImportMessage) string {

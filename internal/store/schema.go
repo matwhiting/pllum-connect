@@ -224,7 +224,7 @@ var lateSchema = []string{
 // hasBody is the SQL test for a line holding text or media: media entries,
 // or a media kind alone (Beeper may name a photo without its details).
 const hasBody = `(COALESCE(text, '') <> '' OR media_json IS NOT NULL
-	OR kind IN ('photo', 'video', 'voiceNote', 'sticker', 'file'))`
+	OR kind IN ('photo', 'video', 'voiceNote', 'sticker', 'file', 'undecryptable'))`
 
 // mediaKinds are the kinds of line that are media.
 var mediaKinds = map[string]bool{"photo": true, "video": true, "voiceNote": true, "sticker": true, "file": true}

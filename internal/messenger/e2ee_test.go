@@ -270,9 +270,10 @@ func TestAnOldThreadAndItsEncryptedThreadAreOneChat(t *testing.T) {
 	}
 }
 
-// A message whose encryption could not be undone is a hidden notice under
-// its ID, counted; when it comes again readable, it is that one line.
-func TestUndecryptableIsAHiddenNoticeAndCounted(t *testing.T) {
+// A message whose encryption could not be undone is an "undecryptable"
+// line under its ID, shown, unread and the chat's newest, and counted; when
+// it comes again readable, it is that one line.
+func TestUndecryptableIsAShownLineAndCounted(t *testing.T) {
 	h := newHarness(t)
 	h.signIn(t)
 	at := time.Date(2026, 3, 2, 8, 0, 0, 0, time.UTC)
@@ -282,11 +283,11 @@ func TestUndecryptableIsAHiddenNoticeAndCounted(t *testing.T) {
 	info := watypes.MessageInfo{MessageSource: watypes.MessageSource{Chat: oneToOne(aliceFBID), Sender: person(aliceFBID)}, ID: "WAINVENTED30", Timestamp: at}
 	h.deliver(t, &events.UndecryptableMessage{Info: info})
 	l, ok := h.line(t, alice, "WAINVENTED30")
-	if !ok || l.Kind != "notice" || l.Hidden == nil || !*l.Hidden || l.Text != "" {
-		t.Fatalf("the undecryptable message reads %+v (ok %v), want a hidden notice", l, ok)
+	if !ok || l.Kind != "undecryptable" || (l.Hidden != nil && *l.Hidden) || l.Text != "" {
+		t.Fatalf("the undecryptable message reads %+v (ok %v), want a shown undecryptable line", l, ok)
 	}
-	if c := h.chat(t, alice); c.Unread != before || c.LastMessageID == "WAINVENTED30" {
-		t.Errorf("a hidden notice counts as unread (%d, was %d) or as the chat's newest line", c.Unread, before)
+	if c := h.chat(t, alice); c.Unread != before+1 || c.LastMessageID != "WAINVENTED30" {
+		t.Errorf("the undecryptable line counts as unread %d (was %d), newest %q: want one more unread and it the newest", c.Unread, before, c.LastMessageID)
 	}
 	if n := h.m.GateCounts().(GateCounts).LiveUndecryptable; n != 1 {
 		t.Errorf("undecryptable count %d, want 1", n)
@@ -491,7 +492,7 @@ func TestAnEndedEncryptedSessionAsksNothing(t *testing.T) {
 
 // Review M2: a message that can never be stored (it panics, or the store
 // refuses it) is not left unacked to come back at every connect: it is kept
-// as a hidden notice under its ID when that can be stored, and acked.
+// as an undecryptable line under its ID when that can be stored, and acked.
 // Review M1: only a message that writes something tells Pllum to re-read.
 func TestAMessageThatCannotBeStoredIsNotLostForever(t *testing.T) {
 	h := newHarness(t)
@@ -504,8 +505,8 @@ func TestAMessageThatCannotBeStoredIsNotLostForever(t *testing.T) {
 		}
 	}
 	h.deliver(t, fbMessage(oneToOne(aliceFBID), person(aliceFBID), "WAINVENTED60", at, textContent("x"), ""))
-	if l, ok := h.line(t, alice, "WAINVENTED60"); !ok || l.Kind != "notice" || l.Hidden == nil || !*l.Hidden {
-		t.Errorf("the message that panicked reads %+v (ok %v), want a hidden notice", l, ok)
+	if l, ok := h.line(t, alice, "WAINVENTED60"); !ok || l.Kind != "undecryptable" || (l.Hidden != nil && *l.Hidden) {
+		t.Errorf("the message that panicked reads %+v (ok %v), want an undecryptable line", l, ok)
 	}
 	// An ID the store refuses: acked, nothing stored.
 	h.deliver(t, fbMessage(oneToOne(aliceFBID), person(aliceFBID), "beeper:invented", at, textContent("x"), ""))
