@@ -1,8 +1,12 @@
 package messenger
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"image"
+	"image/png"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -293,7 +297,7 @@ func methodNames(v any) []string {
 // before the pace or the client, by the adapter and by the real writer;
 // and the reads' client takes only the two reads.
 func TestOnlyTheAllowedTasksAreExecuted(t *testing.T) {
-	if got, want := methodNames((*msgrWriter)(nil)), []string{"DownloadFB", "ExecuteTasks", "MarkRead", "SendFBMessage", "Upload"}; !slices.Equal(got, want) {
+	if got, want := methodNames((*msgrWriter)(nil)), []string{"DownloadFB", "ExecuteTasks", "MarkRead", "SendFBMessage", "Upload", "UploadFB"}; !slices.Equal(got, want) {
 		t.Errorf("msgrWriter has %v, want exactly %v", got, want)
 	}
 	if got := methodNames((*msgrDownloader)(nil)); !slices.Equal(got, []string{"Download"}) {
@@ -594,22 +598,32 @@ func TestAGroupPhotoDownloadsOnceFromTheCDN(t *testing.T) {
 	}
 }
 
+// writePhoto writes a small invented PNG and is its path.
+func writePhoto(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "invented.png")
+	var b bytes.Buffer
+	if err := png.Encode(&b, image.NewRGBA(image.Rect(0, 0, 4, 3))); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, b.Bytes(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
 // His own photo, sent to a group, is uploaded once and sent as one
-// message with its caption, and opens without a download.
+// message, and opens without a download.
 func TestAGroupPhotoIsUploadedThenSent(t *testing.T) {
 	h := newHarness(t)
 	h.signIn(t)
-	path := filepath.Join(t.TempDir(), "invented.png")
-	png := []byte("\x89PNG\r\n\x1a\n" + strings.Repeat("\x00", 64))
-	if err := os.WriteFile(path, png, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	id := h.send(t, network.Outgoing{ChatID: groupChat, Text: canary + " caption", File: path})
+	id := h.send(t, network.Outgoing{ChatID: groupChat, File: writePhoto(t)})
 	sent := tasksOf[*socket.SendMessageTask](h.f)
 	if h.f.count("Upload") != 1 || len(sent) != 1 {
 		t.Fatalf("%d uploads, %d sends; want one each", h.f.count("Upload"), len(sent))
 	}
-	if s := sent[0]; s.SendType != table.MEDIA || !slices.Equal(s.AttachmentFBIds, []int64{5550000000000001}) || s.Text != canary+" caption" {
+	if s := sent[0]; s.SendType != table.MEDIA || !slices.Equal(s.AttachmentFBIds, []int64{5550000000000001}) || s.Text != "" ||
+		strconv.FormatInt(s.Otid, 10) != strings.TrimPrefix(id, otidPrefix) {
 		t.Errorf("the task is %+v", s)
 	}
 	lineID := h.outgoing(t, id).LineID
@@ -622,9 +636,216 @@ func TestAGroupPhotoIsUploadedThenSent(t *testing.T) {
 	if n := h.f.count("Download"); n != 0 {
 		t.Errorf("his own photo was downloaded %d times", n)
 	}
-	// An encrypted chat takes no file: nothing to upload it with.
-	if _, err := h.m.Send(context.Background(), network.Outgoing{ChatID: aliceChat, File: path}); wire.KindOf(err) != wire.Unsupported {
-		t.Errorf("a file to an encrypted chat gave %v, want unsupported", err)
+}
+
+// fbFile is the image, video or document an encrypted send carries, and
+// its transport's direct path ("" for a send with no file).
+func fbFile(t *testing.T, s fbSend) (kind, path string) {
+	t.Helper()
+	app, _ := s.msg.(*waConsumerApplication.ConsumerApplication)
+	c := app.GetPayload().GetContent()
+	switch {
+	case c.GetImageMessage() != nil:
+		tr, err := c.GetImageMessage().Decode()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return "photo", tr.GetIntegral().GetTransport().GetIntegral().GetDirectPath()
+	case c.GetDocumentMessage() != nil:
+		tr, err := c.GetDocumentMessage().Decode()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return "file", tr.GetIntegral().GetTransport().GetIntegral().GetDirectPath()
+	}
+	return "", ""
+}
+
+// Ruling 1 (Review Focus 2): a photo to an encrypted one-to-one is
+// uploaded once with whatsmeow's upload and sent under its message ID. A
+// send that did not go (the socket dropped before it) is the same send
+// after a restart, and goes again with the upload it has, never a second
+// one; once sent, the same key sends nothing. One cut off mid-send is
+// unknown after a restart and never sent again.
+func TestAnEncryptedPhotoSendsOnceWithItsUpload(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "connect")
+	f := newFakeMeta()
+	h := newHarnessOver(t, dir, f)
+	h.signIn(t)
+	out := network.Outgoing{ChatID: aliceChat, File: writePhoto(t), ClientID: "key-photo"}
+
+	f.setErr("SendFBMessage", whatsmeow.ErrNotConnected)
+	id := h.send(t, out)
+	if st := h.m.SendState(id); st.State != network.SendFailed || st.Kind != wire.Refused {
+		t.Fatalf("a send that never went is %+v, want failed refused", st)
+	}
+	if n := f.count("UploadFB"); n != 1 {
+		t.Fatalf("UploadFB was asked %d times, want 1", n)
+	}
+	h.close()
+
+	f.setErr("SendFBMessage", nil)
+	h = newHarnessOver(t, dir, f)
+	h.signIn(t)
+	again, err := h.m.Send(context.Background(), out)
+	h.sends(t)
+	if err != nil || again != id {
+		t.Fatalf("the key asked again gave %q, %v; want %s", again, err, id)
+	}
+	if st := h.m.SendState(id); st.State != network.SendSent {
+		t.Errorf("the send is %+v, want sent", st)
+	}
+	if n := f.count("UploadFB"); n != 1 {
+		t.Errorf("UploadFB was asked %d times, want 1: the upload is reused", n)
+	}
+	sends := f.sentFB()
+	if len(sends) != 2 {
+		t.Fatalf("SendFBMessage was asked %d times, want 2 (the one that never went, then this)", len(sends))
+	}
+	for i, s := range sends {
+		kind, path := fbFile(t, s)
+		if kind != "photo" || path != "/v/t62.invented/upload-1" || string(s.id) != id || s.to.String() != oneToOne(aliceFBID).String() {
+			t.Errorf("send %d was a %q at %q under %s to %s", i, kind, path, s.id, s.to)
+		}
+	}
+	f.mu.Lock()
+	types := append([]whatsmeow.MediaType{}, f.fbUploads...)
+	f.mu.Unlock()
+	if !slices.Equal(types, []whatsmeow.MediaType{whatsmeow.MediaImage}) {
+		t.Errorf("uploaded as %v, want an image", types)
+	}
+	if l, ok := h.line(t, aliceChat, id); !ok || !l.FromMe || l.Kind != "photo" {
+		t.Errorf("his line is %+v (held %v)", l, ok)
+	}
+	if _, err := h.m.Media(context.Background(), aliceChat, id); err != nil || f.count("DownloadFB") != 0 {
+		t.Errorf("his own photo: %v, after %d downloads", err, f.count("DownloadFB"))
+	}
+
+	// Sent, it is never sent again: not after a restart, not by its key.
+	h.close()
+	h = newHarnessOver(t, dir, f)
+	h.signIn(t)
+	if again, err := h.m.Send(context.Background(), out); err != nil || again != id {
+		t.Errorf("the key after the send gave %q, %v", again, err)
+	}
+	h.sends(t)
+	if f.count("UploadFB") != 1 || f.count("SendFBMessage") != 2 {
+		t.Errorf("after the send: %d uploads, %d sends; want 1 and 2", f.count("UploadFB"), f.count("SendFBMessage"))
+	}
+
+	// Cut off mid-send: unknown after a restart, and never sent again.
+	f.setErr("SendFBMessage", whatsmeow.ErrMessageTimedOut)
+	cut := network.Outgoing{ChatID: aliceChat, File: writePhoto(t), ClientID: "key-photo-cut"}
+	id2 := h.send(t, cut)
+	h.close()
+	f.setErr("SendFBMessage", nil)
+	h = newHarnessOver(t, dir, f)
+	if st := h.m.SendState(id2); st.State != network.SendUnknown {
+		t.Errorf("a photo cut off mid-send is %+v after a restart, want unknown", st)
+	}
+	h.signIn(t)
+	if again, err := h.m.Send(context.Background(), cut); err != nil || again != id2 {
+		t.Errorf("its key gave %q, %v", again, err)
+	}
+	h.sends(t)
+	if f.count("UploadFB") != 2 || f.count("SendFBMessage") != 3 {
+		t.Errorf("after the cut-off: %d uploads, %d sends; want 2 and 3", f.count("UploadFB"), f.count("SendFBMessage"))
+	}
+	gaps(t, f.requests())
+}
+
+// Ruling 2: text with a file is two messages, the file then the text, each
+// under an ID of its own; the send's ID (and lineID) is the text's. In a
+// group the file is uploaded once and goes as its own MEDIA task; in an
+// encrypted chat it goes as its own SendFBMessage.
+func TestTextWithAFileIsTwoSendsFileFirst(t *testing.T) {
+	h := newHarness(t)
+	h.signIn(t)
+	id := h.send(t, network.Outgoing{ChatID: groupChat, Text: canary + " caption", File: writePhoto(t)})
+	otid := strings.TrimPrefix(id, otidPrefix)
+	sent := tasksOf[*socket.SendMessageTask](h.f)
+	if h.f.count("Upload") != 1 || len(sent) != 2 {
+		t.Fatalf("%d uploads, %d sends; want 1 and 2", h.f.count("Upload"), len(sent))
+	}
+	file, text := sent[0], sent[1]
+	fileOTID := strconv.FormatInt(file.Otid, 10)
+	if file.SendType != table.MEDIA || file.Text != "" || fileOTID == otid {
+		t.Errorf("the first task is %+v, want the photo alone under its own threading ID", file)
+	}
+	if text.SendType != table.TEXT || text.Text != canary+" caption" || strconv.FormatInt(text.Otid, 10) != otid || len(text.AttachmentFBIds) != 0 {
+		t.Errorf("the second task is %+v, want the text under the send's threading ID", text)
+	}
+	if o := h.outgoing(t, id); o.State != store.OutSent || o.LineID != "mid.$invented-sent-"+otid {
+		t.Errorf("the send is %s with lineID %q, want sent with the text's", o.State, o.LineID)
+	}
+	pl, pok := h.line(t, groupChat, "mid.$invented-sent-"+fileOTID)
+	tl, tok := h.line(t, groupChat, "mid.$invented-sent-"+otid)
+	if !pok || !tok || pl.Kind != "photo" || pl.Text != "" || tl.Kind != "text" || tl.Text != canary+" caption" {
+		t.Errorf("the lines are %+v (%v) and %+v (%v)", pl, pok, tl, tok)
+	}
+
+	eid := h.send(t, network.Outgoing{ChatID: aliceChat, Text: canary + " encrypted caption", File: writePhoto(t)})
+	sends := h.f.sentFB()
+	if h.f.count("UploadFB") != 1 || len(sends) != 2 {
+		t.Fatalf("%d uploads, %d encrypted sends; want 1 and 2", h.f.count("UploadFB"), len(sends))
+	}
+	if kind, _ := fbFile(t, sends[0]); kind != "photo" || string(sends[0].id) == eid || textOf(sends[0]) != "" {
+		t.Errorf("the first encrypted send is a %q under %s, want the photo under its own ID", kind, sends[0].id)
+	}
+	if string(sends[1].id) != eid || textOf(sends[1]) != canary+" encrypted caption" {
+		t.Errorf("the second encrypted send is %q under %s, want the text under %s", textOf(sends[1]), sends[1].id, eid)
+	}
+	if l, ok := h.line(t, aliceChat, string(sends[0].id)); !ok || l.Kind != "photo" {
+		t.Errorf("the photo's line is %+v (held %v)", l, ok)
+	}
+	if st := h.m.SendState(eid); st.State != network.SendSent {
+		t.Errorf("the encrypted send is %+v, want sent", st)
+	}
+	gaps(t, h.f.requests())
+}
+
+// A text whose file went and whose own message Meta turned down is failed
+// unclear; its key again is the same send, and sends the text alone: no
+// second upload, no second photo.
+func TestATextWhoseFileWentIsNotSentWithItAgain(t *testing.T) {
+	h := newHarness(t)
+	h.signIn(t)
+	h.f.mu.Lock()
+	h.f.answer = func(t *socket.SendMessageTask) *table.LSTable {
+		otid := strconv.FormatInt(t.Otid, 10)
+		if t.SendType == table.TEXT {
+			return &table.LSTable{LSMarkOptimisticMessageFailed: []*table.LSMarkOptimisticMessageFailed{{OTID: otid}}}
+		}
+		return &table.LSTable{LSReplaceOptimsiticMessage: []*table.LSReplaceOptimsiticMessage{{OfflineThreadingId: otid, MessageId: "mid.$invented-sent-" + otid}}}
+	}
+	h.f.mu.Unlock()
+	out := network.Outgoing{ChatID: groupChat, Text: canary + " caption", File: writePhoto(t), ClientID: "key-half"}
+	id := h.send(t, out)
+	if st := h.m.SendState(id); st.State != network.SendFailed || st.Kind != wire.Unclear {
+		t.Fatalf("the send is %+v, want failed unclear", st)
+	}
+	h.f.mu.Lock()
+	h.f.answer = nil
+	h.f.mu.Unlock()
+	again, err := h.m.Send(context.Background(), out)
+	h.sends(t)
+	if err != nil || again != id {
+		t.Fatalf("the key again gave %q, %v; want %s", again, err, id)
+	}
+	sent := tasksOf[*socket.SendMessageTask](h.f)
+	var media, texts int
+	for _, s := range sent {
+		if s.SendType == table.MEDIA {
+			media++
+		} else {
+			texts++
+		}
+	}
+	if h.f.count("Upload") != 1 || media != 1 || texts != 2 {
+		t.Errorf("%d uploads, %d photos, %d texts; want 1, 1 and 2", h.f.count("Upload"), media, texts)
+	}
+	if st := h.m.SendState(id); st.State != network.SendSent {
+		t.Errorf("the send is %+v, want sent", st)
 	}
 }
 
@@ -759,5 +980,72 @@ func TestAnUnencryptedOneToOneSendsOnItsThread(t *testing.T) {
 	}
 	if n := len(h.f.receipts()); n != 0 {
 		t.Errorf("%d encrypted receipts", n)
+	}
+}
+
+// A helper stopped between steps (as a crash would leave it): a send whose
+// upload is kept but whose message was never asked comes back failed,
+// refused, and its key sends it with that upload, never a second; one whose
+// file went comes back failed, unclear, and its key sends the text alone.
+func TestASendStoppedBetweenStepsGoesOnWithWhatItHas(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "connect")
+	f := newFakeMeta()
+	h := newHarnessOver(t, dir, f)
+	photo := writePhoto(t)
+	put := func(id, chat, client string, req sendRequest, p sendProgress) {
+		t.Helper()
+		body, _ := json.Marshal(req)
+		if err := h.st.PutOutgoing(Name, store.Outgoing{ID: id, ChatID: chat, Kind: outMessage, Client: client, MadeMs: 1, Request: body}); err != nil {
+			t.Fatal(err)
+		}
+		if err := h.m.keepProgress(id, p); err != nil {
+			t.Fatal(err)
+		}
+	}
+	kept, _ := proto.Marshal(&waMediaTransport.WAMediaTransport{
+		Integral:  &waMediaTransport.WAMediaTransport_Integral{DirectPath: proto.String("/v/t62.invented/kept-1")},
+		Ancillary: &waMediaTransport.WAMediaTransport_Ancillary{ObjectID: proto.String("object-kept-1")}})
+	const encID = "7000000000000091"
+	put(encID, aliceChat, "key-kept", sendRequest{File: photo, FileName: "invented.png", Kind: "photo", Mimetype: "image/png"},
+		sendProgress{Upload: kept, Width: 4, Height: 3})
+	const groupID = otidPrefix + "7000000000000092"
+	put(groupID, groupChat, "key-half", sendRequest{Text: canary + " after", File: photo, FileName: "invented.png", Kind: "photo",
+		Mimetype: "image/png", OTID: "7000000000000092", FileOTID: "7000000000000093"},
+		sendProgress{Attachment: 5550000000000009, FileSent: true, FileLineID: "mid.$invented-kept-file"})
+	h.close()
+
+	h = newHarnessOver(t, dir, f)
+	if st := h.m.SendState(encID); st.State != network.SendFailed || st.Kind != wire.Refused {
+		t.Errorf("the send stopped after its upload is %+v, want failed refused", st)
+	}
+	if st := h.m.SendState(groupID); st.State != network.SendFailed || st.Kind != wire.Unclear {
+		t.Errorf("the send stopped after its file is %+v, want failed unclear", st)
+	}
+	h.signIn(t)
+	for _, tc := range []struct{ chat, client, id string }{{aliceChat, "key-kept", encID}, {groupChat, "key-half", groupID}} {
+		got, err := h.m.Send(context.Background(), network.Outgoing{ChatID: tc.chat, File: photo, Text: "x", ClientID: tc.client})
+		if err != nil || got != tc.id {
+			t.Errorf("the key %s gave %q, %v; want %s", tc.client, got, err, tc.id)
+		}
+	}
+	h.sends(t)
+	if f.count("UploadFB") != 0 || f.count("Upload") != 0 {
+		t.Errorf("%d encrypted and %d group uploads, want none: each send has its own", f.count("UploadFB"), f.count("Upload"))
+	}
+	sends := f.sentFB()
+	if len(sends) != 1 || string(sends[0].id) != encID {
+		t.Fatalf("the encrypted sends are %+v, want the photo once under its ID", sends)
+	}
+	if kind, path := fbFile(t, sends[0]); kind != "photo" || path != "/v/t62.invented/kept-1" {
+		t.Errorf("the photo went as a %q at %q, want the kept upload", kind, path)
+	}
+	tasks := tasksOf[*socket.SendMessageTask](f)
+	if len(tasks) != 1 || tasks[0].SendType != table.TEXT || tasks[0].Otid != 7000000000000092 || tasks[0].Text != canary+" after" {
+		t.Errorf("the group's tasks are %+v, want its text alone", tasks)
+	}
+	for _, id := range []string{encID, groupID} {
+		if st := h.m.SendState(id); st.State != network.SendSent {
+			t.Errorf("%s is %+v, want sent", id, st)
+		}
 	}
 }

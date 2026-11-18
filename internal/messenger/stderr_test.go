@@ -77,6 +77,7 @@ func TestNothingReachesStderr(t *testing.T) {
 	f.table = tbl
 	f.folders[inboxOne] = []*table.LSTable{threadsPage(inboxOne, false, thread(2000088, table.ONE_TO_ONE, at, "pending"))}
 	f.writeErrs["MuteThreadTask"] = errors.New(canary + " invented failure")
+	photo := writePhoto(t)
 	// Every thread's history goes on and on, so groups are never complete.
 	pages := 0
 	f.olderFn = func(key int64) *table.LSTable {
@@ -203,6 +204,7 @@ func TestNothingReachesStderr(t *testing.T) {
 		// its error), and media.
 		{"send", map[string]any{"chatID": fmt.Sprint(groupOne), "text": canary + " sent", "clientID": "key-" + canary}},
 		{"send", map[string]any{"chatID": fmt.Sprint(aliceFBID) + "@msgr", "text": canary + " sent encrypted", "clientID": "key-e-" + canary}},
+		{"send", map[string]any{"chatID": fmt.Sprint(aliceFBID) + "@msgr", "text": canary + " caption", "file": photo, "clientID": "key-p-" + canary}},
 		{"sendStatus", map[string]any{"clientID": "key-" + canary}},
 		{"react", map[string]any{"chatID": fmt.Sprint(groupOne), "messageID": "mid.$invented-s2", "emoji": "👍", "transactionID": "txn-" + canary}},
 		{"markRead", map[string]any{"chatID": fmt.Sprint(groupOne), "through": "mid.$invented-s2"}},
@@ -222,7 +224,7 @@ func TestNothingReachesStderr(t *testing.T) {
 		}
 	}
 	eventually(t, "the writes to reach Meta", func() bool {
-		return f.count("SendMessageTask") == 1 && f.count("SendFBMessage") == 1 && f.count("SendReactionTask") == 1 &&
+		return f.count("SendMessageTask") == 1 && f.count("SendFBMessage") == 3 && f.count("UploadFB") == 1 && f.count("SendReactionTask") == 1 &&
 			f.count("ThreadMarkReadTask") == 1 && f.count("MuteThreadTask") == 2
 	})
 	// A checkpoint on a read, then a sign-out.

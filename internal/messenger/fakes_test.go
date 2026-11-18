@@ -204,6 +204,7 @@ type fakeMeta struct {
 	fbDownloads []string
 	cdnGets     []string
 	uploads     int
+	fbUploads   []whatsmeow.MediaType
 	writeErrs   map[string]error
 	answer      func(t *socket.SendMessageTask) *table.LSTable
 	files       map[string][]byte
@@ -927,4 +928,20 @@ func (w fakeWriter) Download(ctx context.Context, url string) ([]byte, error) {
 		return nil, statusError(404)
 	}
 	return data, nil
+}
+
+// UploadFB is WhatsApp's media servers for an encrypted file: each upload
+// gets a direct path and object ID of its own.
+func (w fakeWriter) UploadFB(ctx context.Context, data []byte, mediaType whatsmeow.MediaType) (whatsmeow.UploadResponse, error) {
+	f := w.f
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.record("UploadFB")
+	f.fbUploads = append(f.fbUploads, mediaType)
+	if err := f.writeErrs["UploadFB"]; err != nil {
+		return whatsmeow.UploadResponse{}, err
+	}
+	n := len(f.fbUploads)
+	return whatsmeow.UploadResponse{DirectPath: fmt.Sprintf("/v/t62.invented/upload-%d", n), ObjectID: fmt.Sprintf("object-upload-%d", n),
+		MediaKey: []byte("key-invented"), FileSHA256: []byte("sha-invented"), FileEncSHA256: []byte("enc-invented"), FileLength: uint64(len(data))}, nil
 }
