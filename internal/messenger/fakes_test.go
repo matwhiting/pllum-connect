@@ -164,6 +164,7 @@ type fakeMeta struct {
 	// test dispatches the event itself.
 	holdConnect bool
 	connects    int
+	disconnects int // main clients told to disconnect
 	// registerErrs fail the next registrations, in order (Meta's answer
 	// lost). regKeys and regUUIDs are the identity key and Facebook device
 	// UUID each registration was made with.
@@ -246,10 +247,33 @@ func (f *fakeMeta) requests() []call {
 	return append([]call{}, f.calls...)
 }
 
-// fakeClock is the time the pace runs on: Sleep moves it on at once.
+// fakeClock is the time the pace and the network's timers run on: Sleep
+// moves it on at once, and a timer runs when the clock reaches it.
 type fakeClock struct {
-	mu  sync.Mutex
-	now time.Time
+	mu     sync.Mutex
+	now    time.Time
+	timers []*fakeTimer
+}
+
+type fakeTimer struct {
+	at      time.Time
+	f       func()
+	stopped bool
+}
+
+// AfterFunc runs f once the clock has moved d on.
+func (c *fakeClock) AfterFunc(d time.Duration, f func()) func() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	t := &fakeTimer{at: c.now.Add(d), f: f}
+	c.timers = append(c.timers, t)
+	return func() bool {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		was := !t.stopped
+		t.stopped = true
+		return was
+	}
 }
 
 func newFakeClock() *fakeClock {
@@ -270,11 +294,28 @@ func (c *fakeClock) Sleep(ctx context.Context, d time.Duration) error {
 	return nil
 }
 
+// Advance moves the clock on and runs every timer now due.
 func (c *fakeClock) Advance(d time.Duration) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	if d > 0 {
 		c.now = c.now.Add(d)
+	}
+	var due []*fakeTimer
+	kept := c.timers[:0]
+	for _, t := range c.timers {
+		switch {
+		case t.stopped:
+		case !t.at.After(c.now):
+			t.stopped = true
+			due = append(due, t)
+		default:
+			kept = append(kept, t)
+		}
+	}
+	c.timers = kept
+	c.mu.Unlock()
+	for _, t := range due {
+		t.f()
 	}
 }
 
@@ -327,7 +368,11 @@ func (c *fakeClient) Connect(ctx context.Context) error {
 	return nil
 }
 
-func (c *fakeClient) Disconnect() {}
+func (c *fakeClient) Disconnect() {
+	c.f.mu.Lock()
+	defer c.f.mu.Unlock()
+	c.f.disconnects++
+}
 
 // dispatch delivers a main-socket event, as messagix's loop does.
 func (c *fakeClient) dispatch(evt any) {
@@ -479,10 +524,11 @@ func (c *fakeClient) History() historyClient { return c.f.history }
 // fakeE2EE is the encrypted socket: Connect says connected (unless the
 // test holds it), and a test delivers events through it.
 type fakeE2EE struct {
-	mu       sync.Mutex
-	handlers []func(evt any) bool
-	connects int
-	hold     bool
+	mu         sync.Mutex
+	handlers   []func(evt any) bool
+	connects   int
+	hold       bool
+	connectErr error // fails the next Connect
 }
 
 func (e *fakeE2EE) AddEventHandlerWithSuccessStatus(h func(evt any) bool) {
@@ -495,6 +541,11 @@ func (e *fakeE2EE) Connect() error {
 	e.mu.Lock()
 	e.connects++
 	hold := e.hold
+	if err := e.connectErr; err != nil {
+		e.connectErr = nil
+		e.mu.Unlock()
+		return err
+	}
 	e.mu.Unlock()
 	if !hold {
 		go e.dispatch(&events.Connected{})
@@ -725,6 +776,7 @@ func newHarnessOver(t *testing.T, dir string, f *fakeMeta) *harness {
 	h.m.newWriter = func(msgrClient, e2eeClient) msgrWriter { return fakeWriter{f} }
 	h.m.newDownloader = func(msgrClient) msgrDownloader { return fakeWriter{f} }
 	h.m.now = f.clock.Now
+	h.m.afterFunc = f.clock.AfterFunc
 	h.m.pageWait = 2 * time.Second
 	h.m.pace = &meta.Pace{Now: f.clock.Now, Sleep: f.clock.Sleep}
 	st.SetClock(f.clock.Now)

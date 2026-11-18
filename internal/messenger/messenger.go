@@ -43,6 +43,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"maps"
+	"net"
 	"slices"
 	"strconv"
 	"strings"
@@ -152,9 +153,10 @@ type Messenger struct {
 	pace          *meta.Pace
 	diff          *meta.SessionDiff
 	now           func() time.Time
-	gate          bool          // started with --gate: every sign-in lists every folder, and one page of restored history is sampled
-	pageWait      time.Duration // how long a page of history may take to come back on the socket
-	writeWait     time.Duration // how long one write's request may wait for its turn and its answer
+	afterFunc     func(d time.Duration, f func()) (stop func() bool) // the network's timers
+	gate          bool                                               // started with --gate: every sign-in lists every folder, and one page of restored history is sampled
+	pageWait      time.Duration                                      // how long a page of history may take to come back on the socket
+	writeWait     time.Duration                                      // how long one write's request may wait for its turn and its answer
 
 	mu        sync.Mutex
 	started   bool
@@ -176,7 +178,21 @@ type Messenger struct {
 	e2eeFailed bool
 	state      network.State
 	kind       wire.Kind
-	work       sync.WaitGroup
+
+	// The main socket's own redials (as Instagram's): drops counts its
+	// failures in a row since it last connected; past maxDrops the run is
+	// stopped and one redial (a new run with the session held) is due
+	// meta.Backoff(redials) on, redialDue until it runs; stopRetry stops
+	// its timer. redialing: the run in force is a redial. retry: the run
+	// ended for a passing reason (offline, timeout), so a nudge may start
+	// another.
+	drops     int
+	redials   int
+	redialDue bool
+	redialing bool
+	retry     bool
+	stopRetry func() bool
+	work      sync.WaitGroup
 
 	// the whatsmeow device store (e2ee.go)
 	dmu       sync.Mutex
@@ -267,6 +283,7 @@ func New(st *store.Store, dir string, key [32]byte, emit network.Emit) *Messenge
 		pace:          &meta.Pace{},
 		diff:          meta.NewSessionDiff(meta.FacebookPage),
 		now:           time.Now,
+		afterFunc:     func(d time.Duration, f func()) func() bool { return time.AfterFunc(d, f).Stop },
 		pageWait:      pageWaitDefault,
 		writeWait:     writeWait,
 		state:         network.NotConnected,
@@ -349,6 +366,7 @@ func (m *Messenger) Login(ctx context.Context, p network.LoginParams) error {
 		return errBadRequest
 	}
 	m.retire()
+	m.calm()
 	hash := sessionHash(session)
 	if kind, stopped, ok := m.keptBlock(); ok {
 		if slices.Contains(stopped, hash) {
@@ -397,6 +415,7 @@ func (m *Messenger) CancelLogin() {
 		return
 	}
 	m.retire()
+	m.calm()
 	m.session = nil
 	m.setState(network.NotConnected, "")
 }
@@ -408,14 +427,140 @@ func (m *Messenger) Logout(ctx context.Context) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.retire()
+	m.calm()
 	m.session = nil
 	m.setState(network.NotConnected, "")
 	return nil
 }
 
-// Nudge does nothing: the gate never retries on its own, and the encrypted
-// socket reconnects on the library's timing.
-func (m *Messenger) Nudge() {}
+// Nudge runs a waiting redial now, or, after a run that ended for a
+// passing reason (no connection, a timeout; never a block), starts one new
+// run with the session held: once per nudge, through the pace. Pllum
+// nudges when the Mac wakes.
+func (m *Messenger) Nudge() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.redialDue {
+		m.redial()
+		return
+	}
+	if m.retry {
+		m.retry = false
+		m.again()
+	}
+}
+
+// maxDrops is how many main-socket failures in a row, without it
+// connecting, the library's own loop is let run (Instagram's rule).
+const maxDrops = 5
+
+// passing reports whether a failure of this kind may be retried: no
+// connection, or a timeout.
+func passing(kind wire.Kind) bool { return kind == wire.Offline || kind == wire.Timeout }
+
+// again starts a new run with the session held, unless one is in force or
+// the pace forbids a request now; ok reports whether it started. m.mu is
+// held.
+func (m *Messenger) again() (ok bool) {
+	if !m.started || m.stopped || m.session == nil || m.cli != nil {
+		return false
+	}
+	if _, blocked := m.pace.Blocked(); blocked {
+		return false
+	}
+	m.retire()
+	m.startRun()
+	return true
+}
+
+// calm forgets every retry the network had planned (a new sign-in, a
+// sign-out, Meta stopping the session). m.mu is held.
+func (m *Messenger) calm() {
+	if m.stopRetry != nil {
+		m.stopRetry()
+		m.stopRetry = nil
+	}
+	m.drops, m.redials = 0, 0
+	m.redialDue, m.redialing, m.retry = false, false, false
+}
+
+// disconnected records a main-socket failure of run gen. messagix redials
+// by itself (2 s, doubling to 5 minutes) for ever, and each dial is a
+// handshake with his cookies that the pace never sees; a checkpoint or a
+// dead session can look like any other failure there. So past maxDrops in
+// a row the run is stopped (both sockets), the state is offline, and one
+// redial is due through the pace, which a checkpoint found then stops as
+// any request's would. Instagram's disconnected, for Messenger.
+func (m *Messenger) disconnected(gen int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if gen != m.gen || m.stopped {
+		return
+	}
+	m.drops++
+	if m.drops <= maxDrops {
+		return
+	}
+	m.drops = 0
+	m.retire() // messagix's Disconnect stops its loop (in its own goroutine)
+	m.setState(network.Offline, "")
+	m.scheduleRedial()
+}
+
+// connected records the main socket of run gen connecting: its failures
+// in a row, and the redials', start over.
+func (m *Messenger) connected(gen int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if gen == m.gen {
+		m.drops, m.redials, m.redialing = 0, 0, false
+	}
+}
+
+// scheduleRedial: one redial is due meta.Backoff(redials) on (15 minutes,
+// doubling to 4 hours while redials fail; a connect starts it over).
+// m.mu is held.
+func (m *Messenger) scheduleRedial() {
+	if m.stopRetry != nil {
+		m.stopRetry()
+	}
+	m.redialDue = true
+	gen := m.gen
+	m.stopRetry = m.afterFunc(meta.Backoff(m.redials), func() {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		if gen == m.gen {
+			m.redial()
+		}
+	})
+}
+
+// redial runs the redial due, once: a new run with the session held (its
+// messages page loaded through the pace, then the socket connected). While
+// the pace forbids a request it waits for the next, twice as long; a run
+// that fails for any other reason than Meta stopping the session does too
+// (failed). m.mu is held.
+func (m *Messenger) redial() {
+	if !m.redialDue || m.stopped || m.session == nil {
+		return
+	}
+	m.redialDue = false
+	if m.stopRetry != nil {
+		m.stopRetry()
+		m.stopRetry = nil
+	}
+	m.redials++
+	if kind, blocked := m.pace.Blocked(); blocked {
+		if kind == wire.RateLimited {
+			m.setState(network.Offline, wire.RateLimited)
+		}
+		m.scheduleRedial()
+		return
+	}
+	if m.again() {
+		m.redialing = true
+	}
+}
 
 // Stop disconnects, waits briefly for the network's work to end, and closes
 // the device database. The store is the server's to close.
@@ -431,6 +576,7 @@ func (m *Messenger) Stop() {
 		return
 	}
 	m.retire()
+	m.calm()
 	m.cancel()
 	m.mu.Unlock()
 
@@ -573,10 +719,12 @@ func (m *Messenger) mainHandler(gen int, cli msgrClient, fbid int64) messagix.Ev
 		}
 		switch e := evt.(type) {
 		case *messagix.ConnectedEvent, *messagix.ReconnectedEvent:
+			m.connected(gen)
 			m.socketUp(gen, false, true)
 			m.beginE2EE(gen, cli, fbid)
 		case *messagix.TransientDisconnectEvent:
 			m.socketUp(gen, false, false)
+			m.disconnected(gen)
 		case *messagix.PermanentErrorEvent:
 			m.pace.Fail(meta.ReconnectNeeded)
 			m.pushedBack(gen, meta.ReconnectNeeded)
@@ -680,8 +828,10 @@ func (m *Messenger) socketUp(gen int, encrypted, up bool) {
 }
 
 // failed ends run gen after a failure that is not Meta stopping the session
-// (pushedBack has set those): he is left not connected, with the kind, until
-// a new login.
+// (pushedBack has set those). A redial's run is offline, with the kind, and
+// the next redial is due twice as long on. Any other run is not connected,
+// with the kind: a passing kind (offline, timeout) waits for a nudge, which
+// starts a new run with the session held; any other waits for a new login.
 func (m *Messenger) failed(gen int, kind wire.Kind) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -689,7 +839,18 @@ func (m *Messenger) failed(gen int, kind wire.Kind) {
 		return
 	}
 	m.retire()
+	if m.redialing {
+		m.redialing = false
+		shown := kind
+		if kind == wire.Offline {
+			shown = ""
+		}
+		m.setState(network.Offline, shown)
+		m.scheduleRedial()
+		return
+	}
 	m.setState(network.NotConnected, kind)
+	m.retry = passing(kind)
 }
 
 // request makes one request to Meta through the pace: none while a block is
@@ -757,6 +918,15 @@ func kindOf(err error) wire.Kind {
 	case errors.Is(err, httpclient.ErrRequestFailed):
 		return wire.Offline
 	}
+	// A connection that failed at the network (the encrypted socket's dial,
+	// say): no connection, or a timeout.
+	var ne net.Error
+	if errors.As(err, &ne) {
+		if ne.Timeout() {
+			return wire.Timeout
+		}
+		return wire.Offline
+	}
 	var e *wire.Error
 	if errors.As(err, &e) {
 		return e.Kind
@@ -819,6 +989,7 @@ func (m *Messenger) pushedBack(gen int, kind wire.Kind) {
 		return
 	}
 	m.retire()
+	m.calm() // nothing redials or retries until a new login
 	m.setState(s, k)
 	// Kept, so neither a restart nor any version of these cookies sent again
 	// asks Meta.
