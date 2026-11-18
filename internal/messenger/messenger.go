@@ -207,11 +207,13 @@ type Messenger struct {
 	// the secure history (history.go)
 	hmu      sync.Mutex // one restore at a time
 	backup   *securehistory.Backup
-	history  string      // historyState: "", noBackup, needsPIN, restored, skipped
-	epmu     sync.Mutex  // one change to the history device's keys at a time
-	ebActive atomic.Bool // the first read of his backup is running
-	efmu     sync.Mutex  // the run of failed backup requests
-	odmu     sync.Mutex  // the day's pages of the backup asked on demand
+	history  string          // historyState: "", noBackup, needsPIN, restored, skipped
+	epmu     sync.Mutex      // one change to the history device's keys at a time
+	ebActive atomic.Bool     // the first read of his backup is running
+	efmu     sync.Mutex      // the run of failed backup requests
+	fillmu   sync.Mutex      // filling
+	filling  map[string]bool // chats whose newest backup page is due (catchup.go)
+	odmu     sync.Mutex      // the day's pages of the backup asked on demand
 
 	// what the gate counts (gate.go)
 	cmu                   sync.Mutex
@@ -790,6 +792,8 @@ func (m *Messenger) beginE2EE(gen int, cli msgrClient, fbid int64) {
 			// His restored backup, once (history.go); a restore made later
 			// in this run starts it itself.
 			m.encryptedBackfill(ctx, gen, cli, fbid)
+			// what the encrypted socket didn't bring, once a day (catchup.go)
+			m.catchUp(ctx, gen, cli, fbid)
 		}
 	}()
 }

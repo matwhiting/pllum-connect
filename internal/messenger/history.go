@@ -290,6 +290,7 @@ func (m *Messenger) RestoreHistory(ctx context.Context, pin []byte) error {
 		m.sample(runCtx, gen, cli, fbid)
 		if m.value("backfilled") != "" {
 			m.encryptedBackfill(runCtx, gen, cli, fbid)
+			m.catchUp(runCtx, gen, cli, fbid)
 		}
 	}()
 	return nil
@@ -919,5 +920,7 @@ func (m *Messenger) encryptedBackfill(ctx context.Context, gen int, cli msgrClie
 	}
 	if m.current(gen) && ctx.Err() == nil {
 		_ = m.keep("ebackfilled", "1")
+		// it read each active chat's newest page: that is today's catch-up (catchup.go)
+		_ = m.keep("ecatchup", strconv.FormatInt(m.now().UnixMilli(), 10))
 	}
 }

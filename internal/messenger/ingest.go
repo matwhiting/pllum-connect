@@ -1149,5 +1149,9 @@ func (m *Messenger) onUndecryptable(e *events.UndecryptableMessage) (bool, error
 	}
 	_, err = m.st.PutMessage(Name, store.Message{ID: e.Info.ID, ChatID: chat, SenderID: sender, FromMe: fromMe,
 		TimeMs: max(e.Info.Timestamp.UnixMilli(), 0), Kind: kind, Hidden: &shown, Source: store.SourceLive})
+	if err == nil && !fromMe {
+		// his phone keeps it in his backup: its chat's newest page brings it (catchup.go)
+		m.fillLater(chat)
+	}
 	return err == nil, err
 }
