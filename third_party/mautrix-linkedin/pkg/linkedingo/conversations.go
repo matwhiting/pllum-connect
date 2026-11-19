@@ -1,6 +1,9 @@
 // mautrix-linkedin - A Matrix-LinkedIn puppeting bridge.
 // Copyright (C) 2025 Sumner Evans
 //
+// Modified by Pllum Connect on 2026-11-19: GetConversationsWithNextCursor
+// added (see PLLUM-CHANGES.md at the root of this copy).
+//
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU Affero General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
@@ -179,6 +182,41 @@ func (c *Client) GetConversationsUpdatedBefore(ctx context.Context, updatedBefor
 		Do(ctx, &response)
 	if err != nil {
 		return nil, err
+	}
+	return response.Data.MessengerConversationsByCategoryQuery, nil
+}
+
+// graphQLQueryIDMessengerConversationsWithNextCursor is the by-category
+// conversations query that Pllum's read-only spike paged by its nextCursor on
+// 2026-11-19 (the ID of mautrix/linkedin PR #122). Pllum Connect addition.
+const graphQLQueryIDMessengerConversationsWithNextCursor = "messengerConversations.9501074288a12f3ae9e3c7ea243bccbf"
+
+// GetConversationsWithNextCursor is one page of 20 conversations of the
+// primary inbox, newest activity first: the first page with an empty cursor,
+// and after it the page the previous one's Metadata.NextCursor names. LinkedIn
+// ignores GetConversationsUpdatedBefore's lastUpdatedBefore (it answers the
+// newest 20 every time; mautrix/linkedin#56), but pages by the cursor it
+// gives. Pllum Connect addition.
+func (c *Client) GetConversationsWithNextCursor(ctx context.Context, cursor string) (*CollectionResponse[ConversationCursorMetadata, Conversation], error) {
+	if c == nil {
+		return nil, ErrClientIsNil
+	}
+	variables := map[string]string{
+		"mailboxUrn": url.QueryEscape(c.userEntityURN.WithPrefix("urn", "li", "fsd_profile").String()),
+		"count":      "20",
+		"query":      "(predicateUnions:List((conversationCategoryPredicate:(category:PRIMARY_INBOX))))",
+	}
+	if cursor != "" {
+		variables["nextCursor"] = url.QueryEscape(cursor)
+	}
+	var response GraphQlResponse
+	_, err := c.newAuthedRequest(http.MethodGet, linkedInVoyagerMessagingGraphQLURL).
+		WithGraphQLQuery(graphQLQueryIDMessengerConversationsWithNextCursor, variables).
+		Do(ctx, &response)
+	if err != nil {
+		return nil, err
+	} else if response.Data.MessengerConversationsByCategoryQuery == nil {
+		return nil, ErrMissingGraphQLData
 	}
 	return response.Data.MessengerConversationsByCategoryQuery, nil
 }
