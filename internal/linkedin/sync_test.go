@@ -306,12 +306,13 @@ func historyFeed(r *rig, endDays int) {
 	}
 }
 
-func TestHistoryIsPacedAtOneRequestEveryTwoSeconds(t *testing.T) {
+func TestHistoryIsPacedARandomTwoToFourSecondsApart(t *testing.T) {
 	r := newRig(t)
 	historyFeed(r, 400)
 	r.live()
 	var last time.Time
 	paged := 0
+	gaps := map[time.Duration]bool{}
 	for _, c := range r.f.callsNow() {
 		switch c.name {
 		case "GetCurrentUserProfile", "GetConversationsBySyncToken", "GetConversationsWithNextCursor", "GetMessagesBefore", "GetMessagesWithPrevCursor":
@@ -321,13 +322,21 @@ func TestHistoryIsPacedAtOneRequestEveryTwoSeconds(t *testing.T) {
 		if c.name == "GetMessagesWithPrevCursor" {
 			paged++
 		}
-		if !last.IsZero() && c.at.Sub(last) < 2*time.Second {
-			t.Errorf("%s went %v after the request before it, want at least 2 s", c.name, c.at.Sub(last))
+		if !last.IsZero() {
+			gap := c.at.Sub(last)
+			if gap < 2*time.Second || gap > 4*time.Second {
+				t.Errorf("%s went %v after the request before it, want 2 to 4 s", c.name, gap)
+			}
+			gaps[gap] = true
 		}
 		last = c.at
 	}
 	if paged < 10 {
 		t.Errorf("%d history pages, want the chat paged back", paged)
+	}
+	// Meta's pace, not a metronome: the gaps differ.
+	if len(gaps) < paged/2 {
+		t.Errorf("%d different gaps over %d pages, want a random gap each time", len(gaps), paged)
 	}
 	if r.f.maxIn > 1 {
 		t.Errorf("%d requests at once, want one at a time", r.f.maxIn)
@@ -495,8 +504,8 @@ func fetchesInOrder(t *testing.T, r *rig, from int, want []string) {
 			if connected < 0 && from == 0 {
 				t.Fatalf("%s was fetched before the stream connected (live)", c.arg)
 			}
-			if !last.IsZero() && c.at.Sub(last) < 2*time.Second {
-				t.Errorf("fetches %v apart, want at least 2 s", c.at.Sub(last))
+			if gap := c.at.Sub(last); !last.IsZero() && (gap < 2*time.Second || gap > 4*time.Second) {
+				t.Errorf("fetches %v apart, want 2 to 4 s", gap)
 			}
 			last = c.at
 			got = append(got, c.arg)

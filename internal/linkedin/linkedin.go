@@ -9,8 +9,8 @@
 // are writes.go's, and photo fetches media.go's.
 //
 // LinkedIn restricts accounts that behave like a script, so the network makes
-// only the calls liClient lists, its background requests go one at a time at
-// most one every 2 s, and LinkedIn pushing back (a 403, 429 or 999) pauses
+// only the calls liClient lists, its background requests go one at a time, a
+// random 2 to 4 s apart (Meta's pace), and LinkedIn pushing back (a 403, 429 or 999) pauses
 // every request, the realtime stream included (pause.go). A session LinkedIn
 // ends (a 401, a 302, li_at deleted) is reconnectNeeded, and nothing asks
 // with it again: only a new sign-in in the window does.
@@ -24,6 +24,7 @@ package linkedin
 import (
 	"context"
 	"io"
+	"math/rand/v2"
 	"net/http"
 	"slices"
 	"strings"
@@ -114,6 +115,8 @@ type Options struct {
 	// as its browser, resuming LinkedIn's conversations sync from syncToken.
 	NewClient func(self linkedingo.URN, jar *linkedingo.StringCookieJar, userAgent, syncToken string, h linkedingo.Handlers) liClient
 	Clock     Clock
+	// Rand gives the background pace's randomness, in [0, 1).
+	Rand func() float64
 }
 
 // realClient is linkedingo's client, with the page's User-Agent in place of
@@ -129,9 +132,6 @@ func realClient(self linkedingo.URN, jar *linkedingo.StringCookieJar, ua, syncTo
 // silent is ctx carrying a logger that writes nothing, for the library.
 func silent(ctx context.Context) context.Context { return zerolog.Nop().WithContext(ctx) }
 
-// backgroundGap is the least time between two background requests.
-const backgroundGap = 2 * time.Second
-
 // changedEvery is the least time between two changed events.
 const changedEvery = 500 * time.Millisecond
 
@@ -144,6 +144,7 @@ type LinkedIn struct {
 
 	newClient func(self linkedingo.URN, jar *linkedingo.StringCookieJar, userAgent, syncToken string, h linkedingo.Handlers) liClient
 	clock     Clock
+	rand      func() float64
 	pause     *pause
 	diff      *meta.SessionDiff
 
@@ -226,6 +227,7 @@ func New(st *store.Store, dir string, key [32]byte, emit network.Emit, opts Opti
 		emit:      emit,
 		newClient: opts.NewClient,
 		clock:     opts.Clock,
+		rand:      opts.Rand,
 		diff:      meta.NewSessionDiff(SignInPage()),
 		state:     network.NotConnected,
 		values:    map[string]string{},
@@ -238,6 +240,9 @@ func New(st *store.Store, dir string, key [32]byte, emit network.Emit, opts Opti
 	}
 	if l.clock == nil {
 		l.clock = realClock{}
+	}
+	if l.rand == nil {
+		l.rand = rand.Float64
 	}
 	l.pause = &pause{now: func() time.Time { return l.clock.Now() }}
 	return l
@@ -759,8 +764,7 @@ func (l *LinkedIn) failed(gen int, s network.State, kind wire.Kind) {
 }
 
 // request makes one request of run gen: none while a pause is in force or
-// once the run has ended; a background one waits its turn, at most one every
-// 2 s. A success may carry changed cookies to Pllum; LinkedIn pushing back
+// once the run has ended; a background one waits its turn (paced). A success may carry changed cookies to Pllum; LinkedIn pushing back
 // pauses everything, and an ended session ends the run.
 func (l *LinkedIn) request(ctx context.Context, gen int, background bool, fn func(ctx context.Context) error) error {
 	if err := l.gate(gen); err != nil {
@@ -809,8 +813,10 @@ func (l *LinkedIn) gate(gen int) error {
 	return nil
 }
 
-// paced waits until a background request may go: at most one every 2 s, in
-// the order they ask.
+// paced waits until a background request may go, in the order they ask: a
+// random 2 to 4 s after the one before (Meta's pace, meta.MinGap to
+// meta.MaxGap), so they never tick like a script; at once when the last was
+// longer ago than that.
 func (l *LinkedIn) paced(ctx context.Context) error {
 	l.pmu.Lock()
 	now := l.clock.Now()
@@ -818,7 +824,7 @@ func (l *LinkedIn) paced(ctx context.Context) error {
 	if l.nextBg.After(at) {
 		at = l.nextBg
 	}
-	l.nextBg = at.Add(backgroundGap)
+	l.nextBg = at.Add(meta.MinGap + time.Duration(l.rand()*float64(meta.MaxGap-meta.MinGap)))
 	l.pmu.Unlock()
 	return l.clock.Sleep(ctx, at.Sub(now))
 }

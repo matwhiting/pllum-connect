@@ -14,7 +14,7 @@ import (
 )
 
 // Catching up and paging history. Every request here is a background one:
-// one at a time, at most one every 2 s (request's pace), none during a pause.
+// one at a time, a random 2 to 4 s apart (paced), none during a pause.
 const (
 	// pageSize is how many messages a page asks for.
 	pageSize = 20
