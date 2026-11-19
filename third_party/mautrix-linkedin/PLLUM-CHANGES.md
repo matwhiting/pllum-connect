@@ -49,3 +49,20 @@ Every change, and nothing else:
 - Test: `pkg/linkedingo/request_pllum_test.go` (a counting round-tripper; no
   request leaves the machine).
 - Drop it when the library can send without retrying.
+
+## 3. A heartbeat pushed back stops the stream (2026-11-19)
+
+- `pkg/linkedingo/realtime.go`: in `runHeartbeatsLoop`, the heartbeat's
+  answer is kept; its body is closed, and an answer outside 2xx stops the
+  stream with `fmt.Errorf("heartbeat: %w", &ResponseError{StatusCode: …})`.
+  `readRealtimeStream` returns that cause, and `realtimeConnectLoop` hands it
+  to the `TransientDisconnect` handler.
+- Why: the loop checked only `DoRaw`'s error, which is nil for any status but
+  a 502 to 504 the library gave up on, and it never closed the body. So a
+  403, 429, 999 or 302 that only the heartbeat met went unseen, and the
+  heartbeat went on every minute. Pllum Connect pauses every LinkedIn request
+  on a 403, 429 or 999 and ends the session on a 302; with this change its
+  `TransientDisconnect` handler sees the heartbeat's answer like any other.
+- Test: `pkg/linkedingo/realtime_pllum_test.go` (a fake round-tripper; no
+  request leaves the machine).
+- Drop it when the library reads the heartbeat's status itself.

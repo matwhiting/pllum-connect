@@ -1,6 +1,10 @@
 // mautrix-linkedin - A Matrix-LinkedIn puppeting bridge.
 // Copyright (C) 2025 Sumner Evans
 //
+// Modified by Pllum Connect on 2026-11-19: a heartbeat LinkedIn answers with
+// anything but a 2xx stops the stream with that answer as a *ResponseError
+// (see PLLUM-CHANGES.md at the root of this copy).
+//
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU Affero General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
@@ -119,7 +123,7 @@ func (c *Client) runHeartbeatsLoop(ctx context.Context, stopStream context.Cance
 	for {
 		log.Debug().Stringer("realtime_session_id", c.realtimeSessionID).Msg("Sending heartbeat")
 
-		_, err := c.newAuthedRequest(http.MethodPost, linkedInRealtimeHeartbeatURL).
+		resp, err := c.newAuthedRequest(http.MethodPost, linkedInRealtimeHeartbeatURL).
 			WithQueryParam("action", "sendHeartbeat").
 			WithHeader("accept", "*/*").
 			WithContentType(contentTypePlaintextUTF8).
@@ -144,6 +148,13 @@ func (c *Client) runHeartbeatsLoop(ctx context.Context, stopStream context.Cance
 		} else if err != nil {
 			log.Err(err).Msg("Failed to send heartbeat")
 			stopStream(fmt.Errorf("failed to send heartbeat: %w", err))
+			return
+		}
+		_ = resp.Body.Close()
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			err = &ResponseError{StatusCode: resp.StatusCode}
+			log.Err(err).Msg("Heartbeat answered with an error")
+			stopStream(fmt.Errorf("heartbeat: %w", err))
 			return
 		}
 

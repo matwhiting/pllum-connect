@@ -3,6 +3,7 @@ package linkedin
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 	"testing"
 	"time"
@@ -271,5 +272,27 @@ func TestATransientDisconnectIsOfflineUntilItConnects(t *testing.T) {
 	r.waitState(network.Offline, wire.RateLimited)
 	if got := r.ev.states(); !slices.Contains(got, "offline/rateLimited") {
 		t.Fatalf("states = %v", got)
+	}
+}
+
+// The library's stream drops with a heartbeat's answer wrapped as it wraps
+// it (third_party PLLUM-CHANGES.md, change 3): pushback pauses, a redirect
+// ends the session.
+func TestAHeartbeatPushedBackPausesOrEnds(t *testing.T) {
+	for status, want := range map[int]network.State{403: network.Offline, 429: network.Offline, 999: network.Offline, 302: network.ReconnectNeeded} {
+		r := newRig(t)
+		c := r.live()
+		c.dispatch(transient{err: fmt.Errorf("heartbeat: %w", statusErr(status))})
+		if want == network.Offline {
+			r.waitState(network.Offline, wire.RateLimited)
+			if _, blocked := r.l.pause.blocked(); !blocked {
+				t.Errorf("a heartbeat answered %d did not pause", status)
+			}
+		} else {
+			r.waitState(network.ReconnectNeeded, "")
+		}
+		eventually(t, fmt.Sprintf("the stream stopped after a heartbeat answered %d", status), func() bool {
+			return r.f.count("RealtimeDisconnect") > 0
+		})
 	}
 }
