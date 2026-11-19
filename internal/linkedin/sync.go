@@ -343,6 +343,11 @@ func (l *LinkedIn) listBack(ctx context.Context, gen int, cli liClient, first bo
 				oldest = at
 			}
 		}
+		if !l.current(gen) {
+			// Ended meanwhile (his Disconnect may have forgotten the
+			// listing): nothing more is kept for it.
+			return errNotConnected
+		}
 		l.storeConversations(page.Elements)
 		next := page.Metadata.NextCursor
 		if first {

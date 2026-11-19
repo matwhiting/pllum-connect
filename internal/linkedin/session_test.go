@@ -1,12 +1,15 @@
 package linkedin
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"reflect"
 	"regexp"
 	"slices"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -331,5 +334,149 @@ func TestALoginAlwaysSaysItsOutcome(t *testing.T) {
 	_ = r3.login(bad)
 	if got := r3.ev.states(); !slices.Equal(got, []string{"notConnected/badRequest", "notConnected/badRequest"}) {
 		t.Errorf("states for two bad sessions = %v, want notConnected/badRequest said each time", got)
+	}
+}
+
+// otherConvURN is an invented conversation of the other account: its URN
+// carries that account's profile ID, as LinkedIn's do.
+func otherConvURN(n int) string {
+	return fmt.Sprintf("urn:li:msg_conversation:(urn:li:fsd_profile:%s,2-b3RoZXItaW52ZW50ZWQt%04d)", otherID, n)
+}
+
+func otherConv(n int, at time.Time) linkedingo.Conversation {
+	return linkedingo.Conversation{
+		EntityURN:                linkedingo.NewURN(otherConvURN(n)),
+		LastActivityAt:           ms(at),
+		ConversationParticipants: []linkedingo.MessagingParticipant{person(otherID, "Other", "Invented"), person(bobID, "Bob", "Invented")},
+		Categories:               []string{"INBOX", "PRIMARY_INBOX"},
+	}
+}
+
+// keptAccountValues are the stored values that belong to the account signed in.
+func keptAccountValues(r *rig) map[string]string {
+	out := map[string]string{}
+	for _, name := range []string{"self", "syncToken", "listed", "listCursor", "block",
+		"fresh." + convURN(1), "cursor." + convURN(1), "histDone." + convURN(1)} {
+		if v := r.value(name); v != "" {
+			out[name] = v
+		}
+	}
+	return out
+}
+
+func TestDisconnectForgetsTheAccount(t *testing.T) {
+	r := newRig(t)
+	historyFeed(r, 400)
+	// His history stops partway (a 404 on a page), leaving progress kept.
+	r.f.failOnce("GetMessagesWithPrevCursor", statusErr(404))
+	r.live()
+	r.keep("fresh."+convURN(1), "1")
+	r.keep("listCursor", "next-invented-9")
+	if len(keptAccountValues(r)) < 4 {
+		t.Fatalf("the rig kept too little to test: %v", keptAccountValues(r))
+	}
+	if err := r.l.Logout(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := keptAccountValues(r); len(got) != 0 {
+		t.Errorf("Disconnect kept the account's values: %v", got)
+	}
+	if got := r.lines(convURN(1)); len(got) == 0 {
+		t.Errorf("Disconnect dropped his messages")
+	}
+
+	// Another account signs in: accepted, listed afresh, and his old chats
+	// stay readable but read-only, never worked on beside the new account's.
+	r.f.profileID = otherID
+	r.f.syncPage = func(token string) *linkedingo.CollectionResponse[linkedingo.ConversationSyncMetadata, linkedingo.Conversation] {
+		return syncPageOf([]linkedingo.Conversation{otherConv(1, start.Add(-time.Hour))})
+	}
+	r.f.cursorPage = func(cursor string) *linkedingo.CollectionResponse[linkedingo.ConversationCursorMetadata, linkedingo.Conversation] {
+		return cursorPageOf("", otherConv(1, start.Add(-time.Hour)), otherConv(2, start.Add(-2*time.Hour)))
+	}
+	r.f.before = func(string, time.Time, int) *linkedingo.CollectionResponse[linkedingo.MessageMetadata, linkedingo.Message] {
+		return messagePage("")
+	}
+	n := len(r.f.callsNow())
+	if err := r.login(otherSession()); err != nil {
+		t.Fatal(err)
+	}
+	r.waitState(network.Live, "")
+	r.idle()
+	if slices.Contains(r.ev.states(), "notConnected/refused") {
+		t.Fatalf("another account was refused after Disconnect: %v", r.ev.states())
+	}
+	if got := r.value("self"); got != otherID {
+		t.Errorf("self = %q, want the new account's", got)
+	}
+	var tokens, cursors []string
+	for _, c := range r.f.callsNow()[n:] {
+		switch c.name {
+		case "GetConversationsBySyncToken":
+			tokens = append(tokens, c.arg)
+		case "GetConversationsWithNextCursor":
+			cursors = append(cursors, c.arg)
+		case "GetMessagesBefore", "GetMessagesWithPrevCursor":
+			if strings.HasPrefix(c.arg, convURN(1)) {
+				t.Errorf("the old account's chat was asked about under the new account: %s %s", c.name, c.arg)
+			}
+		}
+	}
+	if len(tokens) == 0 || tokens[0] != "" {
+		t.Errorf("the new account's catch-up asked with tokens %q, want none", tokens)
+	}
+	if len(cursors) == 0 || cursors[0] != "" {
+		t.Errorf("the new account's listing began at %q, want the first page", cursors)
+	}
+	if ch := r.chat(convURN(1)); !ch.ReadOnly {
+		t.Errorf("the old account's chat is not read-only beside the new account's")
+	}
+	if got := r.lines(convURN(1)); len(got) == 0 {
+		t.Errorf("the old account's lines are gone")
+	}
+	for _, id := range []string{otherConvURN(1), otherConvURN(2)} {
+		if ch := r.chat(id); ch.ReadOnly {
+			t.Errorf("the new account's chat %s is read-only", id)
+		}
+	}
+	if _, err := r.l.Send(context.Background(), network.Outgoing{ChatID: convURN(1), Text: "invented"}); wire.KindOf(err) != wire.NotOnNetwork {
+		t.Errorf("a send to the old account's chat: %v, want notOnNetwork", err)
+	}
+}
+
+func TestDisconnectThenHisOwnAccountKeepsHisChatsWritable(t *testing.T) {
+	r := newRig(t)
+	r.f.syncPage = func(string) *linkedingo.CollectionResponse[linkedingo.ConversationSyncMetadata, linkedingo.Conversation] {
+		return syncPageOf([]linkedingo.Conversation{conv(1, start.Add(-time.Hour))})
+	}
+	r.live()
+	if err := r.l.Logout(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.login(validSession()); err != nil {
+		t.Fatal(err)
+	}
+	r.waitState(network.Live, "")
+	r.idle()
+	if ch := r.chat(convURN(1)); ch.ReadOnly {
+		t.Errorf("his own chat went read-only when he signed in again")
+	}
+	if got := r.value("self"); got != selfID {
+		t.Errorf("self = %q", got)
+	}
+}
+
+func TestDisconnectForgetsAnEndedSession(t *testing.T) {
+	r := newRig(t)
+	c := r.live()
+	c.dispatch(badCredentials{err: errors.New("invented: rejected")})
+	r.waitState(network.ReconnectNeeded, "")
+	r.idle()
+	if err := r.l.Logout(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	r.restart()
+	if st, _ := r.l.stateNow(); st != network.NotConnected {
+		t.Errorf("state after Disconnect and a restart = %s, want notConnected", st)
 	}
 }

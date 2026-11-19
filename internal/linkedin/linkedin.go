@@ -336,15 +336,18 @@ func (l *LinkedIn) CancelLogin() {
 }
 
 // Logout is his Disconnect: it signs the session out of LinkedIn (once,
-// unless a pause or an ended session forbids a request), stops the stream and
-// forgets the cookies. The chats stay in the store, and so does his profile
-// ID, so a later sign-in must be his.
+// unless a pause or an ended session forbids a request), stops the stream,
+// forgets the cookies and forgets the account (forgetAccount), so the next
+// sign-in may be any account's. The chats stay in the store, readable; a
+// pause stays, as it is LinkedIn's.
 func (l *LinkedIn) Logout(ctx context.Context) error {
 	l.mu.Lock()
 	cli := l.cli
 	l.endProbe()
 	l.retire()
 	l.session = nil
+	l.hashes = nil
+	l.forgetAccount()
 	l.setState(network.NotConnected, "")
 	l.mu.Unlock()
 	if cli == nil {
@@ -550,7 +553,8 @@ func (l *LinkedIn) signIn(ctx context.Context, pg int, session network.Session, 
 		return
 	}
 	l.endProbe()
-	if self := l.self(); self != "" && self != id {
+	self := l.self()
+	if self != "" && self != id {
 		l.setState(network.NotConnected, wire.Refused)
 		l.backToBefore()
 		return
@@ -559,6 +563,11 @@ func (l *LinkedIn) signIn(ctx context.Context, pg int, session network.Session, 
 		l.setState(network.NotConnected, wire.Internal)
 		l.backToBefore()
 		return
+	}
+	if self == "" {
+		// The first sign-in since the account was forgotten (or ever): the
+		// chats of any account before it stay readable, but read-only.
+		l.retireOtherAccounts(id)
 	}
 	// His: the run in force ends, a kept ended session is cleared (he has
 	// signed in again), and his run starts.

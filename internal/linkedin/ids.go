@@ -4,6 +4,8 @@ import (
 	"strings"
 
 	"go.mau.fi/mautrix-linkedin/pkg/linkedingo"
+
+	"github.com/matwhiting/pllum-connect/internal/store"
 )
 
 // LinkedIn's IDs, as the protocol and the store use them:
@@ -23,8 +25,10 @@ import (
 // compared at every later one), "syncToken" (LinkedIn's conversations sync
 // token), "listed" and "listCursor" (the first sign-in's listing of the inbox,
 // done or where it got to), "cursor.<chat>" (where that chat's history goes
-// on), "histDone.<chat>" (its history reached 730 days), "pause" (the
-// back-off) and "block" (the session LinkedIn ended, by its hash).
+// on), "histDone.<chat>" (its history reached 730 days), "fresh.<chat>"
+// (what came in it is still to fetch), "pause" (the back-off) and "block"
+// (the session LinkedIn ended, by its hash). His Disconnect forgets all but
+// the pause (forgetAccount).
 
 // Name is the network's name in the protocol and in the store.
 const Name = "linkedin"
@@ -72,5 +76,89 @@ func (l *LinkedIn) keep(name, v string) error {
 	return nil
 }
 
-// self is his profile ID, or "" before his first sign-in.
+// self is his profile ID, or "" before his first sign-in and after his
+// Disconnect.
 func (l *LinkedIn) self() string { return l.value("self") }
+
+// conversationOwner is the profile ID a conversation URN carries, the
+// account whose inbox it is in ("urn:li:msg_conversation:(urn:li:fsd_profile:
+// <owner>,2-…)"), or "" when it carries none.
+func conversationOwner(chatID string) string {
+	rest, ok := strings.CutPrefix(chatID, conversationPrefix+"(")
+	if !ok {
+		return ""
+	}
+	owner, _, ok := strings.Cut(rest, ",")
+	if !ok {
+		return ""
+	}
+	return owner[strings.LastIndex(owner, ":")+1:]
+}
+
+// accountValues are the stored values that belong to the account signed in,
+// besides the per-chat ones (chatValues).
+var accountValues = []string{"self", "syncToken", "listed", "listCursor", "block"}
+
+// chatValues prefix the per-chat stored values: a chat's fresh mark, where
+// its history goes on, and its history being done.
+var chatValues = []string{"fresh.", "cursor.", "histDone."}
+
+// forgetAccount forgets the account signed in (his Disconnect): his profile
+// ID, the sync token, the listing of the inbox, every chat's fresh mark and
+// history progress, and the session LinkedIn ended. The chats and their
+// lines stay. l.mu is held.
+func (l *LinkedIn) forgetAccount() {
+	for _, name := range accountValues {
+		l.forget(name)
+	}
+	for _, c := range l.conversations() {
+		for _, prefix := range chatValues {
+			l.forget(prefix + c.ID)
+		}
+	}
+}
+
+// forget removes the stored value called name, whatever the memory of it
+// says.
+func (l *LinkedIn) forget(name string) {
+	if l.st.PutNetworkValue(Name, name, "") != nil {
+		return
+	}
+	l.vmu.Lock()
+	l.values[name] = ""
+	l.vmu.Unlock()
+}
+
+// retireOtherAccounts makes read-only every stored conversation of another
+// account than self's: they stay readable, and are never written to or
+// worked on beside his. l.mu is held.
+func (l *LinkedIn) retireOtherAccounts(self string) {
+	for _, c := range l.conversations() {
+		if owner := conversationOwner(c.ID); owner != "" && owner != self && !c.ReadOnly {
+			l.readOnly(c.ID)
+		}
+	}
+}
+
+// conversations is every LinkedIn conversation the store holds, newest
+// first.
+func (l *LinkedIn) conversations() []store.Chat {
+	var out []store.Chat
+	cursor := ""
+	for range 50 {
+		page, err := l.st.Chats(Name, 0, cursor, 200)
+		if err != nil {
+			return out
+		}
+		for _, c := range page.Items {
+			if isConversation(c.ID) {
+				out = append(out, c)
+			}
+		}
+		if page.Cursor == "" {
+			break
+		}
+		cursor = page.Cursor
+	}
+	return out
+}
