@@ -2,6 +2,7 @@ package linkedin
 
 import (
 	"context"
+	"errors"
 	"slices"
 	"time"
 
@@ -26,6 +27,10 @@ const (
 	catchUpPages = 10
 	// historyReach is how far back the history worker pages each chat.
 	historyReach = 730 * 24 * time.Hour
+	// passingWait is how long background work a passing failure stopped (a
+	// 5xx, an answer the helper can't read, a timeout) waits before it is
+	// asked again, unless something wakes it sooner.
+	passingWait = 3 * time.Minute
 )
 
 // The background work a run does between catch-ups and history.
@@ -72,7 +77,7 @@ func (l *LinkedIn) stayCaughtUp(ctx context.Context, gen int, cli liClient) {
 		case jobPages:
 			err = l.listBack(ctx, gen, cli, false)
 		case jobSync:
-			err = l.catchUpByToken(ctx, gen, cli)
+			err = l.syncByToken(ctx, gen, cli)
 		default:
 			// What came in the chats a catch-up found changed first, newest
 			// chat first; then the history.
@@ -82,6 +87,9 @@ func (l *LinkedIn) stayCaughtUp(ctx context.Context, gen int, cli liClient) {
 				did, err = l.historyStep(ctx, gen, cli)
 			}
 			if err == nil && !did {
+				if l.askPassedAgain(gen) {
+					continue
+				}
 				if !l.waitForJob(ctx) {
 					return
 				}
@@ -92,9 +100,11 @@ func (l *LinkedIn) stayCaughtUp(ctx context.Context, gen int, cli liClient) {
 			return
 		}
 		if err != nil {
-			// A failure of its own (no connection, an answer it could not
-			// read): the work waits for the stream or a nudge to ask again,
-			// rather than asking again and again.
+			// A passing failure (no connection, a 5xx, an answer it could not
+			// read, a timeout) settles nothing: the work it stopped is asked
+			// again in passingWait, or when the stream or a nudge asks sooner,
+			// rather than again and again.
+			l.later(gen, j)
 			if !l.waitForJob(ctx) {
 				return
 			}
@@ -153,19 +163,18 @@ func (l *LinkedIn) signal() {
 }
 
 // catchUp is a run's catch-up before the stream: by the sync token kept in
-// the store. The first sign-in has none: the sync token's newest chats (and
-// a token), then the inbox listed by cursor back a year.
+// the store (syncByToken). The first sign-in has none: the sync token's
+// newest chats (and a token), then the inbox listed by cursor back a year.
 //
-// A token LinkedIn will not answer for (an answer the helper can't use, not
-// a pause, an ended session or a dropped connection) is dropped, so the next
-// run starts afresh without one, and this one lists the inbox by cursor
-// instead: a run never fails over and over on the same token.
+// A passing answer (a 5xx, one the helper can't read) keeps the token: the
+// run goes on, and the catch-up is asked again later. No connection or a
+// timeout fails the run, which a nudge starts again.
 func (l *LinkedIn) catchUp(ctx context.Context, gen int, cli liClient) error {
-	if err := l.catchUpByToken(ctx, gen, cli); err != nil {
-		if !l.current(gen) || !skippable(err) {
+	if err := l.syncByToken(ctx, gen, cli); err != nil {
+		if !l.current(gen) || wire.KindOf(err) != wire.Internal {
 			return err
 		}
-		_ = l.keep("syncToken", "")
+		l.later(gen, jobSync)
 	}
 	if l.value("listed") == "" {
 		return l.listBack(ctx, gen, cli, true)
@@ -173,11 +182,109 @@ func (l *LinkedIn) catchUp(ctx context.Context, gen int, cli liClient) error {
 	return nil
 }
 
-// skippable reports whether a background request's failure is LinkedIn's
-// answer about that one thing (a chat it won't page, a token it won't take),
-// which the work passes over, rather than a pause, an ended session or a
-// connection gone, which stop it.
-func skippable(err error) bool { return wire.KindOf(err) == wire.Internal }
+// syncByToken is a catch-up by the sync token. A token LinkedIn won't take
+// (gone, not a passing failure) is dropped, so the next run starts afresh
+// without one, and what changed since it was given is listed by cursor back
+// to the newest activity stored: here, and on every later catch-up of this
+// run, as its client still holds the token it was made with. Before the
+// first listing, that listing covers it.
+func (l *LinkedIn) syncByToken(ctx context.Context, gen int, cli liClient) error {
+	l.mu.Lock()
+	dropped := l.tokenDropped && gen == l.gen
+	l.mu.Unlock()
+	if dropped {
+		return l.listBack(ctx, gen, cli, false)
+	}
+	err := l.catchUpByToken(ctx, gen, cli)
+	if err == nil || !settled(err) || !l.current(gen) {
+		return err
+	}
+	_ = l.keep("syncToken", "")
+	l.mu.Lock()
+	if gen == l.gen {
+		l.tokenDropped = true
+	}
+	l.mu.Unlock()
+	if l.value("listed") == "" {
+		return nil
+	}
+	return l.listBack(ctx, gen, cli, false)
+}
+
+// settled reports whether a background request's failure is LinkedIn's
+// answer that the thing asked about is not to be had (gone), which settles
+// the work for good: a chat's fresh mark, its history, the sync token. Any
+// other failure passes, and the work is asked again later.
+func settled(err error) bool { return errors.Is(err, errGone) }
+
+// later asks again, in passingWait, for the work a passing failure of run
+// gen stopped: the catch-up j, or (jobNone) the chats passed over (pass),
+// which the work goes around until then. l.mu is not held.
+func (l *LinkedIn) later(gen int, j job) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if gen != l.gen || l.stopped {
+		return
+	}
+	switch j {
+	case jobSync:
+		l.held.sync = true
+	case jobPages:
+		l.held.pages = true
+	}
+	if l.stopLater != nil {
+		return
+	}
+	l.passDue = false
+	l.stopLater = l.clock.AfterFunc(passingWait, func() {
+		l.mu.Lock()
+		defer l.mu.Unlock()
+		if gen != l.gen || l.stopped {
+			return
+		}
+		l.stopLater = nil
+		l.passDue = true
+		l.due.sync = l.due.sync || l.held.sync
+		l.due.pages = l.due.pages || l.held.pages
+		l.held.sync, l.held.pages = false, false
+		l.signal()
+	})
+}
+
+// pass sets a chat aside after a passing failure of run gen: the work goes
+// around it until later's timer fires, so one chat failing holds up no
+// other.
+func (l *LinkedIn) pass(gen int, chat string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if gen != l.gen || l.stopped {
+		return
+	}
+	if l.passed == nil {
+		l.passed = map[string]bool{}
+	}
+	l.passed[chat] = true
+}
+
+// passedOver reports whether a chat is set aside (pass).
+func (l *LinkedIn) passedOver(chat string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.passed[chat]
+}
+
+// askPassedAgain takes the chats set aside back into the work, once later's
+// timer has fired and nothing else is left to do; false when there are none
+// or it is not yet time.
+func (l *LinkedIn) askPassedAgain(gen int) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if gen != l.gen || !l.passDue || len(l.passed) == 0 {
+		return false
+	}
+	l.passed, l.passDue = nil, false
+	return true
+}
 
 // catchUpByToken asks for the conversations changed since the sync token the
 // client holds (the client gives the new token to the handler, which keeps
@@ -220,6 +327,10 @@ func (l *LinkedIn) listBack(ctx context.Context, gen int, cli liClient, first bo
 			page, err = cli.GetConversationsWithNextCursor(ctx, cursor)
 			return err
 		})
+		if settled(err) {
+			// LinkedIn lists nothing further: the listing ends here.
+			break
+		}
 		if err != nil {
 			return err
 		}
@@ -291,14 +402,18 @@ func (l *LinkedIn) storeConversations(convs []linkedingo.Conversation) {
 }
 
 // freshStep fetches what came in the newest chat marked fresh (catchUpChat)
-// and clears its mark; did is false when none is marked. A chat LinkedIn
-// won't page is cleared too, and passed over.
+// and clears its mark; did is false when none is marked. A chat LinkedIn says
+// isn't there (gone) is cleared too. A passing failure keeps the mark, and
+// the chat is set aside until later asks again.
 func (l *LinkedIn) freshStep(ctx context.Context, gen int, cli liClient) (did bool, err error) {
-	chat, ok := l.nextChat(func(c store.Chat) bool { return !c.ReadOnly && l.value("fresh."+c.ID) != "" })
+	chat, ok := l.nextChat(func(c store.Chat) bool {
+		return !c.ReadOnly && l.value("fresh."+c.ID) != "" && !l.passedOver(c.ID)
+	})
 	if !ok {
 		return false, nil
 	}
-	if err := l.catchUpChat(ctx, gen, cli, linkedingo.NewURN(chat)); err != nil && (!l.current(gen) || !skippable(err)) {
+	if err := l.catchUpChat(ctx, gen, cli, linkedingo.NewURN(chat)); err != nil && !settled(err) {
+		l.pass(gen, chat)
 		return true, err
 	}
 	_ = l.keep("fresh."+chat, "")
@@ -372,12 +487,15 @@ func (l *LinkedIn) historyStep(ctx context.Context, gen int, cli liClient) (did 
 		})
 	}
 	if err != nil {
-		if l.current(gen) && skippable(err) {
-			// LinkedIn won't page this chat: it is passed over, not asked
-			// again and again.
+		if settled(err) {
+			// LinkedIn says there is nothing to page there: the chat is
+			// passed over for good, not asked again and again.
 			_ = l.keep("histDone."+chat, "1")
 			return true, nil
 		}
+		// A passing failure settles nothing: the chat is set aside until
+		// later asks again.
+		l.pass(gen, chat)
 		return true, err
 	}
 	l.storeMessages(page.Elements, store.SourceSync)
@@ -414,7 +532,7 @@ func (l *LinkedIn) historyPaged(chat, cursor string, page *linkedingo.Collection
 // to page: not at its start, not paged to 730 days, not read-only.
 func (l *LinkedIn) nextHistoryChat() (string, bool) {
 	return l.nextChat(func(c store.Chat) bool {
-		return !c.HistoryComplete && !c.ReadOnly && l.value("histDone."+c.ID) == ""
+		return !c.HistoryComplete && !c.ReadOnly && l.value("histDone."+c.ID) == "" && !l.passedOver(c.ID)
 	})
 }
 

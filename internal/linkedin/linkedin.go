@@ -47,6 +47,10 @@ var (
 	errNotConnected = &wire.Error{Kind: wire.NotConnected}
 	errUnsupported  = &wire.Error{Kind: wire.Unsupported}
 	errRateLimited  = &wire.Error{Kind: wire.RateLimited}
+	// errGone is a background request's failure that is LinkedIn's answer
+	// that the thing asked about is not to be had (gone): only it settles
+	// background work for good. Its kind is internal.
+	errGone = &wire.Error{Kind: wire.Internal}
 )
 
 // liClient is every LinkedIn call the helper may make, and nothing else:
@@ -163,6 +167,15 @@ type LinkedIn struct {
 	retry      bool      // the run ended for a passing reason: a nudge may start another
 	stopResume func() bool
 	due        struct{ sync, pages bool } // catch-ups the realtime stream asked for
+
+	// Background work a passing failure stopped (sync.go's later): the
+	// catch-ups to ask again and the chats passed over until the timer
+	// fires. All belong to the run in force, and retire forgets them.
+	stopLater    func() bool
+	held         struct{ sync, pages bool }
+	passed       map[string]bool
+	passDue      bool // the timer has fired: the chats passed over may be asked again
+	tokenDropped bool // the run's client holds a sync token LinkedIn won't take
 
 	// A sign-in being checked: its profile is read before anything else
 	// changes, so another account's is refused with the run in force, the
@@ -408,6 +421,12 @@ func (l *LinkedIn) retire() {
 	}
 	l.runCtx = nil
 	l.due.sync, l.due.pages = false, false
+	if l.stopLater != nil {
+		l.stopLater()
+		l.stopLater = nil
+	}
+	l.held.sync, l.held.pages = false, false
+	l.passed, l.passDue, l.tokenDropped = nil, false, false
 	l.connected, l.sessID = false, uuid.Nil
 	if old := l.cli; old != nil && l.realtime {
 		// RealtimeDisconnect waits for the stream to stop, which may be
@@ -763,6 +782,9 @@ func (l *LinkedIn) request(ctx context.Context, gen int, background bool, fn fun
 	if kind == reconnectNeeded {
 		l.endSession(gen)
 		return errNotConnected
+	}
+	if gone(err) {
+		return errGone
 	}
 	return &wire.Error{Kind: kind}
 }

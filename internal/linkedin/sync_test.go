@@ -2,6 +2,7 @@ package linkedin
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"slices"
@@ -591,5 +592,180 @@ func TestADeleteOfAConversationNeverStoredMakesNoChat(t *testing.T) {
 	r.idle()
 	if _, ok, _ := r.st.Chat(Name, convURN(77)); ok {
 		t.Errorf("a delete of a conversation never stored made a chat")
+	}
+}
+
+// passingErrors are failures that say nothing about the thing asked for: a
+// 5xx, an answer the helper can't read, a timeout.
+func passingErrors() map[string]error {
+	return map[string]error{
+		"500":        statusErr(500),
+		"501":        statusErr(501),
+		"unreadable": fmt.Errorf("failed to decode response body: %w", errors.New("invented: unexpected end of JSON input")),
+		"timeout":    context.DeadlineExceeded,
+	}
+}
+
+func TestAPassingErrorOnAFreshChatKeepsItsMark(t *testing.T) {
+	for name, perr := range passingErrors() {
+		t.Run(name, func(t *testing.T) {
+			r := newRig(t)
+			alice := person(aliceID, "Alice", "Invented")
+			c := r.live()
+			// While Pllum was closed, Alice wrote in chat 1.
+			r.f.syncPage = func(string) *linkedingo.CollectionResponse[linkedingo.ConversationSyncMetadata, linkedingo.Conversation] {
+				return syncPageOf([]linkedingo.Conversation{conv(1, start.Add(time.Minute))})
+			}
+			r.f.before = func(string, time.Time, int) *linkedingo.CollectionResponse[linkedingo.MessageMetadata, linkedingo.Message] {
+				return messagePage("", text(1, 1, alice, start.Add(time.Minute), "invented while closed"))
+			}
+			r.f.failOnce("GetMessagesBefore", perr)
+			c.dispatch(convDeleteless())
+			r.idle()
+			if got := r.value("fresh." + convURN(1)); got == "" {
+				t.Fatalf("one passing failure cleared the chat's fresh mark")
+			}
+			if got := r.lines(convURN(1)); len(got) != 0 {
+				t.Fatalf("lines = %+v before the retry", got)
+			}
+			// A later turn asks again, at the pace, and gets it.
+			r.clock.Advance(passingWait)
+			eventually(t, "the chat fetched again", func() bool { return len(r.lines(convURN(1))) == 1 })
+			r.idle()
+			if got := r.value("fresh." + convURN(1)); got != "" {
+				t.Errorf("the fresh mark is still kept after the fetch")
+			}
+			if st, _ := r.l.stateNow(); st != network.Live {
+				t.Errorf("state = %s, want live", st)
+			}
+		})
+	}
+}
+
+func TestAGoneChatSettlesItsFreshMark(t *testing.T) {
+	r := newRig(t)
+	c := r.live()
+	r.f.syncPage = func(string) *linkedingo.CollectionResponse[linkedingo.ConversationSyncMetadata, linkedingo.Conversation] {
+		return syncPageOf([]linkedingo.Conversation{conv(1, start.Add(time.Minute))})
+	}
+	r.f.setErr("GetMessagesBefore", statusErr(404))
+	c.dispatch(convDeleteless())
+	r.idle()
+	if got := r.value("fresh." + convURN(1)); got != "" {
+		t.Errorf("a chat LinkedIn says isn't there kept its fresh mark")
+	}
+	n := r.f.count("GetMessagesBefore")
+	r.clock.Advance(passingWait)
+	r.idle()
+	if got := r.f.count("GetMessagesBefore"); got != n {
+		t.Errorf("a chat LinkedIn says isn't there was asked again (%d, then %d)", n, got)
+	}
+}
+
+func TestAPassingErrorOnAHistoryPageDoesNotEndIt(t *testing.T) {
+	for name, perr := range passingErrors() {
+		t.Run(name, func(t *testing.T) {
+			r := newRig(t)
+			historyFeed(r, 400)
+			r.f.failOnce("GetMessagesWithPrevCursor", perr)
+			r.live()
+			if got := r.value("histDone." + convURN(1)); got != "" {
+				t.Fatalf("one passing failure ended the chat's history")
+			}
+			if r.chat(convURN(1)).HistoryComplete {
+				t.Fatalf("the chat's history is complete before it was paged")
+			}
+			r.clock.Advance(passingWait)
+			eventually(t, "the history paged on to the chat's start", func() bool {
+				c, ok, _ := r.st.Chat(Name, convURN(1))
+				return ok && c.HistoryComplete
+			})
+		})
+	}
+}
+
+func TestMissingDataSettlesAChatsHistory(t *testing.T) {
+	r := newRig(t)
+	historyFeed(r, 400)
+	r.f.setErr("GetMessagesWithPrevCursor", linkedingo.ErrMissingGraphQLData)
+	r.live()
+	if got := r.value("histDone." + convURN(1)); got == "" {
+		t.Errorf("a chat LinkedIn gave no data for is still paged")
+	}
+}
+
+func TestAPassingErrorKeepsTheSyncToken(t *testing.T) {
+	for name, perr := range passingErrors() {
+		t.Run(name, func(t *testing.T) {
+			r := newRig(t)
+			r.keep("self", selfID)
+			r.keep("syncToken", "sync-token-invented-7")
+			r.keep("listed", "1")
+			r.f.failOnce("GetConversationsBySyncToken", perr)
+			if err := r.login(validSession()); err != nil {
+				t.Fatal(err)
+			}
+			eventually(t, "the failed catch-up", func() bool { return r.f.count("GetConversationsBySyncToken") >= 1 })
+			r.idle()
+			if got := r.value("syncToken"); got != "sync-token-invented-7" {
+				t.Fatalf("one passing failure dropped the sync token (kept %q)", got)
+			}
+			if r.f.count("GetConversationsWithNextCursor") != 0 {
+				t.Errorf("a passing failure listed the inbox as if the token were gone")
+			}
+			// It is asked again with the same token, and catches up.
+			r.clock.Advance(passingWait)
+			r.l.Nudge()
+			eventually(t, "the token asked again", func() bool { return r.f.count("GetConversationsBySyncToken") >= 2 })
+			r.waitState(network.Live, "")
+			r.idle()
+			var asked []string
+			for _, c := range r.f.callsNow() {
+				if c.name == "GetConversationsBySyncToken" {
+					asked = append(asked, c.arg)
+				}
+			}
+			if asked[1] != "sync-token-invented-7" {
+				t.Errorf("asked again with %q, want the kept token", asked[1])
+			}
+			if got := r.value("syncToken"); got != "sync-token-invented-new" {
+				t.Errorf("kept token = %q after the catch-up, want the new one", got)
+			}
+		})
+	}
+}
+
+func TestADroppedTokensGapIsListedBack(t *testing.T) {
+	r := newRig(t)
+	// An earlier run stored chat 1, an hour ago.
+	r.f.syncPage = func(string) *linkedingo.CollectionResponse[linkedingo.ConversationSyncMetadata, linkedingo.Conversation] {
+		return syncPageOf([]linkedingo.Conversation{conv(1, start.Add(-time.Hour))})
+	}
+	r.live()
+	r.restart()
+	// LinkedIn no longer takes the token; chats 2 and 3 changed meanwhile.
+	r.f.failOnce("GetConversationsBySyncToken", statusErr(400))
+	r.f.cursorPage = func(cursor string) *linkedingo.CollectionResponse[linkedingo.ConversationCursorMetadata, linkedingo.Conversation] {
+		switch cursor {
+		case "":
+			return cursorPageOf("next-invented-1", conv(2, start.Add(20*time.Minute)), conv(3, start.Add(10*time.Minute)))
+		case "next-invented-1":
+			return cursorPageOf("next-invented-2", conv(1, start.Add(-time.Hour)))
+		}
+		t.Errorf("listed past the newest stored activity, to %q", cursor)
+		return cursorPageOf("")
+	}
+	if err := r.login(validSession()); err != nil {
+		t.Fatal(err)
+	}
+	r.waitState(network.Live, "")
+	r.idle()
+	if got := r.value("syncToken"); got != "" {
+		t.Errorf("the token LinkedIn refused is still kept: %q", got)
+	}
+	for _, n := range []int{2, 3} {
+		if _, ok, _ := r.st.Chat(Name, convURN(n)); !ok {
+			t.Errorf("chat %d, changed while the token was refused, was not listed", n)
+		}
 	}
 }

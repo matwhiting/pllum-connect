@@ -99,6 +99,25 @@ func (p *pause) checkMedia(err error) wire.Kind {
 	return kindOf(err)
 }
 
+// gone reports whether err is LinkedIn's answer that the thing asked about
+// is not to be had: a 4xx that is neither a pause (403, 429) nor an ended
+// session (401), or a GraphQL answer with no data. Only such an answer
+// settles background work for good (a chat's fresh mark, its history, the
+// sync token). Anything else passes: a 5xx, an answer the helper can't read,
+// a timeout or no connection says nothing about the thing asked, and the
+// work is asked again later.
+func gone(err error) bool {
+	var re *linkedingo.ResponseError
+	if errors.As(err, &re) && re != nil {
+		switch re.StatusCode {
+		case 401, 403, 429:
+			return false
+		}
+		return re.StatusCode >= 400 && re.StatusCode < 500
+	}
+	return errors.Is(err, linkedingo.ErrMissingGraphQLData)
+}
+
 // kindOf is the kind of an error that is not LinkedIn's answer.
 func kindOf(err error) wire.Kind {
 	var we *wire.Error
