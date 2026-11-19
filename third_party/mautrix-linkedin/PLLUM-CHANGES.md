@@ -28,3 +28,24 @@ Every change, and nothing else:
 - Test: `pkg/linkedingo/conversations_pllum_test.go` (a fake round-tripper;
   no request leaves the machine).
 - Drop it when the library pages conversations itself.
+
+## 2. A send is tried once (2026-11-19)
+
+- `pkg/linkedingo/request.go`: `authedRequest` gains `noRetry bool` and
+  `func (a *authedRequest) WithoutRetry() *authedRequest`; in `DoRaw`, both
+  `if retryCount >= 5 {` (the network-error branch and the 502/503/504
+  branch) become `if retryCount >= 5 || a.noRetry {`.
+- `pkg/linkedingo/messages.go`: `SendMessage` adds `.WithoutRetry()` to its
+  request chain.
+- Why: `DoRaw` tries a request that fails on the network, or gets a 502, 503
+  or 504, up to five more times (waiting 2 s, doubling), and `SendMessage`
+  went through that loop with the same `originToken` and
+  `dedupeByClientGeneratedToken: false`, so one send could reach LinkedIn up
+  to six times. Now a network error on a send comes back at once, and a 502
+  to 504 as a `*ResponseError`. Pllum Connect reads both as unclear and never
+  sends again; Pllum's outbox settles the send by the chat's lines. Every
+  other request (uploads, reactions, marks, reads) keeps the library's
+  retries: a repeat of those changes nothing.
+- Test: `pkg/linkedingo/request_pllum_test.go` (a counting round-tripper; no
+  request leaves the machine).
+- Drop it when the library can send without retrying.

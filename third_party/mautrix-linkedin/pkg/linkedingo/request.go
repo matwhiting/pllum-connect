@@ -1,6 +1,10 @@
 // mautrix-linkedin - A Matrix-LinkedIn puppeting bridge.
 // Copyright (C) 2025 Sumner Evans
 //
+// Modified by Pllum Connect on 2026-11-19: authedRequest.WithoutRetry added,
+// so a request can be tried once (see PLLUM-CHANGES.md at the root of this
+// copy).
+//
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU Affero General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
@@ -48,6 +52,9 @@ type authedRequest struct {
 	body        io.Reader
 
 	skipSessionCheck bool
+	// noRetry: the request is tried once, never again after a network
+	// error or a 502 to 504 (WithoutRetry).
+	noRetry bool
 
 	client *Client
 }
@@ -154,6 +161,16 @@ func (a *authedRequest) WithoutSessionCheck() *authedRequest {
 		return nil
 	}
 	a.skipSessionCheck = true
+	return a
+}
+
+// WithoutRetry makes the request go once: a network error or a 502 to 504
+// is returned as it is, never tried again.
+func (a *authedRequest) WithoutRetry() *authedRequest {
+	if a == nil {
+		return nil
+	}
+	a.noRetry = true
 	return a
 }
 
@@ -269,7 +286,7 @@ func (a *authedRequest) DoRaw(ctx context.Context) (*http.Response, error) {
 				Msg("Failed to send request")
 			return nil, err
 		} else if err != nil {
-			if retryCount >= 5 {
+			if retryCount >= 5 || a.noRetry {
 				log.Err(err).
 					Dur("duration", dur).
 					Msg("Failed to send request, not retrying anymore")
@@ -280,7 +297,7 @@ func (a *authedRequest) DoRaw(ctx context.Context) (*http.Response, error) {
 				Dur("retry_in", retryIn).
 				Msg("Failed to send request, retrying")
 		} else if resp.StatusCode == http.StatusBadGateway || resp.StatusCode == http.StatusServiceUnavailable || resp.StatusCode == http.StatusGatewayTimeout {
-			if retryCount >= 5 {
+			if retryCount >= 5 || a.noRetry {
 				log.Error().
 					Dur("duration", dur).
 					Int("status", resp.StatusCode).

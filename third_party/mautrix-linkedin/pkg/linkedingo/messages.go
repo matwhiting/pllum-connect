@@ -1,6 +1,9 @@
 // mautrix-linkedin - A Matrix-LinkedIn puppeting bridge.
 // Copyright (C) 2025 Sumner Evans
 //
+// Modified by Pllum Connect on 2026-11-19: SendMessage is tried once
+// (WithoutRetry; see PLLUM-CHANGES.md at the root of this copy).
+//
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU Affero General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
@@ -203,6 +206,7 @@ func (c *Client) SendMessage(ctx context.Context, conversationURN URN, body Send
 		WithCSRF().
 		WithContentType(contentTypePlaintextUTF8).
 		WithXLIHeaders().
+		WithoutRetry().
 		Do(ctx, &messageSentResponse)
 	if err != nil {
 		return nil, err
