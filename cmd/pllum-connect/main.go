@@ -18,6 +18,7 @@ import (
 	"syscall"
 
 	"github.com/matwhiting/pllum-connect/internal/instagram"
+	"github.com/matwhiting/pllum-connect/internal/linkedin"
 	"github.com/matwhiting/pllum-connect/internal/messenger"
 	"github.com/matwhiting/pllum-connect/internal/network"
 	"github.com/matwhiting/pllum-connect/internal/quiet"
@@ -91,6 +92,7 @@ func run(args []string) int {
 				whatsapp.New(st, dir, key, emit.For(whatsapp.Name)),
 				instagram.New(st, dir, key, emit.For(instagram.Name)),
 				m,
+				linkedin.New(st, dir, key, emit.For(linkedin.Name), linkedin.Options{}),
 			}
 		},
 		Gate: *gate,

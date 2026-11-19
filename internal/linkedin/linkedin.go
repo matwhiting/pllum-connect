@@ -1,0 +1,788 @@
+// Package linkedin is Pllum Connect's LinkedIn network, built on
+// mautrix-linkedin's linkedingo client (a patched copy in
+// third_party/mautrix-linkedin; see its PLLUM-CHANGES.md). It signs in with
+// the cookies of a linkedin.com session Pllum took from its own sign-in
+// window (`login` with method "session", sent from the Keychain on every
+// start), catches up through LinkedIn's sync token, stays live on LinkedIn's
+// realtime stream, and pages history slowly in the background. Reads are the
+// server's, from the store.
+//
+// LinkedIn restricts accounts that behave like a script, so the network makes
+// only the calls liClient lists, its background requests go one at a time at
+// most one every 2 s, and LinkedIn pushing back (a 403, 429 or 999) pauses
+// every request, the realtime stream included (pause.go). A session LinkedIn
+// ends (a 401, a 302, li_at deleted) is reconnectNeeded, and nothing asks
+// with it again: only a new sign-in in the window does.
+//
+// Nothing here logs: the library logs only through zerolog, which every
+// context it is given carries as a no-op (and quiet.Init switches off), and
+// every error returned carries only a fixed kind. The cookies are held in
+// memory only.
+package linkedin
+
+import (
+	"context"
+	"io"
+	"net/http"
+	"slices"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/rs/zerolog"
+	"go.mau.fi/mautrix-linkedin/pkg/linkedingo"
+
+	"github.com/matwhiting/pllum-connect/internal/meta"
+	"github.com/matwhiting/pllum-connect/internal/network"
+	"github.com/matwhiting/pllum-connect/internal/store"
+	"github.com/matwhiting/pllum-connect/internal/wire"
+)
+
+var (
+	errBadRequest   = &wire.Error{Kind: wire.BadRequest}
+	errInternal     = &wire.Error{Kind: wire.Internal}
+	errNotConnected = &wire.Error{Kind: wire.NotConnected}
+	errUnsupported  = &wire.Error{Kind: wire.Unsupported}
+	errRateLimited  = &wire.Error{Kind: wire.RateLimited}
+)
+
+// liClient is every LinkedIn call the helper may make, and nothing else:
+// the reads, the realtime stream, and the writes (a send, its upload, a
+// reaction, a mark and his sign-out). *linkedingo.Client satisfies it; tests
+// use a fake. GetConversationsUpdatedBefore is allowed but never used: LinkedIn
+// ignores its lastUpdatedBefore (mautrix/linkedin#56), so conversations are
+// listed by GetConversationsWithNextCursor, Pllum's patch.
+type liClient interface {
+	GetCurrentUserProfile(ctx context.Context) (*linkedingo.UserProfile, error)
+	GetConversationsBySyncToken(ctx context.Context) (*linkedingo.CollectionResponse[linkedingo.ConversationSyncMetadata, linkedingo.Conversation], error)
+	GetConversationsUpdatedBefore(ctx context.Context, updatedBefore time.Time) (*linkedingo.CollectionResponse[linkedingo.ConversationCursorMetadata, linkedingo.Conversation], error)
+	GetConversationsWithNextCursor(ctx context.Context, cursor string) (*linkedingo.CollectionResponse[linkedingo.ConversationCursorMetadata, linkedingo.Conversation], error)
+	GetMessagesBefore(ctx context.Context, conversationURN linkedingo.URN, before time.Time, count int) (*linkedingo.CollectionResponse[linkedingo.MessageMetadata, linkedingo.Message], error)
+	GetMessagesWithPrevCursor(ctx context.Context, conversationURN linkedingo.URN, prevCursor string, count int) (*linkedingo.CollectionResponse[linkedingo.MessageMetadata, linkedingo.Message], error)
+	DownloadHTTP(ctx context.Context, url string) (*http.Response, error)
+	RealtimeConnect(ctx context.Context) error
+	RealtimeDisconnect()
+	IsLoggedIn() bool
+
+	SendMessage(ctx context.Context, conversationURN linkedingo.URN, body linkedingo.SendMessageBody, renderContent []linkedingo.SendRenderContent, transactionID string) (*linkedingo.MessageSentResponse, error)
+	UploadMedia(ctx context.Context, mediaUploadType linkedingo.MediaUploadType, filename, contentType string, size int, r io.Reader) (linkedingo.URN, error)
+	SendReaction(ctx context.Context, messageURN linkedingo.URN, emoji string) error
+	RemoveReaction(ctx context.Context, messageURN linkedingo.URN, emoji string) error
+	MarkConversationRead(ctx context.Context, convURNs ...linkedingo.URN) (*linkedingo.MarkThreadReadResponse, error)
+	MarkConversationUnread(ctx context.Context, convURNs ...linkedingo.URN) (*linkedingo.MarkThreadReadResponse, error)
+	Logout(ctx context.Context) error
+}
+
+var _ liClient = (*linkedingo.Client)(nil)
+
+// Clock is the time the network's timers and its pace run on; tests move a
+// fake one.
+type Clock interface {
+	Now() time.Time
+	AfterFunc(d time.Duration, f func()) (stop func() bool)
+	Sleep(ctx context.Context, d time.Duration) error
+}
+
+type realClock struct{}
+
+func (realClock) Now() time.Time { return time.Now() }
+
+func (realClock) AfterFunc(d time.Duration, f func()) func() bool { return time.AfterFunc(d, f).Stop }
+
+func (realClock) Sleep(ctx context.Context, d time.Duration) error {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-t.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// Options are what tests change; the zero value is the real thing.
+type Options struct {
+	// NewClient makes a client signed in as self (an empty URN before his
+	// profile is known) with the cookies in jar, presenting userAgent alone
+	// as its browser, resuming LinkedIn's conversations sync from syncToken.
+	NewClient func(self linkedingo.URN, jar *linkedingo.StringCookieJar, userAgent, syncToken string, h linkedingo.Handlers) liClient
+	Clock     Clock
+}
+
+// realClient is linkedingo's client, with the page's User-Agent in place of
+// the library's browser headers. Its page instance and tracking header are
+// the library's defaults (the window injects no script, so it can't capture
+// the page's own).
+func realClient(self linkedingo.URN, jar *linkedingo.StringCookieJar, ua, syncToken string, h linkedingo.Handlers) liClient {
+	c := linkedingo.NewClient(silent(context.Background()), self, jar, "", "", syncToken, h)
+	c.SetBrowserHeaders(browserHeaders(ua))
+	return c
+}
+
+// silent is ctx carrying a logger that writes nothing, for the library.
+func silent(ctx context.Context) context.Context { return zerolog.Nop().WithContext(ctx) }
+
+// backgroundGap is the least time between two background requests.
+const backgroundGap = 2 * time.Second
+
+// changedEvery is the least time between two changed events.
+const changedEvery = 500 * time.Millisecond
+
+// LinkedIn is the linkedin network. Its methods are safe from any goroutine.
+type LinkedIn struct {
+	st   *store.Store
+	dir  string
+	key  [32]byte
+	emit network.Emit
+
+	newClient func(self linkedingo.URN, jar *linkedingo.StringCookieJar, userAgent, syncToken string, h linkedingo.Handlers) liClient
+	clock     Clock
+	pause     *pause
+	diff      *meta.SessionDiff
+
+	mu         sync.Mutex
+	started    bool
+	stopped    bool
+	ctx        context.Context
+	cancel     context.CancelFunc
+	state      network.State
+	kind       wire.Kind
+	gen        int             // counts runs: events and results of an older one are dropped
+	session    network.Session // the cookies held now; never written anywhere
+	hashes     []string        // sessionHash of every version of the session held since the login
+	cli        liClient        // the run's signed-in client, nil before the profile check
+	jar        *linkedingo.StringCookieJar
+	runCtx     context.Context
+	runCancel  context.CancelFunc
+	realtime   bool      // the run's client has its realtime stream started
+	connected  bool      // a ClientConnection has come in this run
+	sessID     uuid.UUID // the realtime session of the last ClientConnection
+	retry      bool      // the run ended for a passing reason: a nudge may start another
+	stopResume func() bool
+	due        struct{ sync, pages bool } // catch-ups the realtime stream asked for
+	wake       chan struct{}
+	work       sync.WaitGroup
+	busy       atomic.Int32 // runs at work and stream stops still running
+
+	vmu    sync.Mutex
+	values map[string]string
+
+	pmu    sync.Mutex
+	nextBg time.Time // the earliest the next background request may go
+
+	cmu      sync.Mutex
+	cLast    time.Time
+	cPending bool
+}
+
+var (
+	_ network.Network     = (*LinkedIn)(nil)
+	_ network.SignInPager = (*LinkedIn)(nil)
+)
+
+// New makes the linkedin network over st; emit must be emit.For("linkedin").
+// Nothing is asked of LinkedIn until a `login`.
+func New(st *store.Store, dir string, key [32]byte, emit network.Emit, opts Options) *LinkedIn {
+	l := &LinkedIn{
+		st:        st,
+		dir:       dir,
+		key:       key,
+		emit:      emit,
+		newClient: opts.NewClient,
+		clock:     opts.Clock,
+		diff:      meta.NewSessionDiff(SignInPage()),
+		state:     network.NotConnected,
+		values:    map[string]string{},
+		wake:      make(chan struct{}, 1),
+	}
+	if l.newClient == nil {
+		l.newClient = realClient
+	}
+	if l.clock == nil {
+		l.clock = realClock{}
+	}
+	l.pause = &pause{now: func() time.Time { return l.clock.Now() }}
+	return l
+}
+
+// Name is "linkedin".
+func (l *LinkedIn) Name() string { return Name }
+
+// SignIn is LinkedIn's sign-in page.
+func (l *LinkedIn) SignIn() meta.SignInPage { return SignInPage() }
+
+// Start readies the network. It asks nothing of LinkedIn: the cookies live in
+// Pllum's Keychain, and Pllum sends them as a `login` on every start. A pause
+// from an earlier run runs to its end, and a session LinkedIn ended stays
+// ended.
+func (l *LinkedIn) Start(ctx context.Context) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.started || l.stopped {
+		return nil
+	}
+	l.ctx, l.cancel = context.WithCancel(silent(context.WithoutCancel(ctx)))
+	l.started = true
+	l.pause.restore(l.value("pause"))
+	if len(l.keptBlock()) > 0 {
+		l.setState(network.ReconnectNeeded, "")
+	}
+	return nil
+}
+
+// Status is the network's state. LinkedIn has no "message yourself" chat.
+func (l *LinkedIn) Status() network.Status {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return network.Status{State: l.state}
+}
+
+// Login signs in with the cookies of a linkedin.com session. A session
+// without li_at or JSESSIONID is badRequest before anything is asked. The
+// session LinkedIn ended (any version of it), sent again, is reconnectNeeded
+// with nothing asked. Otherwise it answers at once, and the outcome comes as
+// state events: connecting, catchingUp and live; notConnected with refused
+// for another account than his; or a failure.
+func (l *LinkedIn) Login(ctx context.Context, p network.LoginParams) error {
+	if p.Method != network.LoginSession {
+		return errUnsupported
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if !l.started || l.stopped {
+		return errInternal
+	}
+	session, ok := named(p.Session)
+	if !ok {
+		l.setState(network.NotConnected, wire.BadRequest)
+		return errBadRequest
+	}
+	hash := sessionHash(session)
+	if blocked := l.keptBlock(); len(blocked) > 0 {
+		if slices.Contains(blocked, hash) {
+			l.retire()
+			l.session = nil
+			l.setState(network.ReconnectNeeded, "")
+			return nil
+		}
+		// A new session: he has signed in again in the window.
+		_ = l.keep("block", "")
+	}
+	l.retire()
+	l.session = session
+	l.hashes = []string{hash}
+	l.diff.Seed(session)
+	if _, blocked := l.pause.blocked(); blocked {
+		l.setState(network.Offline, wire.RateLimited)
+		l.scheduleResume()
+		return nil
+	}
+	l.setState(network.Connecting, "")
+	l.startRun()
+	return nil
+}
+
+// CancelLogin stops a sign-in still connecting.
+func (l *LinkedIn) CancelLogin() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.state != network.Connecting {
+		return
+	}
+	l.retire()
+	l.session = nil
+	l.setState(network.NotConnected, "")
+}
+
+// Logout is his Disconnect: it signs the session out of LinkedIn (once,
+// unless a pause or an ended session forbids a request), stops the stream and
+// forgets the cookies. The chats stay in the store, and so does his profile
+// ID, so a later sign-in must be his.
+func (l *LinkedIn) Logout(ctx context.Context) error {
+	l.mu.Lock()
+	cli := l.cli
+	l.retire()
+	l.session = nil
+	l.setState(network.NotConnected, "")
+	l.mu.Unlock()
+	if cli == nil {
+		return nil
+	}
+	if _, blocked := l.pause.blocked(); blocked {
+		return nil
+	}
+	cctx, cancel := context.WithTimeout(silent(ctx), 20*time.Second)
+	defer cancel()
+	_ = cli.Logout(cctx)
+	return nil
+}
+
+// Nudge tries again, with the cookies it holds, after a sign-in failed for a
+// passing reason (no connection, a timeout), and wakes background work that
+// stopped on one. A pause is never ended by it: its own end is.
+func (l *LinkedIn) Nudge() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.retry {
+		l.again()
+		return
+	}
+	l.signal()
+}
+
+// The writes are the next step's; until then each is unsupported.
+
+func (l *LinkedIn) Send(ctx context.Context, m network.Outgoing) (string, error) {
+	return "", errUnsupported
+}
+
+func (l *LinkedIn) SendState(messageID string) network.SendState {
+	return network.SendState{State: network.SendUnknown}
+}
+
+func (l *LinkedIn) SendFor(clientID string) (string, error) { return "", nil }
+
+func (l *LinkedIn) React(ctx context.Context, chatID, messageID, emoji, transactionID string) error {
+	return errUnsupported
+}
+
+func (l *LinkedIn) MarkRead(ctx context.Context, chatID, through string) error {
+	return errUnsupported
+}
+
+func (l *LinkedIn) MarkUnread(ctx context.Context, chatID string) error { return errUnsupported }
+
+func (l *LinkedIn) SetMuted(ctx context.Context, chatID string, muted bool) error {
+	return errUnsupported
+}
+
+func (l *LinkedIn) Media(ctx context.Context, chatID, messageID string) (string, error) {
+	return "", errUnsupported
+}
+
+// Stop disconnects and waits briefly for the network's work to end. The
+// store is the server's to close.
+func (l *LinkedIn) Stop() {
+	l.mu.Lock()
+	if l.stopped {
+		l.mu.Unlock()
+		return
+	}
+	l.stopped = true
+	if !l.started {
+		l.mu.Unlock()
+		return
+	}
+	l.retire()
+	l.cancel()
+	l.mu.Unlock()
+
+	done := make(chan struct{})
+	go func() {
+		l.work.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		// A request is stuck; it ends with the process.
+	}
+}
+
+// passing reports whether a failure of this kind may be retried by a nudge.
+func passing(kind wire.Kind) bool { return kind == wire.Offline || kind == wire.Timeout }
+
+// retire ends the current run, if any: its context, its stream, any timer,
+// and (by moving gen on) any event or result still to come from it. l.mu is
+// held.
+func (l *LinkedIn) retire() {
+	l.gen++
+	l.retry = false
+	if l.stopResume != nil {
+		l.stopResume()
+		l.stopResume = nil
+	}
+	if l.runCancel != nil {
+		l.runCancel()
+		l.runCancel = nil
+	}
+	l.runCtx = nil
+	l.due.sync, l.due.pages = false, false
+	l.connected, l.sessID = false, uuid.Nil
+	if old := l.cli; old != nil && l.realtime {
+		// RealtimeDisconnect waits for the stream to stop, which may be
+		// inside one of its handlers on this very path.
+		l.work.Add(1)
+		l.busy.Add(1)
+		go func() {
+			defer l.work.Done()
+			defer l.busy.Add(-1)
+			old.RealtimeDisconnect()
+		}()
+	}
+	l.cli, l.jar, l.realtime = nil, nil, false
+}
+
+// startRun signs in with l.session in the background, as run l.gen. l.mu is
+// held.
+func (l *LinkedIn) startRun() {
+	ctx, cancel := context.WithCancel(l.ctx)
+	l.runCtx, l.runCancel = ctx, cancel
+	gen, session := l.gen, l.session
+	l.work.Add(1)
+	l.busy.Add(1)
+	go func() {
+		defer l.work.Done()
+		defer l.busy.Add(-1)
+		l.run(ctx, gen, session)
+	}()
+}
+
+// again starts a new run with the held cookies, unless one is running, there
+// are none, or a pause forbids a request. l.mu is held.
+func (l *LinkedIn) again() {
+	if !l.started || l.stopped || l.session == nil || l.runCtx != nil {
+		return
+	}
+	if _, blocked := l.pause.blocked(); blocked {
+		return
+	}
+	l.retire()
+	l.setState(network.Connecting, "")
+	l.startRun()
+}
+
+// resumeAfterPause starts a new run when the pause ends, or now if it has
+// already ended. l.mu is held.
+func (l *LinkedIn) resumeAfterPause() {
+	if _, blocked := l.pause.blocked(); blocked {
+		l.scheduleResume()
+		return
+	}
+	l.again()
+}
+
+// scheduleResume starts a new run when the pause in force ends. l.mu is
+// held.
+func (l *LinkedIn) scheduleResume() {
+	until, blocked := l.pause.blocked()
+	if !blocked {
+		return
+	}
+	if l.stopResume != nil {
+		l.stopResume()
+	}
+	gen := l.gen
+	l.stopResume = l.clock.AfterFunc(until.Sub(l.clock.Now()), func() {
+		l.mu.Lock()
+		defer l.mu.Unlock()
+		if gen == l.gen {
+			l.stopResume = nil
+			l.again()
+		}
+	})
+}
+
+// current reports whether gen is still the run in force.
+func (l *LinkedIn) current(gen int) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return gen == l.gen && !l.stopped
+}
+
+// run signs in: the profile read with a client signed in as no one, the
+// check that the profile is his, then his client, the catch-up, the realtime
+// stream and the background work (sync.go), all as run gen.
+func (l *LinkedIn) run(ctx context.Context, gen int, session network.Session) {
+	jar := jarOf(session)
+	l.mu.Lock()
+	if gen != l.gen || l.stopped {
+		l.mu.Unlock()
+		return
+	}
+	l.jar = jar
+	l.mu.Unlock()
+
+	probe := l.newClient(linkedingo.NewURN(""), jar, userAgent, "", l.handlersFor(gen))
+	var profile *linkedingo.UserProfile
+	err := l.request(ctx, gen, true, func(ctx context.Context) (err error) {
+		profile, err = probe.GetCurrentUserProfile(ctx)
+		return err
+	})
+	if err != nil {
+		l.failed(gen, network.NotConnected, wire.KindOf(err))
+		return
+	}
+	urn := profile.MiniProfile.DashEntityURN
+	if urn.IsEmpty() {
+		urn = profile.MiniProfile.EntityURN
+	}
+	id := profileID(urn)
+	if id == "" {
+		l.failed(gen, network.NotConnected, wire.Internal)
+		return
+	}
+	if self := l.self(); self != "" && self != id {
+		// Another account than the one whose chats the store holds: refused,
+		// and nothing changes.
+		l.mu.Lock()
+		if gen == l.gen && !l.stopped {
+			l.retire()
+			l.session = nil
+			l.setState(network.NotConnected, wire.Refused)
+		}
+		l.mu.Unlock()
+		return
+	}
+	if err := l.keep("self", id); err != nil {
+		l.failed(gen, network.NotConnected, wire.Internal)
+		return
+	}
+	cli := l.newClient(urn.WithPrefix("urn", "li", "fsd_profile"), jar, userAgent, l.value("syncToken"), l.handlersFor(gen))
+	l.mu.Lock()
+	if gen != l.gen || l.stopped {
+		l.mu.Unlock()
+		return
+	}
+	l.cli = cli
+	l.setState(network.CatchingUp, "")
+	l.mu.Unlock()
+
+	l.stayCaughtUp(ctx, gen, cli)
+}
+
+// failed ends run gen after a failure that has not already ended it (a pause
+// or an ended session have): the state is s with the kind, and a passing one
+// may be nudged. A request refused for a pause waits for its end.
+func (l *LinkedIn) failed(gen int, s network.State, kind wire.Kind) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if gen != l.gen || l.stopped {
+		return
+	}
+	l.retire()
+	if kind == wire.RateLimited {
+		l.setState(network.Offline, wire.RateLimited)
+		l.resumeAfterPause()
+		return
+	}
+	shown := kind
+	if s == network.Offline && kind == wire.Offline {
+		shown = ""
+	}
+	l.setState(s, shown)
+	l.retry = passing(kind)
+}
+
+// request makes one request of run gen: none while a pause is in force or
+// once the run has ended; a background one waits its turn, at most one every
+// 2 s. A success may carry changed cookies to Pllum; LinkedIn pushing back
+// pauses everything, and an ended session ends the run.
+func (l *LinkedIn) request(ctx context.Context, gen int, background bool, fn func(ctx context.Context) error) error {
+	if err := l.gate(gen); err != nil {
+		return err
+	}
+	if background {
+		if err := l.paced(ctx); err != nil {
+			return errNotConnected
+		}
+		if err := l.gate(gen); err != nil {
+			return err
+		}
+	}
+	err := fn(ctx)
+	if err == nil {
+		l.afterSuccess(gen)
+		return nil
+	}
+	if ctx.Err() != nil {
+		return errNotConnected
+	}
+	kind, paused := l.pause.check(err)
+	if paused {
+		_ = l.keep("pause", l.pause.String())
+		l.paused(gen)
+		return errRateLimited
+	}
+	if kind == reconnectNeeded {
+		l.endSession(gen)
+		return errNotConnected
+	}
+	return &wire.Error{Kind: kind}
+}
+
+// gate is the error for a request of run gen now, when one may not go.
+func (l *LinkedIn) gate(gen int) error {
+	if !l.current(gen) {
+		return errNotConnected
+	}
+	if _, blocked := l.pause.blocked(); blocked {
+		return errRateLimited
+	}
+	return nil
+}
+
+// paced waits until a background request may go: at most one every 2 s, in
+// the order they ask.
+func (l *LinkedIn) paced(ctx context.Context) error {
+	l.pmu.Lock()
+	now := l.clock.Now()
+	at := now
+	if l.nextBg.After(at) {
+		at = l.nextBg
+	}
+	l.nextBg = at.Add(backgroundGap)
+	l.pmu.Unlock()
+	return l.clock.Sleep(ctx, at.Sub(now))
+}
+
+// download fetches a media file through the client: never during a pause,
+// and a CDN refusing it never pauses LinkedIn (mediaGone, or rateLimited for
+// a 429 or 999).
+func (l *LinkedIn) download(ctx context.Context, cli liClient, url string) (*http.Response, error) {
+	if _, blocked := l.pause.blocked(); blocked {
+		return nil, errRateLimited
+	}
+	resp, err := cli.DownloadHTTP(ctx, url)
+	if err == nil {
+		return resp, nil
+	}
+	kind := l.pause.checkMedia(err)
+	if kind == reconnectNeeded {
+		l.mu.Lock()
+		gen := l.gen
+		l.mu.Unlock()
+		l.endSession(gen)
+		kind = wire.NotConnected
+	}
+	return nil, &wire.Error{Kind: kind}
+}
+
+// paused: LinkedIn pushed back, and the pause has begun. The run ends, its
+// stream too, and a new one starts when the pause ends.
+func (l *LinkedIn) paused(gen int) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if gen != l.gen || l.stopped {
+		return
+	}
+	l.retire()
+	l.setState(network.Offline, wire.RateLimited)
+	l.resumeAfterPause()
+}
+
+// endSession: LinkedIn ended the session (bad credentials, a 401, a 302, li_at
+// deleted). The run ends, its stream too, and nothing asks with these
+// cookies again, after a restart either, until a new sign-in.
+func (l *LinkedIn) endSession(gen int) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if gen != l.gen || l.stopped || l.session == nil {
+		return
+	}
+	hashes := l.hashes
+	if len(hashes) == 0 {
+		hashes = []string{sessionHash(l.session)}
+	}
+	l.retire()
+	l.session = nil
+	l.setState(network.ReconnectNeeded, "")
+	_ = l.keep("block", strings.Join(hashes, ","))
+}
+
+// keptBlock is the hashes of every version of the session LinkedIn ended, in
+// this or an earlier run; none when no session has been ended since the last
+// new sign-in.
+func (l *LinkedIn) keptBlock() []string {
+	v := l.value("block")
+	if v == "" {
+		return nil
+	}
+	return strings.Split(v, ",")
+}
+
+// afterSuccess runs after each request LinkedIn answered: a session whose
+// li_at LinkedIn deleted has ended, and changed cookies go to Pllum (the
+// session event, at most once a minute), which keeps the copy it signs in
+// again from.
+func (l *LinkedIn) afterSuccess(gen int) {
+	l.mu.Lock()
+	jar := l.jar
+	ok := gen == l.gen && !l.stopped
+	l.mu.Unlock()
+	if !ok || jar == nil {
+		return
+	}
+	if jarValue(jar, "li_at") == "" {
+		l.endSession(gen)
+		return
+	}
+	s, changed := l.diff.ChangedBy(func(name string) string { return jarValue(jar, name) }, l.clock.Now())
+	if !changed {
+		return
+	}
+	l.mu.Lock()
+	if gen == l.gen {
+		l.session = network.Session(s)
+		if h := sessionHash(l.session); !slices.Contains(l.hashes, h) {
+			l.hashes = append(l.hashes, h)
+		}
+	}
+	l.mu.Unlock()
+	l.emit(map[string]any{"event": "session", "session": s})
+}
+
+// setState moves the state and tells Pllum; l.mu is held. The state event
+// goes out under the lock, so state events keep their order.
+func (l *LinkedIn) setState(s network.State, kind wire.Kind) {
+	if s == l.state && kind == l.kind {
+		return
+	}
+	l.state, l.kind = s, kind
+	ev := map[string]any{"event": "state", "state": s}
+	if kind != "" {
+		ev["kind"] = string(kind)
+	}
+	l.emit(ev)
+}
+
+// stateNow is the state and its kind.
+func (l *LinkedIn) stateNow() (network.State, wire.Kind) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.state, l.kind
+}
+
+// idleNow reports whether nothing is at work: no run doing anything but
+// waiting for the stream to ask, and no catch-up asked for.
+func (l *LinkedIn) idleNow() bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.busy.Load() == 0 && !l.due.sync && !l.due.pages
+}
+
+// changed tells Pllum there is something to re-read: at once, or when 500 ms
+// have passed since the last time.
+func (l *LinkedIn) changed() {
+	l.cmu.Lock()
+	defer l.cmu.Unlock()
+	if l.cPending {
+		return
+	}
+	now := l.clock.Now()
+	if wait := l.cLast.Add(changedEvery).Sub(now); wait > 0 && !l.cLast.IsZero() {
+		l.cPending = true
+		l.clock.AfterFunc(wait, func() {
+			l.cmu.Lock()
+			l.cPending = false
+			l.cLast = l.clock.Now()
+			l.cmu.Unlock()
+			l.emit(map[string]any{"event": "changed"})
+		})
+		return
+	}
+	l.cLast = now
+	l.emit(map[string]any{"event": "changed"})
+}

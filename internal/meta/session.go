@@ -51,9 +51,18 @@ func (d *SessionDiff) Changed(c *cookies.Cookies, now time.Time) (map[string]str
 	if c == nil {
 		return nil, false
 	}
+	return d.ChangedBy(func(name string) string { return c.Get(cookies.MetaCookieName(name)) }, now)
+}
+
+// ChangedBy is Changed for a network whose cookies are not Meta's: get
+// gives the value of a named cookie as it is now ("" for none).
+func (d *SessionDiff) ChangedBy(get func(name string) string, now time.Time) (map[string]string, bool) {
+	if get == nil {
+		return nil, false
+	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	cur := d.pick(func(name string) string { return c.Get(cookies.MetaCookieName(name)) })
+	cur := d.pick(get)
 	for _, name := range d.Required {
 		if cur[name] == "" {
 			return nil, false

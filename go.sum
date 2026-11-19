@@ -163,5 +163,5 @@ gotest.tools/v3 v3.5.2 h1:7koQfIKdy+I8UTetycgUqXWSDwpgv193Ka+qRsmBY8Q=
 gotest.tools/v3 v3.5.2/go.mod h1:LtdLGcnqToBH83WByAAi/wiwSFCArdFIUV/xxN4pcjA=
 lukechampine.com/adiantum v1.1.1 h1:4fp6gTxWCqpEbLy40ExiYDDED3oUNWx5cTqBCtPdZqA=
 lukechampine.com/adiantum v1.1.1/go.mod h1:LrAYVnTYLnUtE/yMp5bQr0HstAf060YUF8nM0B6+rUw=
-maunium.net/go/mautrix v0.32.0 h1:xuAZzzyWce0pFkBhV/MCLFiJdVs2rFkY3Eep7hNng4I=
-maunium.net/go/mautrix v0.32.0/go.mod h1:tZSwPzw+/0pa0dxGufkh0uJqM84BNxB6e2I0+S0UyjU=
+maunium.net/go/mautrix v0.32.1-0.20261026180307-744963f88e51 h1:eEU3N3iyC5K2D9LLX8Te1vSoZIgxRuIqQ4HdHs5oktc=
+maunium.net/go/mautrix v0.32.1-0.20261026180307-744963f88e51/go.mod h1:tZSwPzw+/0pa0dxGufkh0uJqM84BNxB6e2I0+S0UyjU=

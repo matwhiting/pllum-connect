@@ -172,20 +172,7 @@ func (s *Store) PutNetworkValue(network, name, value string) error {
 // "read up to this time" rather than naming lines. A line already seen keeps
 // its time.
 func (s *Store) SeenThrough(network, chatID string, throughMs int64) error {
-	if network == "" || chatID == "" || throughMs <= 0 {
-		return errBadRequest
-	}
-	return s.write(func(tx *sql.Tx) error {
-		chat, err := resolve(tx, network, chatID)
-		if err != nil {
-			return err
-		}
-		_, err = tx.Exec(`UPDATE messages SET seen_ms = ?
-				WHERE network = ? AND chat_id = ? AND from_me = 1 AND early = 0
-					AND ts_ms <= ? AND seen_ms IS NULL`,
-			throughMs, network, chat, throughMs)
-		return err
-	})
+	return s.SeenThroughAt(network, chatID, throughMs, throughMs)
 }
 
 // LineState is what shows of one row: enough for a network to tell whether

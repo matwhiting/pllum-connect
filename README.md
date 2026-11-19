@@ -33,3 +33,5 @@ go test ./...
 GNU Affero General Public License v3.0 (AGPL-3.0). See [LICENSE](LICENSE).
 
 The helper includes code from [mautrix-meta](https://github.com/mautrix/meta) (AGPL-3.0), used as a library: the packages `pkg/instameow`, `pkg/instameow/slidetypes` and `pkg/messagix` and its subpackages, for Instagram and Messenger. Those packages pull in parts of the mautrix bridge framework at build time, but the helper never uses them. It never imports `pkg/connector` or `pkg/igconnector`.
+
+It also includes a copy of the `pkg/linkedingo` package of [mautrix-linkedin](https://github.com/mautrix/linkedin) (AGPL-3.0), for LinkedIn, in `third_party/mautrix-linkedin/`, changed by Pllum Connect: every change is listed in its `PLLUM-CHANGES.md`, and each changed file says so at its top. It never imports `pkg/connector`.

@@ -280,6 +280,9 @@ func (s *Store) reactions(network, chat, msgID string) ([]Reaction, error) {
 		if err := rows.Scan(&r.Emoji, &r.SenderID, &r.FromMe); err != nil {
 			return nil, err
 		}
+		if strings.HasPrefix(r.SenderID, summarySender) {
+			r.SenderID = "" // a count per emoji, from no one in particular
+		}
 		out = append(out, r)
 	}
 	return out, rows.Err()

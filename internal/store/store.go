@@ -142,6 +142,7 @@ type ChatInfo struct {
 	ReadThroughMs   *int64 // his read marker: incoming lines after it are unread
 	ReadForwardOnly bool   // ReadThroughMs only moves the marker forward, never back
 	HistoryComplete *bool
+	ReadOnly        *bool // the chat can no longer be written to (LinkedIn deleted it); its lines stay
 	LastActivityMs  int64
 	Participants    []Participant
 }
@@ -856,6 +857,7 @@ func (s *Store) PutChat(network string, c ChatInfo) error {
 				read_through_ms = CASE WHEN ? THEN MAX(read_through_ms, COALESCE(?, read_through_ms))
 					ELSE COALESCE(?, read_through_ms) END,
 				history_complete = COALESCE(?, history_complete),
+				read_only = COALESCE(?, read_only),
 				last_activity_ms = MAX(last_activity_ms, ?)
 			WHERE network = ? AND chat_id = ?`,
 			c.Kind,
@@ -863,6 +865,7 @@ func (s *Store) PutChat(network string, c ChatInfo) error {
 			c.Phone != nil, deref(c.Phone),
 			c.Muted, c.Muted, c.Muted, c.MuteEndMs,
 			c.ReadForwardOnly, c.ReadThroughMs, c.ReadThroughMs, c.HistoryComplete,
+			c.ReadOnly,
 			c.LastActivityMs,
 			network, chat)
 		if err != nil {

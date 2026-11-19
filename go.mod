@@ -10,6 +10,7 @@ require (
 	github.com/ncruces/go-sqlite3 v0.35.6
 	github.com/rs/zerolog v1.35.1
 	go.mau.fi/libsignal v0.2.2
+	go.mau.fi/mautrix-linkedin v0.2609.1-0.20261103213510-3127fea810c0
 	go.mau.fi/mautrix-meta v0.2610.0
 	go.mau.fi/util v0.11.0
 	go.mau.fi/whatsmeow v0.0.0-20261031222104-5d4657a5c29e
@@ -62,7 +63,9 @@ require (
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 	lukechampine.com/adiantum v1.1.1 // indirect
-	maunium.net/go/mautrix v0.32.0 // indirect
+	maunium.net/go/mautrix v0.32.1-0.20261026180307-744963f88e51 // indirect
 )
 
 replace github.com/imroc/req/v3 => github.com/beeper/req/v3 v3.0.0-20260925135712-b49593750e56
+
+replace go.mau.fi/mautrix-linkedin => ./third_party/mautrix-linkedin

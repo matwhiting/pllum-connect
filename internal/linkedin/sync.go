@@ -1,0 +1,575 @@
+package linkedin
+
+import (
+	"context"
+	"slices"
+	"time"
+
+	"go.mau.fi/mautrix-linkedin/pkg/linkedingo"
+
+	"github.com/matwhiting/pllum-connect/internal/network"
+	"github.com/matwhiting/pllum-connect/internal/store"
+	"github.com/matwhiting/pllum-connect/internal/wire"
+)
+
+// Catching up and paging history. Every request here is a background one:
+// one at a time, at most one every 2 s (request's pace), none during a pause.
+const (
+	// pageSize is how many messages a page asks for.
+	pageSize = 20
+	// firstListing is how far back a first sign-in lists the inbox: until a
+	// page's oldest activity is older, or listPages pages.
+	firstListing = 365 * 24 * time.Hour
+	listPages    = 40
+	// catchUpPages is the most earlier pages a caught-up chat is paged back
+	// looking for a line the store holds; the history worker has the rest.
+	catchUpPages = 10
+	// historyReach is how far back the history worker pages each chat.
+	historyReach = 730 * 24 * time.Hour
+)
+
+// The background work a run does between catch-ups and history.
+type job int
+
+const (
+	jobNone  job = iota
+	jobSync      // a catch-up by the sync token
+	jobPages     // the inbox listed by cursor back to the newest activity stored
+)
+
+// stayCaughtUp is a signed-in run's work: the catch-up, then the realtime
+// stream (live), then, one request at a time, the catch-ups the stream asks
+// for and the history, newest chats first, until the run ends.
+func (l *LinkedIn) stayCaughtUp(ctx context.Context, gen int, cli liClient) {
+	if err := l.catchUp(ctx, gen, cli); err != nil {
+		l.failed(gen, network.Offline, wire.KindOf(err))
+		return
+	}
+	l.mu.Lock()
+	if gen != l.gen || l.stopped {
+		l.mu.Unlock()
+		return
+	}
+	if _, blocked := l.pause.blocked(); blocked {
+		l.mu.Unlock()
+		return
+	}
+	// Started under the lock, so a retire that comes after it stops it. It
+	// returns at once; the stream runs in the library.
+	l.realtime = true
+	_ = cli.RealtimeConnect(ctx)
+	l.setState(network.Live, "")
+	l.mu.Unlock()
+
+	for {
+		j, ok := l.takeJob(gen)
+		if !ok {
+			return
+		}
+		var err error
+		switch j {
+		case jobPages:
+			err = l.listBack(ctx, gen, cli, false)
+		case jobSync:
+			err = l.catchUpByToken(ctx, gen, cli)
+		default:
+			var did bool
+			did, err = l.historyStep(ctx, gen, cli)
+			if err == nil && !did {
+				if !l.waitForJob(ctx) {
+					return
+				}
+				continue
+			}
+		}
+		if !l.current(gen) {
+			return
+		}
+		if err != nil {
+			// A failure of its own (no connection, an answer it could not
+			// read): the work waits for the stream or a nudge to ask again,
+			// rather than asking again and again.
+			if !l.waitForJob(ctx) {
+				return
+			}
+		}
+	}
+}
+
+// takeJob is the next catch-up the stream asked for, jobNone for none; ok is
+// false once run gen has ended.
+func (l *LinkedIn) takeJob(gen int) (j job, ok bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if gen != l.gen || l.stopped {
+		return jobNone, false
+	}
+	switch {
+	case l.due.pages:
+		l.due.pages = false
+		return jobPages, true
+	case l.due.sync:
+		l.due.sync = false
+		return jobSync, true
+	}
+	return jobNone, true
+}
+
+// waitForJob waits, idle, until something asks for work or the run ends.
+func (l *LinkedIn) waitForJob(ctx context.Context) bool {
+	l.busy.Add(-1)
+	defer l.busy.Add(1)
+	select {
+	case <-l.wake:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+// queue asks the run for a catch-up: by cursor pages (pages) or by the sync
+// token. l.mu is held.
+func (l *LinkedIn) queue(pages bool) {
+	if pages {
+		l.due.pages = true
+	} else {
+		l.due.sync = true
+	}
+	l.signal()
+}
+
+// signal wakes the run's background work.
+func (l *LinkedIn) signal() {
+	select {
+	case l.wake <- struct{}{}:
+	default:
+	}
+}
+
+// catchUp is a run's catch-up before the stream: by the sync token kept in
+// the store. The first sign-in has none: the sync token's newest chats (and
+// a token), then the inbox listed by cursor back a year.
+//
+// A token LinkedIn will not answer for (an answer the helper can't use, not
+// a pause, an ended session or a dropped connection) is dropped, so the next
+// run starts afresh without one, and this one lists the inbox by cursor
+// instead: a run never fails over and over on the same token.
+func (l *LinkedIn) catchUp(ctx context.Context, gen int, cli liClient) error {
+	if err := l.catchUpByToken(ctx, gen, cli); err != nil {
+		if !l.current(gen) || !skippable(err) {
+			return err
+		}
+		_ = l.keep("syncToken", "")
+	}
+	if l.value("listed") == "" {
+		return l.listBack(ctx, gen, cli, true)
+	}
+	return nil
+}
+
+// skippable reports whether a background request's failure is LinkedIn's
+// answer about that one thing (a chat it won't page, a token it won't take),
+// which the work passes over, rather than a pause, an ended session or a
+// connection gone, which stop it.
+func skippable(err error) bool { return wire.KindOf(err) == wire.Internal }
+
+// catchUpByToken asks for the conversations changed since the sync token the
+// client holds (the client gives the new token to the handler, which keeps
+// it), stores them, makes the deleted ones read-only and fetches what came
+// in each changed one.
+func (l *LinkedIn) catchUpByToken(ctx context.Context, gen int, cli liClient) error {
+	var page *linkedingo.CollectionResponse[linkedingo.ConversationSyncMetadata, linkedingo.Conversation]
+	err := l.request(ctx, gen, true, func(ctx context.Context) (err error) {
+		page, err = cli.GetConversationsBySyncToken(ctx)
+		return err
+	})
+	if err != nil {
+		return err
+	}
+	if page == nil {
+		return nil
+	}
+	for _, d := range page.Metadata.DeletedURNs {
+		l.readOnly(urnString(d.Conversation.EntityURN))
+	}
+	return l.storeAndCatchUp(ctx, gen, cli, page.Elements)
+}
+
+// listBack lists the inbox by cursor, newest activity first: on a first
+// sign-in (first) until a page's oldest activity is over a year old, resuming
+// where an interrupted listing got to; otherwise back to the newest activity
+// the store held before it began. At most listPages pages either way.
+func (l *LinkedIn) listBack(ctx context.Context, gen int, cli liClient, first bool) error {
+	stopAt := l.clock.Now().Add(-firstListing)
+	cursor := ""
+	if first {
+		cursor = l.value("listCursor")
+	} else if newest, ok := l.newestStored(); ok {
+		stopAt = newest
+	}
+	for range listPages {
+		var page *linkedingo.CollectionResponse[linkedingo.ConversationCursorMetadata, linkedingo.Conversation]
+		err := l.request(ctx, gen, true, func(ctx context.Context) (err error) {
+			page, err = cli.GetConversationsWithNextCursor(ctx, cursor)
+			return err
+		})
+		if err != nil {
+			return err
+		}
+		if page == nil {
+			break
+		}
+		var oldest time.Time
+		for _, c := range page.Elements {
+			if at := c.LastActivityAt.Time; !at.IsZero() && (oldest.IsZero() || at.Before(oldest)) {
+				oldest = at
+			}
+		}
+		if err := l.storeAndCatchUp(ctx, gen, cli, page.Elements); err != nil {
+			return err
+		}
+		next := page.Metadata.NextCursor
+		if first {
+			_ = l.keep("listCursor", next)
+		}
+		if len(page.Elements) == 0 || next == "" {
+			break
+		}
+		if !oldest.IsZero() && (first && oldest.Before(stopAt) || !first && !oldest.After(stopAt)) {
+			break
+		}
+		cursor = next
+	}
+	if first {
+		_ = l.keep("listed", "1")
+		_ = l.keep("listCursor", "")
+	}
+	return nil
+}
+
+// newestStored is the newest activity of a LinkedIn conversation the store
+// holds; ok is false when it holds none.
+func (l *LinkedIn) newestStored() (time.Time, bool) {
+	cursor := ""
+	for range 50 {
+		page, err := l.st.Chats(Name, 0, cursor, 200)
+		if err != nil {
+			return time.Time{}, false
+		}
+		for _, c := range page.Items {
+			if isConversation(c.ID) && c.LastActivityMs > 0 {
+				return time.UnixMilli(c.LastActivityMs), true
+			}
+		}
+		if page.Cursor == "" {
+			break
+		}
+		cursor = page.Cursor
+	}
+	return time.Time{}, false
+}
+
+// storeAndCatchUp stores conversations, then fetches what came in each one
+// with activity newer than the store had for it.
+func (l *LinkedIn) storeAndCatchUp(ctx context.Context, gen int, cli liClient, convs []linkedingo.Conversation) error {
+	var changed []linkedingo.URN
+	for _, c := range convs {
+		if l.storeConversation(c) {
+			changed = append(changed, c.EntityURN)
+		}
+	}
+	if len(convs) > 0 {
+		l.changed()
+	}
+	for _, c := range changed {
+		if err := l.catchUpChat(ctx, gen, cli, c); err != nil && (!l.current(gen) || !skippable(err)) {
+			return err
+		}
+	}
+	return nil
+}
+
+// catchUpChat fetches the newest page of a chat, then earlier pages until one
+// holds a line the store already had (up to catchUpPages). A chat with no
+// lines yet gets its newest page, and its history goes on from there.
+func (l *LinkedIn) catchUpChat(ctx context.Context, gen int, cli liClient, conv linkedingo.URN) error {
+	chat := urnString(conv)
+	_, _, had := l.st.OldestLine(Name, chat, linePrefix)
+	var page *linkedingo.CollectionResponse[linkedingo.MessageMetadata, linkedingo.Message]
+	err := l.request(ctx, gen, true, func(ctx context.Context) (err error) {
+		page, err = cli.GetMessagesBefore(ctx, conv, l.clock.Now(), pageSize)
+		return err
+	})
+	if err != nil {
+		return err
+	}
+	reached := l.storeMessages(page.Elements, store.SourceSync)
+	l.changed()
+	if !had {
+		if l.value("cursor."+chat) == "" {
+			l.historyPaged(chat, "", page)
+		}
+		return nil
+	}
+	for range catchUpPages {
+		if reached || page.Metadata.PrevCursor == "" {
+			return nil
+		}
+		prev := page.Metadata.PrevCursor
+		err := l.request(ctx, gen, true, func(ctx context.Context) (err error) {
+			page, err = cli.GetMessagesWithPrevCursor(ctx, conv, prev, pageSize)
+			return err
+		})
+		if err != nil {
+			return err
+		}
+		reached = l.storeMessages(page.Elements, store.SourceSync)
+		l.changed()
+	}
+	return nil
+}
+
+// historyStep pages the history of the newest chat that has more to page,
+// by one page: back from the cursor kept for it, or from its oldest line (or
+// now) when none is kept. did is false when no chat has more.
+func (l *LinkedIn) historyStep(ctx context.Context, gen int, cli liClient) (did bool, err error) {
+	chat, ok := l.nextHistoryChat()
+	if !ok {
+		return false, nil
+	}
+	conv := linkedingo.NewURN(chat)
+	cursor := l.value("cursor." + chat)
+	var page *linkedingo.CollectionResponse[linkedingo.MessageMetadata, linkedingo.Message]
+	if cursor == "" {
+		anchor := l.clock.Now()
+		if ms, _, ok := l.st.OldestLine(Name, chat, linePrefix); ok {
+			anchor = time.UnixMilli(ms)
+		}
+		err = l.request(ctx, gen, true, func(ctx context.Context) (err error) {
+			page, err = cli.GetMessagesBefore(ctx, conv, anchor, pageSize)
+			return err
+		})
+	} else {
+		err = l.request(ctx, gen, true, func(ctx context.Context) (err error) {
+			page, err = cli.GetMessagesWithPrevCursor(ctx, conv, cursor, pageSize)
+			return err
+		})
+	}
+	if err != nil {
+		if l.current(gen) && skippable(err) {
+			// LinkedIn won't page this chat: it is passed over, not asked
+			// again and again.
+			_ = l.keep("histDone."+chat, "1")
+			return true, nil
+		}
+		return true, err
+	}
+	l.storeMessages(page.Elements, store.SourceSync)
+	l.changed()
+	l.historyPaged(chat, cursor, page)
+	return true, nil
+}
+
+// historyPaged keeps where a chat's history goes on after page (asked from
+// cursor): a page with nothing before it is the chat's start (it is
+// historyComplete), and one reaching past 730 days ends its paging.
+func (l *LinkedIn) historyPaged(chat, cursor string, page *linkedingo.CollectionResponse[linkedingo.MessageMetadata, linkedingo.Message]) {
+	if page == nil || len(page.Elements) == 0 || page.Metadata.PrevCursor == "" {
+		complete := true
+		_ = l.st.PutChat(Name, store.ChatInfo{ID: chat, HistoryComplete: &complete})
+		_ = l.keep("cursor."+chat, "")
+		l.changed()
+		return
+	}
+	prev := page.Metadata.PrevCursor
+	_ = l.keep("cursor."+chat, prev)
+	oldest := time.Time{}
+	for _, m := range page.Elements {
+		if at := m.DeliveredAt.Time; !at.IsZero() && (oldest.IsZero() || at.Before(oldest)) {
+			oldest = at
+		}
+	}
+	if prev == cursor || !oldest.IsZero() && oldest.Before(l.clock.Now().Add(-historyReach)) {
+		_ = l.keep("histDone."+chat, "1")
+	}
+}
+
+// nextHistoryChat is the newest LinkedIn conversation whose history has more
+// to page: not at its start, not paged to 730 days, not read-only.
+func (l *LinkedIn) nextHistoryChat() (string, bool) {
+	cursor := ""
+	for range 50 {
+		page, err := l.st.Chats(Name, 0, cursor, 200)
+		if err != nil {
+			return "", false
+		}
+		for _, c := range page.Items {
+			if !isConversation(c.ID) || c.HistoryComplete || c.ReadOnly || l.value("histDone."+c.ID) != "" {
+				continue
+			}
+			return c.ID, true
+		}
+		if page.Cursor == "" {
+			break
+		}
+		cursor = page.Cursor
+	}
+	return "", false
+}
+
+// handlersFor is the client's realtime and sync-token handlers for run gen.
+// Each one writes what it carries before it returns, and none asks LinkedIn
+// anything itself: a catch-up it calls for waits its turn in the run.
+func (l *LinkedIn) handlersFor(gen int) linkedingo.Handlers {
+	guard := func() {
+		_ = recover()
+	}
+	return linkedingo.Handlers{
+		Heartbeat: func(context.Context) {
+			defer guard()
+			l.heard(gen)
+		},
+		ClientConnection: func(_ context.Context, c *linkedingo.ClientConnection) {
+			defer guard()
+			l.clientConnected(gen, c)
+		},
+		TransientDisconnect: func(_ context.Context, err error) {
+			defer guard()
+			l.disconnected(gen, err)
+		},
+		BadCredentials: func(context.Context, error) {
+			defer guard()
+			l.endSession(gen)
+		},
+		DecoratedEvent: func(_ context.Context, e *linkedingo.DecoratedEvent) {
+			defer guard()
+			if l.current(gen) {
+				l.onEvent(gen, e)
+			}
+		},
+		ConversationsSyncToken: func(_ context.Context, token string) {
+			defer guard()
+			if l.current(gen) && token != "" {
+				_ = l.keep("syncToken", token)
+			}
+		},
+	}
+}
+
+// heard: the stream is alive (a heartbeat); offline is live again.
+func (l *LinkedIn) heard(gen int) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if gen != l.gen || l.stopped || !l.realtime {
+		return
+	}
+	if l.state == network.Offline && l.kind == "" {
+		l.setState(network.Live, "")
+	}
+}
+
+// clientConnected: the stream has (re)connected. The run's first connection,
+// or one under the same realtime session, catches up by the sync token; one
+// under a new session lists the inbox back to the newest activity stored, as
+// the token may not cover the gap.
+func (l *LinkedIn) clientConnected(gen int, c *linkedingo.ClientConnection) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if gen != l.gen || l.stopped || !l.realtime {
+		return
+	}
+	if l.state == network.Offline && l.kind == "" {
+		l.setState(network.Live, "")
+	}
+	switch {
+	case !l.connected:
+		l.connected, l.sessID = true, c.SessID
+		l.queue(false)
+	case c.SessID != l.sessID:
+		l.sessID = c.SessID
+		l.queue(true)
+	default:
+		l.queue(false)
+	}
+}
+
+// disconnected: the stream dropped, and the library reconnects it. A
+// reconnect LinkedIn pushed back on is a pause, like any request's; an ended
+// session is the library's to report (BadCredentials).
+func (l *LinkedIn) disconnected(gen int, err error) {
+	if !l.current(gen) {
+		return
+	}
+	kind, paused := l.pause.check(err)
+	if paused {
+		_ = l.keep("pause", l.pause.String())
+		l.paused(gen)
+		return
+	}
+	if kind == reconnectNeeded {
+		l.endSession(gen)
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if gen != l.gen || l.stopped {
+		return
+	}
+	if l.state == network.Live || l.state == network.CatchingUp {
+		l.setState(network.Offline, "")
+	}
+}
+
+// onEvent stores what a realtime event carries. Every topic but these five
+// is ignored.
+func (l *LinkedIn) onEvent(gen int, e *linkedingo.DecoratedEvent) {
+	if e == nil {
+		return
+	}
+	data := e.Payload.Data
+	switch e.Topic.NthPrefixPart(2) {
+	case linkedingo.RealtimeEventTopicMessages:
+		if data.DecoratedMessage != nil {
+			m := data.DecoratedMessage.Result
+			if skipped(m.Conversation) {
+				return
+			}
+			if c := m.Conversation; !c.EntityURN.IsEmpty() && len(c.ConversationParticipants) > 0 {
+				l.storeConversation(c)
+			}
+			l.storeMessages([]linkedingo.Message{m}, store.SourceLive)
+			l.changed()
+		}
+	case linkedingo.RealtimeEventTopicMessageReactionSummaries:
+		if data.DecoratedReactionSummary != nil {
+			l.storeReaction(data.DecoratedReactionSummary.Result)
+			l.changed()
+		}
+	case linkedingo.RealtimeEventTopicMessageSeenReceipts:
+		if data.DecoratedSeenReceipt != nil {
+			l.storeSeen(data.DecoratedSeenReceipt.Result)
+			l.changed()
+		}
+	case linkedingo.RealtimeEventTopicConversations:
+		if data.DecoratedConversation == nil {
+			// Something changed and LinkedIn didn't say what: a catch-up by
+			// the sync token, in turn.
+			l.mu.Lock()
+			if gen == l.gen && !l.stopped {
+				l.queue(false)
+			}
+			l.mu.Unlock()
+			return
+		}
+		l.storeConversation(data.DecoratedConversation.Result)
+		l.changed()
+	case linkedingo.RealtimeEventTopicConversationDelete:
+		if data.DecoratedConversationDelete != nil {
+			l.readOnly(urnString(data.DecoratedConversationDelete.Result.EntityURN))
+		}
+	}
+}
+
+// skipped reports whether a conversation is one Pllum leaves out: LinkedIn's
+// spam folder (mautrix-linkedin drops those too).
+func skipped(c linkedingo.Conversation) bool { return slices.Contains(c.Categories, "SPAM") }
