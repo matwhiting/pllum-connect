@@ -291,3 +291,45 @@ func TestAnotherAccountLeavesALiveSessionRunning(t *testing.T) {
 		t.Errorf("his run no longer answers its stream")
 	}
 }
+
+// Pllum clears the row's state as it sends the saved session at a start, so
+// the login's outcome is always said, even when it is the state already in
+// force: after a restart with a kept block, the row reads Reconnect needed,
+// not Catching up.
+func TestALoginAlwaysSaysItsOutcome(t *testing.T) {
+	r := newRig(t)
+	c := r.live()
+	c.dispatch(badCredentials{err: errors.New("invented: session rejected")})
+	r.waitState(network.ReconnectNeeded, "")
+	r.idle()
+	r.restart()
+	if got := r.ev.states(); !slices.Equal(got, []string{"reconnectNeeded"}) {
+		t.Fatalf("states at the start = %v, want reconnectNeeded", got)
+	}
+	if err := r.login(validSession()); err != nil {
+		t.Fatalf("Login: %v", err)
+	}
+	if got := r.ev.states(); !slices.Equal(got, []string{"reconnectNeeded", "reconnectNeeded"}) {
+		t.Errorf("states after the saved session's login = %v, want reconnectNeeded said again", got)
+	}
+
+	// The same for a login during a pause, and a badRequest twice.
+	r2, _ := pauseAfterLive(t, 429)
+	k := len(r2.ev.states())
+	if err := r2.login(validSession()); err != nil {
+		t.Fatal(err)
+	}
+	if err := r2.login(validSession()); err != nil {
+		t.Fatal(err)
+	}
+	if got := r2.ev.states()[k:]; !slices.Equal(got, []string{"offline/rateLimited", "offline/rateLimited"}) {
+		t.Errorf("states for two logins during a pause = %v, want offline/rateLimited said each time", got)
+	}
+	r3 := newRig(t)
+	bad := network.Session{"li_at": "li-at-invented-1"}
+	_ = r3.login(bad)
+	_ = r3.login(bad)
+	if got := r3.ev.states(); !slices.Equal(got, []string{"notConnected/badRequest", "notConnected/badRequest"}) {
+		t.Errorf("states for two bad sessions = %v, want notConnected/badRequest said each time", got)
+	}
+}

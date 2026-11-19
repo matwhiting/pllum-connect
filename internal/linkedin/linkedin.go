@@ -280,9 +280,11 @@ func (l *LinkedIn) Login(ctx context.Context, p network.LoginParams) error {
 	if !l.started || l.stopped {
 		return errInternal
 	}
+	// Every outcome is said, even one equal to the state in force: Pllum
+	// clears the row as it sends a session, and waits for the answer.
 	session, ok := named(p.Session)
 	if !ok {
-		l.setState(network.NotConnected, wire.BadRequest)
+		l.sayState(network.NotConnected, wire.BadRequest)
 		return errBadRequest
 	}
 	hash := sessionHash(session)
@@ -290,7 +292,7 @@ func (l *LinkedIn) Login(ctx context.Context, p network.LoginParams) error {
 		l.endProbe()
 		l.retire()
 		l.session = nil
-		l.setState(network.ReconnectNeeded, "")
+		l.sayState(network.ReconnectNeeded, "")
 		return nil
 	}
 	if _, blocked := l.pause.blocked(); blocked {
@@ -299,7 +301,7 @@ func (l *LinkedIn) Login(ctx context.Context, p network.LoginParams) error {
 		l.retire()
 		l.session = session
 		l.hashes = []string{hash}
-		l.setState(network.Offline, wire.RateLimited)
+		l.sayState(network.Offline, wire.RateLimited)
 		l.scheduleResume()
 		return nil
 	}
@@ -464,7 +466,7 @@ func (l *LinkedIn) startProbe(session network.Session, hash string) {
 	pg := l.probeGen
 	ctx, cancel := context.WithCancel(l.ctx)
 	l.probeCancel = cancel
-	l.setState(network.Connecting, "")
+	l.sayState(network.Connecting, "")
 	l.work.Add(1)
 	l.busy.Add(1)
 	go func() {
@@ -899,6 +901,13 @@ func (l *LinkedIn) setState(s network.State, kind wire.Kind) {
 	if s == l.state && kind == l.kind {
 		return
 	}
+	l.sayState(s, kind)
+}
+
+// sayState is setState that tells Pllum even when the state is unchanged:
+// a login's outcome, which Pllum waits for after clearing the row. l.mu is
+// held.
+func (l *LinkedIn) sayState(s network.State, kind wire.Kind) {
 	l.state, l.kind = s, kind
 	ev := map[string]any{"event": "state", "state": s}
 	if kind != "" {
