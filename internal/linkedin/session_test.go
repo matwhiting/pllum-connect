@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"reflect"
 	"regexp"
 	"slices"
@@ -478,5 +479,40 @@ func TestDisconnectForgetsAnEndedSession(t *testing.T) {
 	r.restart()
 	if st, _ := r.l.stateNow(); st != network.NotConnected {
 		t.Errorf("state after Disconnect and a restart = %s, want notConnected", st)
+	}
+}
+
+// A sign-in that changes nothing, with his run in force, says why before the
+// run's state comes back: Pllum keeps a new session only once the helper
+// takes it (connecting, then catchingUp), so a run's earlier state must never
+// read as that.
+func TestASignInThatChangesNothingSaysWhy(t *testing.T) {
+	for name, tc := range map[string]struct {
+		err  error
+		want string
+	}{
+		"ended":      {statusErr(401), "reconnectNeeded"},
+		"offline":    {&url.Error{Op: "Get", URL: "https://invented.example", Err: errors.New("invented: no route")}, "notConnected/offline"},
+		"unreadable": {errors.New("invented: unexpected end of JSON input"), "notConnected/internal"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			r := newRig(t)
+			r.live()
+			r.f.setErr("GetCurrentUserProfile", tc.err)
+			k := len(r.ev.states())
+			fresh := validSession()
+			fresh["li_at"] = "li-at-invented-2"
+			if err := r.login(fresh); err != nil {
+				t.Fatal(err)
+			}
+			eventually(t, "the run's state back", func() bool { return len(r.ev.states()) >= k+3 })
+			r.waitState(network.Live, "")
+			if got := r.ev.states()[k:]; !slices.Equal(got, []string{"connecting", tc.want, "live"}) {
+				t.Errorf("states = %v, want connecting, %s, then live", got, tc.want)
+			}
+			if n := r.f.count("RealtimeDisconnect"); n != 0 {
+				t.Errorf("his run was stopped (%d disconnects)", n)
+			}
+		})
 	}
 }

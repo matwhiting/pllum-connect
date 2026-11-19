@@ -519,11 +519,16 @@ func (l *LinkedIn) probeCurrent(pg int) bool {
 }
 
 // backToBefore puts the state back as it was before a sign-in that changed
-// nothing, when a run is still in force. l.mu is held.
-func (l *LinkedIn) backToBefore() {
-	if l.runCtx != nil {
-		l.setState(l.prevState, l.prevKind)
+// nothing, when a run is still in force. The sign-in's own outcome (s with
+// kind) is said first, so the run's earlier state never reads as the new
+// session taken (Pllum keeps a session only once connecting is followed by
+// catchingUp). l.mu is held.
+func (l *LinkedIn) backToBefore(s network.State, kind wire.Kind) {
+	if l.runCtx == nil {
+		return
 	}
+	l.setState(s, kind)
+	l.setState(l.prevState, l.prevKind)
 }
 
 // signIn checks a sign-in: the profile read with a client signed in as no
@@ -561,12 +566,12 @@ func (l *LinkedIn) signIn(ctx context.Context, pg int, session network.Session, 
 	self := l.self()
 	if self != "" && self != id {
 		l.setState(network.NotConnected, wire.Refused)
-		l.backToBefore()
+		l.backToBefore(network.NotConnected, wire.Refused)
 		return
 	}
 	if err := l.keep("self", id); err != nil {
 		l.setState(network.NotConnected, wire.Internal)
-		l.backToBefore()
+		l.backToBefore(network.NotConnected, wire.Internal)
 		return
 	}
 	if self == "" {
@@ -646,7 +651,7 @@ func (l *LinkedIn) probeRequest(ctx context.Context, pg int, session network.Ses
 		l.endProbe()
 		_ = l.keep("block", strings.Join(append(l.keptBlock(), hash), ","))
 		if l.runCtx != nil {
-			l.backToBefore()
+			l.backToBefore(network.ReconnectNeeded, "")
 			return errNotConnected
 		}
 		l.session = nil
@@ -677,7 +682,7 @@ func (l *LinkedIn) probeFailed(pg int, session network.Session, hash string, kin
 		return
 	}
 	if l.runCtx != nil {
-		l.backToBefore()
+		l.backToBefore(network.NotConnected, kind)
 		return
 	}
 	l.session = session
