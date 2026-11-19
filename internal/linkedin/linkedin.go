@@ -5,7 +5,8 @@
 // window (`login` with method "session", sent from the Keychain on every
 // start), catches up through LinkedIn's sync token, stays live on LinkedIn's
 // realtime stream, and pages history slowly in the background. Reads are the
-// server's, from the store.
+// server's, from the store. The writes (a send, a reaction, a mark, a mute)
+// are writes.go's, and photo fetches media.go's.
 //
 // LinkedIn restricts accounts that behave like a script, so the network makes
 // only the calls liClient lists, its background requests go one at a time at
@@ -185,6 +186,16 @@ type LinkedIn struct {
 	cmu      sync.Mutex
 	cLast    time.Time
 	cPending bool
+
+	// The sends in line (writes.go): one goroutine sends them, in order.
+	smu      sync.Mutex
+	outbox   []string
+	draining bool
+
+	// One lock per media file, so each is fetched once at a time (media.go).
+	mmu      sync.Mutex
+	mlocks   map[string]*sync.Mutex
+	mediaCap int64
 }
 
 var (
@@ -206,6 +217,8 @@ func New(st *store.Store, dir string, key [32]byte, emit network.Emit, opts Opti
 		state:     network.NotConnected,
 		values:    map[string]string{},
 		wake:      make(chan struct{}, 1),
+		mlocks:    map[string]*sync.Mutex{},
+		mediaCap:  mediaCap,
 	}
 	if l.newClient == nil {
 		l.newClient = realClient
@@ -226,7 +239,7 @@ func (l *LinkedIn) SignIn() meta.SignInPage { return SignInPage() }
 // Start readies the network. It asks nothing of LinkedIn: the cookies live in
 // Pllum's Keychain, and Pllum sends them as a `login` on every start. A pause
 // from an earlier run runs to its end, and a session LinkedIn ended stays
-// ended.
+// ended. A send an earlier run left sending is unknown, and never sent again.
 func (l *LinkedIn) Start(ctx context.Context) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -236,6 +249,7 @@ func (l *LinkedIn) Start(ctx context.Context) error {
 	l.ctx, l.cancel = context.WithCancel(silent(context.WithoutCancel(ctx)))
 	l.started = true
 	l.pause.restore(l.value("pause"))
+	l.forgetCutOff()
 	if len(l.keptBlock()) > 0 {
 		l.setState(network.ReconnectNeeded, "")
 	}
@@ -341,36 +355,6 @@ func (l *LinkedIn) Nudge() {
 		return
 	}
 	l.signal()
-}
-
-// The writes are the next step's; until then each is unsupported.
-
-func (l *LinkedIn) Send(ctx context.Context, m network.Outgoing) (string, error) {
-	return "", errUnsupported
-}
-
-func (l *LinkedIn) SendState(messageID string) network.SendState {
-	return network.SendState{State: network.SendUnknown}
-}
-
-func (l *LinkedIn) SendFor(clientID string) (string, error) { return "", nil }
-
-func (l *LinkedIn) React(ctx context.Context, chatID, messageID, emoji, transactionID string) error {
-	return errUnsupported
-}
-
-func (l *LinkedIn) MarkRead(ctx context.Context, chatID, through string) error {
-	return errUnsupported
-}
-
-func (l *LinkedIn) MarkUnread(ctx context.Context, chatID string) error { return errUnsupported }
-
-func (l *LinkedIn) SetMuted(ctx context.Context, chatID string, muted bool) error {
-	return errUnsupported
-}
-
-func (l *LinkedIn) Media(ctx context.Context, chatID, messageID string) (string, error) {
-	return "", errUnsupported
 }
 
 // Stop disconnects and waits briefly for the network's work to end. The
@@ -810,14 +794,21 @@ func (l *LinkedIn) paced(ctx context.Context) error {
 // and a CDN refusing it never pauses LinkedIn (mediaGone, or rateLimited for
 // a 429 or 999).
 func (l *LinkedIn) download(ctx context.Context, cli liClient, url string) (*http.Response, error) {
+	resp, _, err := l.downloadRaw(ctx, cli, url)
+	return resp, err
+}
+
+// downloadRaw is download, with the client's own error too (raw), nil when
+// nothing was asked.
+func (l *LinkedIn) downloadRaw(ctx context.Context, cli liClient, url string) (resp *http.Response, raw, err error) {
 	if _, blocked := l.pause.blocked(); blocked {
-		return nil, errRateLimited
+		return nil, nil, errRateLimited
 	}
-	resp, err := cli.DownloadHTTP(ctx, url)
-	if err == nil {
-		return resp, nil
+	resp, raw = cli.DownloadHTTP(ctx, url)
+	if raw == nil {
+		return resp, nil, nil
 	}
-	kind := l.pause.checkMedia(err)
+	kind := l.pause.checkMedia(raw)
 	if kind == reconnectNeeded {
 		l.mu.Lock()
 		gen := l.gen
@@ -825,7 +816,7 @@ func (l *LinkedIn) download(ctx context.Context, cli liClient, url string) (*htt
 		l.endSession(gen)
 		kind = wire.NotConnected
 	}
-	return nil, &wire.Error{Kind: kind}
+	return nil, raw, &wire.Error{Kind: kind}
 }
 
 // paused: LinkedIn pushed back, and the pause has begun. The run ends, its

@@ -173,6 +173,65 @@ type fakeLinkedIn struct {
 	// cookies LinkedIn sets as it answers.
 	rotate func(jar *linkedingo.StringCookieJar, n int)
 	nreq   int
+
+	// send, when set, answers SendMessage (after it is recorded and any
+	// error set for it given); otherwise a sent message with a new URN.
+	send  func(c *fakeClient, ctx context.Context, conv string, body linkedingo.SendMessageBody, rc []linkedingo.SendRenderContent, txn string) (*linkedingo.MessageSentResponse, error)
+	sends []sentMessage
+	nsent int
+	// uploads are the files UploadMedia was given.
+	uploads []upload
+	// download, when set, answers DownloadHTTP; otherwise an empty 200.
+	download func(url string) (*http.Response, error)
+}
+
+// sentMessage is one SendMessage call's arguments.
+type sentMessage struct {
+	conv string
+	body linkedingo.SendMessageBody
+	rc   []linkedingo.SendRenderContent
+	txn  string
+}
+
+// upload is one UploadMedia call's arguments.
+type upload struct {
+	kind        linkedingo.MediaUploadType
+	filename    string
+	contentType string
+	size        int
+	data        []byte
+}
+
+// uploadedAsset is the asset URN every invented upload answers with.
+const uploadedAsset = "urn:li:digitalmediaAsset:InventedAsset0001"
+
+// sentNow is LinkedIn's answer to a send: the message, his, under a new
+// invented URN.
+func (f *fakeLinkedIn) sentNow(conv string, body linkedingo.SendMessageBody) *linkedingo.MessageSentResponse {
+	f.mu.Lock()
+	f.nsent++
+	n := f.nsent
+	f.mu.Unlock()
+	return &linkedingo.MessageSentResponse{Data: linkedingo.Message{
+		EntityURN:               linkedingo.NewURN(msgURN(800000 + n)),
+		Body:                    linkedingo.AttributedText{Text: body.Text},
+		DeliveredAt:             ms(f.clock.Now()),
+		Sender:                  me(),
+		MessageBodyRenderFormat: linkedingo.MessageBodyRenderFormatDefault,
+		ConversationURN:         linkedingo.NewURN(conv),
+	}}
+}
+
+func (f *fakeLinkedIn) sendsNow() []sentMessage {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]sentMessage(nil), f.sends...)
+}
+
+func (f *fakeLinkedIn) uploadsNow() []upload {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]upload(nil), f.uploads...)
 }
 
 func newFakeLinkedIn(clock *fakeClock) *fakeLinkedIn {
@@ -381,6 +440,12 @@ func (c *fakeClient) DownloadHTTP(ctx context.Context, url string) (*http.Respon
 	if err := c.f.record(c, "DownloadHTTP", url); err != nil {
 		return nil, err
 	}
+	c.f.mu.Lock()
+	download := c.f.download
+	c.f.mu.Unlock()
+	if download != nil {
+		return download(url)
+	}
 	return &http.Response{StatusCode: http.StatusOK, Body: http.NoBody}, nil
 }
 
@@ -407,27 +472,54 @@ func (c *fakeClient) IsLoggedIn() bool {
 }
 
 func (c *fakeClient) SendMessage(ctx context.Context, conv linkedingo.URN, body linkedingo.SendMessageBody, rc []linkedingo.SendRenderContent, txn string) (*linkedingo.MessageSentResponse, error) {
-	return nil, c.f.record(c, "SendMessage", conv.String())
+	c.f.enter()
+	defer c.f.leave()
+	c.f.mu.Lock()
+	c.f.sends = append(c.f.sends, sentMessage{conv: conv.String(), body: body, rc: rc, txn: txn})
+	send := c.f.send
+	c.f.mu.Unlock()
+	if err := c.f.record(c, "SendMessage", conv.String()); err != nil {
+		return nil, err
+	}
+	if send != nil {
+		return send(c, ctx, conv.String(), body, rc, txn)
+	}
+	return c.f.sentNow(conv.String(), body), nil
 }
 
 func (c *fakeClient) UploadMedia(ctx context.Context, t linkedingo.MediaUploadType, filename, contentType string, size int, r io.Reader) (linkedingo.URN, error) {
-	return linkedingo.URN{}, c.f.record(c, "UploadMedia", filename)
+	data, _ := io.ReadAll(r)
+	c.f.mu.Lock()
+	c.f.uploads = append(c.f.uploads, upload{kind: t, filename: filename, contentType: contentType, size: size, data: data})
+	c.f.mu.Unlock()
+	if err := c.f.record(c, "UploadMedia", filename); err != nil {
+		return linkedingo.URN{}, err
+	}
+	return linkedingo.NewURN(uploadedAsset), nil
 }
 
 func (c *fakeClient) SendReaction(ctx context.Context, msg linkedingo.URN, emoji string) error {
-	return c.f.record(c, "SendReaction", msg.String())
+	return c.f.record(c, "SendReaction", msg.String()+" "+emoji)
 }
 
 func (c *fakeClient) RemoveReaction(ctx context.Context, msg linkedingo.URN, emoji string) error {
-	return c.f.record(c, "RemoveReaction", msg.String())
+	return c.f.record(c, "RemoveReaction", msg.String()+" "+emoji)
 }
 
 func (c *fakeClient) MarkConversationRead(ctx context.Context, convs ...linkedingo.URN) (*linkedingo.MarkThreadReadResponse, error) {
-	return nil, c.f.record(c, "MarkConversationRead", "")
+	return &linkedingo.MarkThreadReadResponse{}, c.f.record(c, "MarkConversationRead", urnList(convs))
 }
 
 func (c *fakeClient) MarkConversationUnread(ctx context.Context, convs ...linkedingo.URN) (*linkedingo.MarkThreadReadResponse, error) {
-	return nil, c.f.record(c, "MarkConversationUnread", "")
+	return &linkedingo.MarkThreadReadResponse{}, c.f.record(c, "MarkConversationUnread", urnList(convs))
+}
+
+func urnList(us []linkedingo.URN) string {
+	var out []string
+	for _, u := range us {
+		out = append(out, u.String())
+	}
+	return strings.Join(out, ",")
 }
 
 func (c *fakeClient) Logout(ctx context.Context) error {
