@@ -220,3 +220,74 @@ func TestANewLoginWithAKeptBlockIsRefusedWithNoRequest(t *testing.T) {
 	r.waitState(network.ReconnectNeeded, "")
 	never(t, "the stopped session reached LinkedIn after a restart", func() bool { return len(r.f.callsNow()) > n })
 }
+
+// otherSession is an invented session of another LinkedIn account, freshly
+// signed in in the window.
+func otherSession() network.Session {
+	s := validSession()
+	s["li_at"] = "li-at-invented-other"
+	s["JSESSIONID"] = `"ajax:0000000000000000099"`
+	return s
+}
+
+func TestAnotherAccountAfterAnEndedSessionKeepsItsBlock(t *testing.T) {
+	r := newRig(t)
+	c := r.live()
+	c.dispatch(badCredentials{err: errors.New("invented: rejected")})
+	r.waitState(network.ReconnectNeeded, "")
+	r.idle()
+	block := r.value("block")
+	if block == "" {
+		t.Fatalf("no block kept for the ended session")
+	}
+
+	// He signs in in the window, but as another account: refused.
+	r.f.profileID = otherID
+	if err := r.login(otherSession()); err != nil {
+		t.Fatal(err)
+	}
+	r.waitState(network.NotConnected, wire.Refused)
+	r.idle()
+	if got := r.value("block"); got != block {
+		t.Fatalf("the refusal changed the kept block: %q, want %q", got, block)
+	}
+	if got := r.value("self"); got != selfID {
+		t.Fatalf("self = %q", got)
+	}
+
+	// A restart still knows his session ended, and the ended session sent
+	// again from the Keychain asks LinkedIn nothing.
+	r.f.profileID = selfID
+	r.restart()
+	if st, _ := r.l.stateNow(); st != network.ReconnectNeeded {
+		t.Fatalf("state after a restart = %s, want reconnectNeeded", st)
+	}
+	n := len(r.f.callsNow())
+	if err := r.login(validSession()); err != nil {
+		t.Fatal(err)
+	}
+	r.waitState(network.ReconnectNeeded, "")
+	never(t, "the ended session reached LinkedIn after the refusal", func() bool { return len(r.f.callsNow()) > n })
+}
+
+func TestAnotherAccountLeavesALiveSessionRunning(t *testing.T) {
+	r := newRig(t)
+	r.live()
+	r.f.profileID = otherID
+	if err := r.login(otherSession()); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, "the refusal", func() bool { return slices.Contains(r.ev.states(), "notConnected/refused") })
+	r.waitState(network.Live, "")
+	r.idle()
+	if n := r.f.count("RealtimeDisconnect"); n != 0 {
+		t.Errorf("his live session was stopped for another account's sign-in (%d disconnects)", n)
+	}
+	// His run still works: a catch-up it is asked for still goes.
+	n := r.f.count("GetConversationsBySyncToken")
+	r.f.clients[1].dispatch(convDeleteless())
+	r.idle()
+	if r.f.count("GetConversationsBySyncToken") == n {
+		t.Errorf("his run no longer answers its stream")
+	}
+}

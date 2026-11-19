@@ -127,6 +127,9 @@ func (l *LinkedIn) readOnly(chat string) {
 	if !isConversation(chat) {
 		return
 	}
+	if _, ok, err := l.st.Chat(Name, chat); err != nil || !ok {
+		return // never stored (spam, or never listed): nothing to keep readable
+	}
 	yes := true
 	if l.st.PutChat(Name, store.ChatInfo{ID: chat, ReadOnly: &yes}) == nil {
 		l.changed()

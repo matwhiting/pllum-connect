@@ -162,9 +162,19 @@ type LinkedIn struct {
 	retry      bool      // the run ended for a passing reason: a nudge may start another
 	stopResume func() bool
 	due        struct{ sync, pages bool } // catch-ups the realtime stream asked for
-	wake       chan struct{}
-	work       sync.WaitGroup
-	busy       atomic.Int32 // runs at work and stream stops still running
+
+	// A sign-in being checked: its profile is read before anything else
+	// changes, so another account's is refused with the run in force, the
+	// kept block and the store as they were.
+	probing     bool
+	probeGen    int
+	probeCancel context.CancelFunc
+	prevState   network.State // the state before the sign-in began, for a refusal to go back to
+	prevKind    wire.Kind
+
+	wake chan struct{}
+	work sync.WaitGroup
+	busy atomic.Int32 // runs at work and stream stops still running
 
 	vmu    sync.Mutex
 	values map[string]string
@@ -244,7 +254,9 @@ func (l *LinkedIn) Status() network.Status {
 // session LinkedIn ended (any version of it), sent again, is reconnectNeeded
 // with nothing asked. Otherwise it answers at once, and the outcome comes as
 // state events: connecting, catchingUp and live; notConnected with refused
-// for another account than his; or a failure.
+// for another account than his; or a failure. Nothing else changes (the run
+// in force, a kept ended session) until the profile read shows the session
+// is his (signIn).
 func (l *LinkedIn) Login(ctx context.Context, p network.LoginParams) error {
 	if p.Method != network.LoginSession {
 		return errUnsupported
@@ -260,27 +272,24 @@ func (l *LinkedIn) Login(ctx context.Context, p network.LoginParams) error {
 		return errBadRequest
 	}
 	hash := sessionHash(session)
-	if blocked := l.keptBlock(); len(blocked) > 0 {
-		if slices.Contains(blocked, hash) {
-			l.retire()
-			l.session = nil
-			l.setState(network.ReconnectNeeded, "")
-			return nil
-		}
-		// A new session: he has signed in again in the window.
-		_ = l.keep("block", "")
+	if slices.Contains(l.keptBlock(), hash) {
+		l.endProbe()
+		l.retire()
+		l.session = nil
+		l.setState(network.ReconnectNeeded, "")
+		return nil
 	}
-	l.retire()
-	l.session = session
-	l.hashes = []string{hash}
-	l.diff.Seed(session)
 	if _, blocked := l.pause.blocked(); blocked {
+		// Nothing may be asked; the sign-in is checked when the pause ends.
+		l.endProbe()
+		l.retire()
+		l.session = session
+		l.hashes = []string{hash}
 		l.setState(network.Offline, wire.RateLimited)
 		l.scheduleResume()
 		return nil
 	}
-	l.setState(network.Connecting, "")
-	l.startRun()
+	l.startProbe(session, hash)
 	return nil
 }
 
@@ -291,6 +300,7 @@ func (l *LinkedIn) CancelLogin() {
 	if l.state != network.Connecting {
 		return
 	}
+	l.endProbe()
 	l.retire()
 	l.session = nil
 	l.setState(network.NotConnected, "")
@@ -303,6 +313,7 @@ func (l *LinkedIn) CancelLogin() {
 func (l *LinkedIn) Logout(ctx context.Context) error {
 	l.mu.Lock()
 	cli := l.cli
+	l.endProbe()
 	l.retire()
 	l.session = nil
 	l.setState(network.NotConnected, "")
@@ -375,6 +386,7 @@ func (l *LinkedIn) Stop() {
 		l.mu.Unlock()
 		return
 	}
+	l.endProbe()
 	l.retire()
 	l.cancel()
 	l.mu.Unlock()
@@ -425,33 +437,234 @@ func (l *LinkedIn) retire() {
 	l.cli, l.jar, l.realtime = nil, nil, false
 }
 
-// startRun signs in with l.session in the background, as run l.gen. l.mu is
-// held.
-func (l *LinkedIn) startRun() {
+// startRun starts run l.gen in the background, signed in as urn with the
+// cookies in jar (signIn has checked they are his). l.mu is held.
+func (l *LinkedIn) startRun(urn linkedingo.URN, jar *linkedingo.StringCookieJar) {
 	ctx, cancel := context.WithCancel(l.ctx)
 	l.runCtx, l.runCancel = ctx, cancel
-	gen, session := l.gen, l.session
+	l.jar = jar
+	gen := l.gen
 	l.work.Add(1)
 	l.busy.Add(1)
 	go func() {
 		defer l.work.Done()
 		defer l.busy.Add(-1)
-		l.run(ctx, gen, session)
+		l.run(ctx, gen, urn, jar)
 	}()
 }
 
-// again starts a new run with the held cookies, unless one is running, there
-// are none, or a pause forbids a request. l.mu is held.
+// again signs in again with the held cookies, unless a run or a sign-in is
+// in force, there are none, or a pause forbids a request. l.mu is held.
 func (l *LinkedIn) again() {
-	if !l.started || l.stopped || l.session == nil || l.runCtx != nil {
+	if !l.started || l.stopped || l.session == nil || l.runCtx != nil || l.probing {
 		return
 	}
 	if _, blocked := l.pause.blocked(); blocked {
 		return
 	}
 	l.retire()
+	l.startProbe(l.session, sessionHash(l.session))
+}
+
+// startProbe begins checking a sign-in: its profile is read in the
+// background (signIn). The state is connecting meanwhile. l.mu is held.
+func (l *LinkedIn) startProbe(session network.Session, hash string) {
+	if l.probeCancel != nil {
+		l.probeCancel()
+	}
+	if !l.probing {
+		l.prevState, l.prevKind = l.state, l.kind
+	}
+	l.probing = true
+	l.probeGen++
+	pg := l.probeGen
+	ctx, cancel := context.WithCancel(l.ctx)
+	l.probeCancel = cancel
 	l.setState(network.Connecting, "")
-	l.startRun()
+	l.work.Add(1)
+	l.busy.Add(1)
+	go func() {
+		defer l.work.Done()
+		defer l.busy.Add(-1)
+		l.signIn(ctx, pg, session, hash)
+	}()
+}
+
+// endProbe drops the sign-in being checked, if any. l.mu is held.
+func (l *LinkedIn) endProbe() {
+	l.probing = false
+	if l.probeCancel != nil {
+		l.probeCancel()
+		l.probeCancel = nil
+	}
+}
+
+// probeCurrent reports whether pg is still the sign-in being checked. l.mu is
+// held.
+func (l *LinkedIn) probeCurrent(pg int) bool {
+	return l.probing && pg == l.probeGen && !l.stopped
+}
+
+// backToBefore puts the state back as it was before a sign-in that changed
+// nothing, when a run is still in force. l.mu is held.
+func (l *LinkedIn) backToBefore() {
+	if l.runCtx != nil {
+		l.setState(l.prevState, l.prevKind)
+	}
+}
+
+// signIn checks a sign-in: the profile read with a client signed in as no
+// one. Another account than the one whose chats the store holds is refused,
+// and nothing changes: the run in force goes on, a kept ended session stays
+// kept. Only his own profile ends the run in force, clears the kept block
+// and starts his run (adopt).
+func (l *LinkedIn) signIn(ctx context.Context, pg int, session network.Session, hash string) {
+	jar := jarOf(session)
+	probe := l.newClient(linkedingo.NewURN(""), jar, userAgent, "", noHandlers())
+	var profile *linkedingo.UserProfile
+	err := l.probeRequest(ctx, pg, session, hash, func(ctx context.Context) (err error) {
+		profile, err = probe.GetCurrentUserProfile(ctx)
+		return err
+	})
+	if err != nil {
+		l.probeFailed(pg, session, hash, wire.KindOf(err))
+		return
+	}
+	urn := profile.MiniProfile.DashEntityURN
+	if urn.IsEmpty() {
+		urn = profile.MiniProfile.EntityURN
+	}
+	id := profileID(urn)
+	if id == "" {
+		l.probeFailed(pg, session, hash, wire.Internal)
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if !l.probeCurrent(pg) {
+		return
+	}
+	l.endProbe()
+	if self := l.self(); self != "" && self != id {
+		l.setState(network.NotConnected, wire.Refused)
+		l.backToBefore()
+		return
+	}
+	if err := l.keep("self", id); err != nil {
+		l.setState(network.NotConnected, wire.Internal)
+		l.backToBefore()
+		return
+	}
+	// His: the run in force ends, a kept ended session is cleared (he has
+	// signed in again), and his run starts.
+	l.retire()
+	_ = l.keep("block", "")
+	l.session = session
+	l.hashes = []string{hash}
+	l.diff.Seed(session)
+	l.startRun(urn.WithPrefix("urn", "li", "fsd_profile"), jar)
+}
+
+// noHandlers are handlers that do nothing, for the client that only reads
+// the profile.
+func noHandlers() linkedingo.Handlers {
+	return linkedingo.Handlers{
+		Heartbeat:              func(context.Context) {},
+		ClientConnection:       func(context.Context, *linkedingo.ClientConnection) {},
+		TransientDisconnect:    func(context.Context, error) {},
+		BadCredentials:         func(context.Context, error) {},
+		DecoratedEvent:         func(context.Context, *linkedingo.DecoratedEvent) {},
+		ConversationsSyncToken: func(context.Context, string) {},
+	}
+}
+
+// probeRequest is request for the profile read of sign-in pg: none during a
+// pause or once the sign-in is dropped, in the background's turn. LinkedIn
+// pushing back pauses everything, the run in force included; an ended
+// session ends this sign-in.
+func (l *LinkedIn) probeRequest(ctx context.Context, pg int, session network.Session, hash string, fn func(ctx context.Context) error) error {
+	gate := func() error {
+		l.mu.Lock()
+		ok := l.probeCurrent(pg)
+		l.mu.Unlock()
+		if !ok {
+			return errNotConnected
+		}
+		if _, blocked := l.pause.blocked(); blocked {
+			return errRateLimited
+		}
+		return nil
+	}
+	if err := gate(); err != nil {
+		return err
+	}
+	if err := l.paced(ctx); err != nil {
+		return errNotConnected
+	}
+	if err := gate(); err != nil {
+		return err
+	}
+	err := fn(ctx)
+	if err == nil {
+		return nil
+	}
+	if ctx.Err() != nil {
+		return errNotConnected
+	}
+	kind, paused := l.pause.check(err)
+	if paused {
+		_ = l.keep("pause", l.pause.String())
+		return errRateLimited
+	}
+	if kind == reconnectNeeded {
+		l.mu.Lock()
+		defer l.mu.Unlock()
+		if !l.probeCurrent(pg) {
+			return errNotConnected
+		}
+		// This session LinkedIn won't take is kept as ended too, beside any
+		// kept before; the run in force, if any, goes on.
+		l.endProbe()
+		_ = l.keep("block", strings.Join(append(l.keptBlock(), hash), ","))
+		if l.runCtx != nil {
+			l.backToBefore()
+			return errNotConnected
+		}
+		l.session = nil
+		l.setState(network.ReconnectNeeded, "")
+		return errNotConnected
+	}
+	return &wire.Error{Kind: kind}
+}
+
+// probeFailed: sign-in pg's profile read failed with kind. A pause (begun by
+// it, or in force) stops everything, the run in force included, and the
+// sign-in is checked again when it ends. Any other failure leaves a run in
+// force as it was; with none, the state is notConnected with the kind, and a
+// passing one may be nudged.
+func (l *LinkedIn) probeFailed(pg int, session network.Session, hash string, kind wire.Kind) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if !l.probeCurrent(pg) {
+		return
+	}
+	l.endProbe()
+	if kind == wire.RateLimited {
+		l.retire()
+		l.session = session
+		l.hashes = []string{hash}
+		l.setState(network.Offline, wire.RateLimited)
+		l.resumeAfterPause()
+		return
+	}
+	if l.runCtx != nil {
+		l.backToBefore()
+		return
+	}
+	l.session = session
+	l.hashes = []string{hash}
+	l.setState(network.NotConnected, kind)
+	l.retry = passing(kind)
 }
 
 // resumeAfterPause starts a new run when the pause ends, or now if it has
@@ -492,55 +705,10 @@ func (l *LinkedIn) current(gen int) bool {
 	return gen == l.gen && !l.stopped
 }
 
-// run signs in: the profile read with a client signed in as no one, the
-// check that the profile is his, then his client, the catch-up, the realtime
-// stream and the background work (sync.go), all as run gen.
-func (l *LinkedIn) run(ctx context.Context, gen int, session network.Session) {
-	jar := jarOf(session)
-	l.mu.Lock()
-	if gen != l.gen || l.stopped {
-		l.mu.Unlock()
-		return
-	}
-	l.jar = jar
-	l.mu.Unlock()
-
-	probe := l.newClient(linkedingo.NewURN(""), jar, userAgent, "", l.handlersFor(gen))
-	var profile *linkedingo.UserProfile
-	err := l.request(ctx, gen, true, func(ctx context.Context) (err error) {
-		profile, err = probe.GetCurrentUserProfile(ctx)
-		return err
-	})
-	if err != nil {
-		l.failed(gen, network.NotConnected, wire.KindOf(err))
-		return
-	}
-	urn := profile.MiniProfile.DashEntityURN
-	if urn.IsEmpty() {
-		urn = profile.MiniProfile.EntityURN
-	}
-	id := profileID(urn)
-	if id == "" {
-		l.failed(gen, network.NotConnected, wire.Internal)
-		return
-	}
-	if self := l.self(); self != "" && self != id {
-		// Another account than the one whose chats the store holds: refused,
-		// and nothing changes.
-		l.mu.Lock()
-		if gen == l.gen && !l.stopped {
-			l.retire()
-			l.session = nil
-			l.setState(network.NotConnected, wire.Refused)
-		}
-		l.mu.Unlock()
-		return
-	}
-	if err := l.keep("self", id); err != nil {
-		l.failed(gen, network.NotConnected, wire.Internal)
-		return
-	}
-	cli := l.newClient(urn.WithPrefix("urn", "li", "fsd_profile"), jar, userAgent, l.value("syncToken"), l.handlersFor(gen))
+// run is his signed-in run gen: his client, the catch-up, the realtime
+// stream and the background work (sync.go).
+func (l *LinkedIn) run(ctx context.Context, gen int, urn linkedingo.URN, jar *linkedingo.StringCookieJar) {
+	cli := l.newClient(urn, jar, userAgent, l.value("syncToken"), l.handlersFor(gen))
 	l.mu.Lock()
 	if gen != l.gen || l.stopped {
 		l.mu.Unlock()
@@ -760,7 +928,7 @@ func (l *LinkedIn) stateNow() (network.State, wire.Kind) {
 func (l *LinkedIn) idleNow() bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	return l.busy.Load() == 0 && !l.due.sync && !l.due.pages
+	return l.busy.Load() == 0 && !l.due.sync && !l.due.pages && !l.probing
 }
 
 // changed tells Pllum there is something to re-read: at once, or when 500 ms

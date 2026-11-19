@@ -70,10 +70,10 @@ func TestCatchUpFollowsTheSyncTokenThenGoesLive(t *testing.T) {
 	}
 	names := r.f.namesSince(0)
 	i := slices.Index(names, "GetConversationsBySyncToken")
-	j := slices.Index(names, "GetMessagesBefore")
 	k := slices.Index(names, "RealtimeConnect")
-	if i < 0 || j < i || k < j {
-		t.Errorf("calls = %v, want the sync token, the chat's messages, then realtime", names)
+	j := slices.Index(names, "GetMessagesBefore")
+	if i < 0 || k < i || j < k {
+		t.Errorf("calls = %v, want the sync token, realtime, then the chat's messages behind it", names)
 	}
 	if slices.Contains(names, "GetConversationsWithNextCursor") || slices.Contains(names, "GetConversationsUpdatedBefore") {
 		t.Errorf("a catch-up with a token listed the inbox: %v", names)
@@ -463,5 +463,133 @@ func TestAChatLinkedInWontPageIsPassedOver(t *testing.T) {
 	}
 	if st, _ := r.l.stateNow(); st != network.Live {
 		t.Errorf("state = %s, want live", st)
+	}
+}
+
+// convsByDay are n one-to-ones, chat i last active i days back (newest
+// first), numbered from base.
+func convsByDay(base, n int) []linkedingo.Conversation {
+	var out []linkedingo.Conversation
+	for i := range n {
+		out = append(out, conv(base+i, start.Add(-time.Duration(i)*24*time.Hour)))
+	}
+	return out
+}
+
+// fetchesInOrder checks the newest-page fetches (GetMessagesBefore) came
+// after the stream connected, paced, for want in that order.
+func fetchesInOrder(t *testing.T, r *rig, from int, want []string) {
+	t.Helper()
+	calls := r.f.callsNow()[from:]
+	connected := -1
+	var got []string
+	var last time.Time
+	for i, c := range calls {
+		switch c.name {
+		case "RealtimeConnect":
+			if connected < 0 {
+				connected = i
+			}
+		case "GetMessagesBefore":
+			if connected < 0 && from == 0 {
+				t.Fatalf("%s was fetched before the stream connected (live)", c.arg)
+			}
+			if !last.IsZero() && c.at.Sub(last) < 2*time.Second {
+				t.Errorf("fetches %v apart, want at least 2 s", c.at.Sub(last))
+			}
+			last = c.at
+			got = append(got, c.arg)
+		}
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("fetched %d chats in order\n%v\nwant\n%v", len(got), got, want)
+	}
+}
+
+func TestAFirstConnectGoesLiveBeforeFetchingMessages(t *testing.T) {
+	r := newRig(t)
+	convs := convsByDay(200, 6)
+	r.f.cursorPage = func(cursor string) *linkedingo.CollectionResponse[linkedingo.ConversationCursorMetadata, linkedingo.Conversation] {
+		switch cursor {
+		case "":
+			return cursorPageOf("next-invented-1", convs[:3]...)
+		case "next-invented-1":
+			return cursorPageOf("", convs[3:]...)
+		}
+		return cursorPageOf("")
+	}
+	var liveAt time.Time
+	r.f.before = func(c string, _ time.Time, _ int) *linkedingo.CollectionResponse[linkedingo.MessageMetadata, linkedingo.Message] {
+		if st, _ := r.l.stateNow(); st != network.Live {
+			t.Errorf("messages of %s fetched in state %s, want live", c, st)
+		} else if liveAt.IsZero() {
+			liveAt = r.clock.Now()
+		}
+		return messagePage("")
+	}
+	if err := r.login(validSession()); err != nil {
+		t.Fatal(err)
+	}
+	r.waitState(network.Live, "")
+	r.idle()
+	var want []string
+	for _, c := range convs {
+		want = append(want, urnString(c.EntityURN))
+	}
+	fetchesInOrder(t, r, 0, want)
+	if got := r.f.count("GetConversationsWithNextCursor"); got != 2 {
+		t.Errorf("%d listing pages, want 2", got)
+	}
+}
+
+func TestANewSessionsGapIsFetchedBehindTheListing(t *testing.T) {
+	r := newRig(t)
+	r.f.syncPage = func(string) *linkedingo.CollectionResponse[linkedingo.ConversationSyncMetadata, linkedingo.Conversation] {
+		return syncPageOf([]linkedingo.Conversation{conv(1, start.Add(-time.Hour))})
+	}
+	c := r.live()
+	c.dispatch(&linkedingo.ClientConnection{})
+	r.idle()
+	r.f.cursorPage = func(cursor string) *linkedingo.CollectionResponse[linkedingo.ConversationCursorMetadata, linkedingo.Conversation] {
+		switch cursor {
+		case "":
+			return cursorPageOf("next-invented-1", conv(2, start.Add(30*time.Minute)), conv(3, start.Add(20*time.Minute)))
+		case "next-invented-1":
+			return cursorPageOf("next-invented-2", conv(4, start.Add(10*time.Minute)), conv(1, start.Add(-time.Hour)))
+		}
+		return cursorPageOf("")
+	}
+	listed := false
+	r.f.before = func(c string, _ time.Time, _ int) *linkedingo.CollectionResponse[linkedingo.MessageMetadata, linkedingo.Message] {
+		if !listed {
+			t.Errorf("messages of %s fetched before the listing ended", c)
+		}
+		return messagePage("")
+	}
+	page := r.f.cursorPage
+	r.f.cursorPage = func(cursor string) *linkedingo.CollectionResponse[linkedingo.ConversationCursorMetadata, linkedingo.Conversation] {
+		p := page(cursor)
+		listed = listed || cursor == "next-invented-1"
+		return p
+	}
+	n := len(r.f.callsNow())
+	c.dispatch(&linkedingo.ClientConnection{SessID: [16]byte{4, 5, 6}})
+	r.idle()
+	if st, _ := r.l.stateNow(); st != network.Live {
+		t.Fatalf("state = %s, want live", st)
+	}
+	fetchesInOrder(t, r, n, []string{convURN(2), convURN(3), convURN(4)})
+}
+
+func TestADeleteOfAConversationNeverStoredMakesNoChat(t *testing.T) {
+	r := newRig(t)
+	c := r.live()
+	r.f.syncPage = func(string) *linkedingo.CollectionResponse[linkedingo.ConversationSyncMetadata, linkedingo.Conversation] {
+		return syncPageOf(nil, convURN(77))
+	}
+	c.dispatch(convDeleteless())
+	r.idle()
+	if _, ok, _ := r.st.Chat(Name, convURN(77)); ok {
+		t.Errorf("a delete of a conversation never stored made a chat")
 	}
 }

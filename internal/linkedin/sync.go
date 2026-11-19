@@ -37,9 +37,10 @@ const (
 	jobPages     // the inbox listed by cursor back to the newest activity stored
 )
 
-// stayCaughtUp is a signed-in run's work: the catch-up, then the realtime
-// stream (live), then, one request at a time, the catch-ups the stream asks
-// for and the history, newest chats first, until the run ends.
+// stayCaughtUp is a signed-in run's work: the catch-up of the chats, then the
+// realtime stream (live), then, one request at a time, the catch-ups the
+// stream asks for, the messages of the chats found changed, and the history,
+// newest chats first, until the run ends.
 func (l *LinkedIn) stayCaughtUp(ctx context.Context, gen int, cli liClient) {
 	if err := l.catchUp(ctx, gen, cli); err != nil {
 		l.failed(gen, network.Offline, wire.KindOf(err))
@@ -73,8 +74,13 @@ func (l *LinkedIn) stayCaughtUp(ctx context.Context, gen int, cli liClient) {
 		case jobSync:
 			err = l.catchUpByToken(ctx, gen, cli)
 		default:
-			var did bool
-			did, err = l.historyStep(ctx, gen, cli)
+			// What came in the chats a catch-up found changed first, newest
+			// chat first; then the history.
+			did, ferr := l.freshStep(ctx, gen, cli)
+			err = ferr
+			if err == nil && !did {
+				did, err = l.historyStep(ctx, gen, cli)
+			}
 			if err == nil && !did {
 				if !l.waitForJob(ctx) {
 					return
@@ -175,8 +181,8 @@ func skippable(err error) bool { return wire.KindOf(err) == wire.Internal }
 
 // catchUpByToken asks for the conversations changed since the sync token the
 // client holds (the client gives the new token to the handler, which keeps
-// it), stores them, makes the deleted ones read-only and fetches what came
-// in each changed one.
+// it), stores them and makes the deleted ones read-only. What came in each
+// changed one is fetched behind it, by the background work (freshStep).
 func (l *LinkedIn) catchUpByToken(ctx context.Context, gen int, cli liClient) error {
 	var page *linkedingo.CollectionResponse[linkedingo.ConversationSyncMetadata, linkedingo.Conversation]
 	err := l.request(ctx, gen, true, func(ctx context.Context) (err error) {
@@ -192,7 +198,8 @@ func (l *LinkedIn) catchUpByToken(ctx context.Context, gen int, cli liClient) er
 	for _, d := range page.Metadata.DeletedURNs {
 		l.readOnly(urnString(d.Conversation.EntityURN))
 	}
-	return l.storeAndCatchUp(ctx, gen, cli, page.Elements)
+	l.storeConversations(page.Elements)
+	return nil
 }
 
 // listBack lists the inbox by cursor, newest activity first: on a first
@@ -225,9 +232,7 @@ func (l *LinkedIn) listBack(ctx context.Context, gen int, cli liClient, first bo
 				oldest = at
 			}
 		}
-		if err := l.storeAndCatchUp(ctx, gen, cli, page.Elements); err != nil {
-			return err
-		}
+		l.storeConversations(page.Elements)
 		next := page.Metadata.NextCursor
 		if first {
 			_ = l.keep("listCursor", next)
@@ -269,24 +274,35 @@ func (l *LinkedIn) newestStored() (time.Time, bool) {
 	return time.Time{}, false
 }
 
-// storeAndCatchUp stores conversations, then fetches what came in each one
-// with activity newer than the store had for it.
-func (l *LinkedIn) storeAndCatchUp(ctx context.Context, gen int, cli liClient, convs []linkedingo.Conversation) error {
-	var changed []linkedingo.URN
+// storeConversations stores conversations and marks each one with activity
+// newer than the store had for it (or new) as fresh: what came in it is
+// fetched behind the catch-up, by the background work (freshStep), so the
+// chats show, and the state goes live, first. The marks are kept in the
+// store, so a restart fetches what an earlier run did not get to.
+func (l *LinkedIn) storeConversations(convs []linkedingo.Conversation) {
 	for _, c := range convs {
 		if l.storeConversation(c) {
-			changed = append(changed, c.EntityURN)
+			_ = l.keep("fresh."+urnString(c.EntityURN), "1")
 		}
 	}
 	if len(convs) > 0 {
 		l.changed()
 	}
-	for _, c := range changed {
-		if err := l.catchUpChat(ctx, gen, cli, c); err != nil && (!l.current(gen) || !skippable(err)) {
-			return err
-		}
+}
+
+// freshStep fetches what came in the newest chat marked fresh (catchUpChat)
+// and clears its mark; did is false when none is marked. A chat LinkedIn
+// won't page is cleared too, and passed over.
+func (l *LinkedIn) freshStep(ctx context.Context, gen int, cli liClient) (did bool, err error) {
+	chat, ok := l.nextChat(func(c store.Chat) bool { return !c.ReadOnly && l.value("fresh."+c.ID) != "" })
+	if !ok {
+		return false, nil
 	}
-	return nil
+	if err := l.catchUpChat(ctx, gen, cli, linkedingo.NewURN(chat)); err != nil && (!l.current(gen) || !skippable(err)) {
+		return true, err
+	}
+	_ = l.keep("fresh."+chat, "")
+	return true, nil
 }
 
 // catchUpChat fetches the newest page of a chat, then earlier pages until one
@@ -397,6 +413,14 @@ func (l *LinkedIn) historyPaged(chat, cursor string, page *linkedingo.Collection
 // nextHistoryChat is the newest LinkedIn conversation whose history has more
 // to page: not at its start, not paged to 730 days, not read-only.
 func (l *LinkedIn) nextHistoryChat() (string, bool) {
+	return l.nextChat(func(c store.Chat) bool {
+		return !c.HistoryComplete && !c.ReadOnly && l.value("histDone."+c.ID) == ""
+	})
+}
+
+// nextChat is the newest LinkedIn conversation the store holds for which
+// want is true.
+func (l *LinkedIn) nextChat(want func(c store.Chat) bool) (string, bool) {
 	cursor := ""
 	for range 50 {
 		page, err := l.st.Chats(Name, 0, cursor, 200)
@@ -404,10 +428,9 @@ func (l *LinkedIn) nextHistoryChat() (string, bool) {
 			return "", false
 		}
 		for _, c := range page.Items {
-			if !isConversation(c.ID) || c.HistoryComplete || c.ReadOnly || l.value("histDone."+c.ID) != "" {
-				continue
+			if isConversation(c.ID) && want(c) {
+				return c.ID, true
 			}
-			return c.ID, true
 		}
 		if page.Cursor == "" {
 			break
