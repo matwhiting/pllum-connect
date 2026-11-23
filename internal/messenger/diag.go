@@ -106,7 +106,7 @@ func (m *Messenger) icdcCheck(ctx context.Context, gen int) (ok bool) {
 	if !m.checkICDC(ctx, gen) {
 		return true
 	}
-	if m.value(reregisteredKey) != "" {
+	if m.reregistered() {
 		m.diagLine("re-registration: not attempted, it was done once before")
 		return true
 	}
@@ -149,7 +149,7 @@ func (m *Messenger) checkICDC(ctx context.Context, gen int) (missing bool) {
 	}
 	in := slices.Contains(ids, own)
 	m.diagLine(fmt.Sprintf("self-check: ICDC list has %d identities, this device's among them %v; Meta's ICDC seq %d; re-registered before %v",
-		len(ids), in, seq, m.value(reregisteredKey) != ""))
+		len(ids), in, seq, m.reregistered()))
 	return !in && len(ids) > 0
 }
 

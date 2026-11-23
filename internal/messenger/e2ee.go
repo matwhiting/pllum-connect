@@ -30,19 +30,17 @@ import (
 // (the signed list of every device identity his account has, which senders
 // check a device against), adds this device's identity, signs the list with
 // it and posts it to Meta with the device's keys and its Facebook device
-// ID. The Facebook device ID is the session's (sessionDeviceID), never one
-// RegisterE2EE would make up. Once, ever, the self-check (diag.go) finding
-// this device's identity missing from that list replaces the device with a
-// new one (reregister).
+// ID. The Facebook device ID is set as mautrix-meta's connector sets it: a
+// Messenger Lite session's suggested one (realClient.SessionDeviceID); a
+// web cookie session names none, so RegisterE2EE makes one and it is saved
+// with the device. Once, ever, the self-check (diag.go) finding this
+// device's identity missing from that list replaces the device with a new
+// one (reregister), whose own RegisterE2EE adds the new identity to the
+// list it fetches afresh.
 
-// The network's own store values for the device (ids.go lists the rest):
-// reregisteredKey is the day the one re-registration was begun, and
-// deviceUUIDKey a Facebook device ID made here once, for a session that
-// names none.
-const (
-	reregisteredKey = "ereregistered"
-	deviceUUIDKey   = "fbdevice"
-)
+// reregisteredKey is the network's store value (ids.go lists the rest)
+// holding the day the one re-registration was begun.
+const reregisteredKey = "ereregistered"
 
 // e2eeClient is what the adapter uses of the whatsmeow client: its events,
 // and the socket. waClient wraps *whatsmeow.Client; tests use a fake.
@@ -79,12 +77,14 @@ func (c realClient) PrepareE2EE() (e2eeClient, error) {
 
 // device is his Messenger device for this account, registered with Meta
 // and saved: the one saved in an earlier run or sign-in, or else one
-// registered now (once, timed), with the session's Facebook device ID
-// (sessionDeviceID). While a re-registration is pending (m.replacing, set
+// registered now (once, timed), with a Messenger Lite session's Facebook
+// device ID where there is one, else the one RegisterE2EE makes. While a re-registration is pending (m.replacing, set
 // by reregister) the saved device is passed over: the pending device is
 // registered, and once it is, the replaced device's row is deleted before
 // the new one is saved (a device Meta gives the same number would
-// otherwise keep the old keys in the row). It holds dmu throughout, so two
+// otherwise keep the old keys in the row; a crash between the delete and
+// the save leaves no device, and the next start registers a fresh one,
+// once). It holds dmu throughout, so two
 // runs never each make one. A registration that fails (Meta's answer lost,
 // or the save after it) keeps its unsaved device, keys and Facebook device
 // ID, for the next sign-in in this helper to register again: Meta finds the
@@ -140,9 +140,9 @@ func (m *Messenger) device(ctx context.Context, gen int, cli msgrClient, fbid in
 		err := m.request(ctx, gen, func(ctx context.Context) error {
 			asked = true
 			if dev.FacebookUUID == uuid.Nil {
-				// asked here, past the pace's wait, when the page's configs
-				// are in place
-				dev.FacebookUUID = m.sessionDeviceID(cli)
+				// a Messenger Lite session's; Nil for a web session, and
+				// RegisterE2EE makes one (kept with the device after)
+				dev.FacebookUUID = cli.SessionDeviceID()
 			}
 			began := m.now()
 			err := cli.RegisterE2EE(ctx, fbid)
@@ -175,21 +175,24 @@ func (m *Messenger) device(ctx context.Context, gen int, cli msgrClient, fbid in
 	return dev, registerMs, nil
 }
 
-// sessionDeviceID is the Facebook device ID a new device registers with:
-// the session's, as mautrix-meta's connector takes it (a native session's,
-// or the web page's device ID; realClient.SessionDeviceID), else one made
-// here once and kept (deviceUUIDKey), so no registration uses an ID
-// RegisterE2EE makes up on the spot.
-func (m *Messenger) sessionDeviceID(cli msgrClient) uuid.UUID {
-	if id := cli.SessionDeviceID(); id != uuid.Nil {
-		return id
+// reregistered reports whether the one re-registration has been begun: its
+// marker is set, or cannot be read (an unreadable marker never lets it run
+// again).
+func (m *Messenger) reregistered() bool {
+	m.vmu.Lock()
+	v, ok := m.values[reregisteredKey]
+	m.vmu.Unlock()
+	if ok {
+		return v != ""
 	}
-	if id, err := uuid.Parse(m.value(deviceUUIDKey)); err == nil && id != uuid.Nil {
-		return id
+	v, _, err := m.st.NetworkValue(Name, reregisteredKey)
+	if err != nil {
+		return true
 	}
-	id := uuid.New()
-	_ = m.keep(deviceUUIDKey, id.String())
-	return id
+	m.vmu.Lock()
+	m.values[reregisteredKey] = v
+	m.vmu.Unlock()
+	return v != ""
 }
 
 // reregister replaces his Messenger device for run gen, once ever: the
@@ -197,16 +200,22 @@ func (m *Messenger) sessionDeviceID(cli msgrClient) uuid.UUID {
 // list, which senders check a device against. The day is kept under
 // reregisteredKey before anything is asked, so it never runs twice, after
 // a restart either. The encrypted socket is disconnected, and a new device
-// (new keys, the session's Facebook device ID) is registered, saved in
-// place of the old one and connected (device, connectE2EE). Its first
-// connect runs the socket's self-check again and asks again for what could
-// not be read (askAgain), which reaches the new device. A failure is what
-// a failed first registration is (e2eeSetupFailed): an unclear one keeps
-// the registration-unclear block, and the same new keys are registered
-// again only at a later sign-in in this helper. began reports whether it
-// was attempted; err is the failure that ended the run.
+// (new keys; its Facebook device ID set as device sets one) is registered,
+// saved in place of the old one and connected (device, connectE2EE). Its
+// first connect runs the socket's self-check again and asks again for what
+// could not be read (askAgain), which reaches the new device. A failure is
+// what a failed first registration is (e2eeSetupFailed): an unclear one
+// keeps the registration-unclear block, and the same new keys are
+// registered again only at a later sign-in in this helper. A run retired
+// while it begins arms nothing (the marker stays set). began reports
+// whether it was attempted; err is the failure that ended the run.
+//
+// Nothing retries it on its own. A failed attempt followed by a restart
+// leaves him on the old device with the marker set; the manual reset is to
+// delete the network value "messenger.ereregistered" and the kept
+// "messenger.block" from the store's meta table, then sign in again.
 func (m *Messenger) reregister(ctx context.Context, gen int) (began bool, err error) {
-	if m.value(reregisteredKey) != "" {
+	if m.reregistered() {
 		return false, nil
 	}
 	m.mu.Lock()
@@ -220,18 +229,28 @@ func (m *Messenger) reregister(ctx context.Context, gen int) (began bool, err er
 		m.diagLine("re-registration: not attempted, its marker could not be kept")
 		return false, nil
 	}
-	m.diagLine("re-registration: attempted, with a new device, new keys and the session's device ID")
-	m.mu.Lock()
-	old := m.e2ee
-	if gen == m.gen {
-		m.e2ee = nil
+	if m.testReregister != nil {
+		m.testReregister()
 	}
+	m.mu.Lock()
+	if gen != m.gen || m.stopped {
+		m.mu.Unlock()
+		m.diagLine("re-registration: not attempted, its sign-in had ended")
+		return false, nil
+	}
+	old := m.e2ee
+	m.e2ee = nil
 	m.mu.Unlock()
+	m.diagLine("re-registration: attempted, with a new device and new keys")
 	if old != nil {
 		old.Disconnect()
 	}
 	m.e2eeUp(gen, false)
 	m.dmu.Lock()
+	if !m.current(gen) {
+		m.dmu.Unlock()
+		return false, nil // retired meanwhile: nothing armed for another run
+	}
 	prev := m.dev
 	var prevID *watypes.JID
 	if prev != nil && prev.ID != nil {

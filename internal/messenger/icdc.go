@@ -1,7 +1,6 @@
 package messenger
 
 import (
-	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -24,13 +23,13 @@ import (
 // come from DumpState (the state mautrix-meta's connector caches), the
 // endpoint from GetEndpoint, the HTTP client from GetHTTP, and the answer
 // is messagix's own ICDCFetchResponse. The request carries the account's
-// FBID, the crypto auth token and app ID from the page, and a device ID,
-// and no cookie, as the library's does; nothing of it, or of the answer,
-// is logged or kept.
+// FBID, the crypto auth token and app ID from the page, and this device's
+// Facebook device ID, and no cookie, as the library's does; nothing of it,
+// or of the answer, is logged or kept.
 
 // errNoPageConfigs: the client has not loaded and synced the messages page
-// yet, so its configs (the crypto auth token, the app ID, the page's device
-// ID) are not there to read.
+// yet, so its configs (the crypto auth token, the app ID) are not there to
+// read.
 var errNoPageConfigs = errors.New("messenger: the page's configs are not loaded")
 
 // pageConfigs are the configs the client took from the messages page, as
@@ -104,24 +103,11 @@ func (c realClient) FetchICDC(ctx context.Context, fbid int64, deviceUUID uuid.U
 	return ids, r.ICDCSeq, nil
 }
 
-// SessionDeviceID is the session's Facebook device ID, as mautrix-meta's
-// connector takes it before registering: a Messenger Lite (native)
-// session's suggested one (nil for a web cookie session, whose client has
-// no MessengerLite), else the device ID the messages page gave the web
-// session, which messagix's own socket uses (configs.go's updateSocketIDs:
-// IGDMqttWebDeviceID, then MqttWebDeviceID). uuid.Nil when neither is a
-// UUID.
+// SessionDeviceID is the Facebook device ID mautrix-meta's connector
+// registers with: a Messenger Lite (native) session's suggested one. A web
+// cookie session's client has no MessengerLite, so it is uuid.Nil, and
+// RegisterE2EE makes one, as it does for the connector. (The page's MQTT
+// web device ID is messagix's socket ID, never an ICDC device ID.)
 func (c realClient) SessionDeviceID() uuid.UUID {
-	if id := c.Client.MessengerLite.GetSuggestedDeviceID(); id != uuid.Nil {
-		return id
-	}
-	cfg, err := c.pageConfigs()
-	if err != nil {
-		return uuid.Nil
-	}
-	id, err := uuid.Parse(cmp.Or(cfg.IGDMqttWebDeviceID.ClientID, cfg.MqttWebDeviceID.ClientID))
-	if err != nil {
-		return uuid.Nil
-	}
-	return id
+	return c.Client.MessengerLite.GetSuggestedDeviceID()
 }

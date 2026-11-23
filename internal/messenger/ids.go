@@ -33,8 +33,7 @@ import (
 // ("<ms>\n<message ID>"), "olderDone.<chat>" when an encrypted chat's
 // older thread has no more, "backfilled" once the first sign-in's
 // backfill has run, "block" and "rate" (messenger.go), and "ereregistered"
-// (the day the one re-registration began) and "fbdevice" (a Facebook
-// device ID made once, for a session that names none) (e2ee.go). His restored
+// (the day the one re-registration began; e2ee.go). His restored
 // backup's (history.go): "ecursor.<chat>" → where a chat's backup goes on
 // (ms), "encDone.<chat>" when it has no more, "estalled.<chat>" while it is
 // held, "ebf.<chat>" and "ebfPages" (the first restore's pages, a chat's

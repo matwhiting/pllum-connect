@@ -6,7 +6,7 @@
 // own sign-in window (`login` with method "session"), loads the messages
 // page and connects the main (lightspeed) socket; on its first connect, as
 // mautrix-meta's connector does, it registers Pllum as a Messenger device
-// (once, ever, with the session's Facebook device ID; replaced once, ever,
+// (once, ever; replaced once, ever,
 // if the self-check finds its identity missing from his account's ICDC
 // list) and connects the encrypted socket (e2ee.go), looks for his
 // history backup, which his PIN restores (history.go), lists every folder
@@ -108,8 +108,8 @@ type msgrClient interface {
 	// FetchICDC is the account's ICDC list as Meta gives it: every device
 	// identity in it, and its seq (icdc.go).
 	FetchICDC(ctx context.Context, fbid int64, deviceUUID uuid.UUID) (identities [][32]byte, seq int, err error)
-	// SessionDeviceID is the session's Facebook device ID, uuid.Nil when
-	// it names none (icdc.go).
+	// SessionDeviceID is a Messenger Lite session's Facebook device ID,
+	// uuid.Nil for a web session (icdc.go).
 	SessionDeviceID() uuid.UUID
 	// PrepareE2EE is the whatsmeow client for the encrypted chats, made
 	// silent and acking only once its handlers have run.
@@ -277,6 +277,9 @@ type Messenger struct {
 	// testPrep, set only by tests, sees each encrypted message before it is
 	// worked out.
 	testPrep func(evt *events.FBMessage)
+	// testReregister, set only by tests, runs as a re-registration begins,
+	// once its marker is kept.
+	testReregister func()
 	// testKeep, set only by tests, fails a send's progress as the store
 	// would.
 	testKeep func(p sendProgress) error

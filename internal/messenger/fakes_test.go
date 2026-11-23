@@ -175,8 +175,9 @@ type fakeMeta struct {
 	// it, and icdcSeq its seq: each registration that goes adds its
 	// identity and moves the seq on, as the library's does, unless icdcSkip
 	// (the next registrations that do not land in it) says not. icdcErr
-	// fails the next fetch of it. sessionUUID is the device ID of the
-	// session SessionDeviceID gives (uuid.Nil: none). sameDevice gives
+	// fails the next fetch of it. sessionUUID is the Messenger Lite
+	// device ID SessionDeviceID gives (uuid.Nil, as for a web cookie
+	// session: none, and RegisterE2EE makes one). sameDevice gives
 	// every registration device 7, where each would get the next number.
 	icdc        [][32]byte
 	icdcSeq     int
@@ -243,7 +244,7 @@ func newFakeMeta() *fakeMeta {
 	f := &fakeMeta{table: inbox(), e2ee: &fakeE2EE{}, history: &fakeHistory{},
 		folders: map[folderKey][]*table.LSTable{}, older: map[int64][]*table.LSTable{}, clock: newFakeClock(),
 		writeErrs: map[string]error{}, files: map[string][]byte{},
-		icdc: [][32]byte{inventedIdentity(0x11)}, icdcSeq: 3, sessionUUID: inventedSessionUUID}
+		icdc: [][32]byte{inventedIdentity(0x11)}, icdcSeq: 3}
 	f.history.rec = func(name string) {
 		f.mu.Lock()
 		defer f.mu.Unlock()
@@ -558,7 +559,7 @@ func (c *fakeClient) FetchICDC(ctx context.Context, fbid int64, deviceUUID uuid.
 	return append([][32]byte{}, c.f.icdc...), c.f.icdcSeq, nil
 }
 
-// SessionDeviceID is the invented device ID of the session, if any.
+// SessionDeviceID is the session's invented Messenger Lite device ID, if any.
 func (c *fakeClient) SessionDeviceID() uuid.UUID {
 	c.f.mu.Lock()
 	defer c.f.mu.Unlock()
@@ -575,7 +576,7 @@ func (c *fakeClient) PrepareE2EE() (e2eeClient, error) {
 	return c.f.e2ee, nil
 }
 
-// inventedSessionUUID is the invented device ID of the session.
+// inventedSessionUUID is an invented Messenger Lite device ID.
 var inventedSessionUUID = uuid.MustParse("5e5510e0-0000-4000-8000-00000000c0de")
 
 // inventedIdentity is an invented identity key of another of his devices.

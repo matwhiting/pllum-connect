@@ -126,7 +126,7 @@ func TestTheSelfCheckLogsWhetherThisDeviceIsInTheICDCList(t *testing.T) {
 			}
 		}
 	}
-	for _, s := range []string{"2000001", ids[0].String(), inventedSessionUUID.String()} {
+	for _, s := range []string{"2000001", ids[0].String()} {
 		if strings.Contains(text, s) {
 			t.Fatalf("an ID reached the diagnostics file")
 		}
@@ -166,6 +166,9 @@ func TestAnAbsentIdentityReRegistersOnce(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			f := newFakeMeta()
 			f.sameDevice = same
+			if same {
+				f.sessionUUID = inventedSessionUUID // a Messenger Lite session names one
+			}
 			f.icdcSkip = 1 // the first registration never lands in the list
 			oldE2EE, newE2EE := f.e2ee, &fakeE2EE{}
 			f.e2eeNext = []*fakeE2EE{oldE2EE, newE2EE}
@@ -187,8 +190,11 @@ func TestAnAbsentIdentityReRegistersOnce(t *testing.T) {
 			if keys[0] == keys[1] {
 				t.Errorf("the re-registration kept the old keys")
 			}
-			if ids[1] != inventedSessionUUID {
-				t.Errorf("the re-registration's Facebook device ID is not the session's")
+			switch {
+			case same && ids[1] != inventedSessionUUID:
+				t.Errorf("the re-registration's Facebook device ID is not the Messenger Lite session's")
+			case !same && (ids[1] == uuid.Nil || ids[1] == ids[0]):
+				t.Errorf("without a session device ID, the re-registration did not get a new one of its own")
 			}
 			if h.m.value(reregisteredKey) == "" {
 				t.Errorf("the re-registration marker is not set")
@@ -222,8 +228,8 @@ func TestAnAbsentIdentityReRegistersOnce(t *testing.T) {
 			if len(saved) != 1 {
 				t.Fatalf("device.db holds %d devices, want 1", len(saved))
 			}
-			if saved[0].identity != keys[1] || saved[0].fbUUID != inventedSessionUUID {
-				t.Errorf("device.db holds the old device, or the new one without the session's device ID")
+			if saved[0].identity != keys[1] || saved[0].fbUUID != ids[1] {
+				t.Errorf("device.db holds the old device, or the new one without the device ID it registered with")
 			}
 
 			// A later helper: his identity is absent again, and the marker is set.
@@ -306,22 +312,120 @@ func TestAFailedReRegistrationDoesNotLoop(t *testing.T) {
 	}
 }
 
-// A fresh registration (a first sign-in) uses the session's Facebook device
-// ID; a session without one uses an ID made once here and kept.
-func TestTheFirstRegistrationUsesTheSessionsDeviceID(t *testing.T) {
-	h := newHarness(t)
+// A fresh registration (a first sign-in) uses a Messenger Lite session's
+// device ID; a web cookie session names none, and the device keeps the one
+// RegisterE2EE makes for it, as mautrix-meta's connector leaves it.
+func TestTheFirstRegistrationsDeviceID(t *testing.T) {
+	lite := newFakeMeta()
+	lite.sessionUUID = inventedSessionUUID
+	h := newHarnessOver(t, filepath.Join(t.TempDir(), "connect"), lite)
 	h.signIn(t)
-	if _, _, ids := h.f.registered(); len(ids) != 1 || ids[0] != inventedSessionUUID {
-		t.Fatalf("the first registration's Facebook device ID is not the session's")
+	if _, _, ids := lite.registered(); len(ids) != 1 || ids[0] != inventedSessionUUID {
+		t.Fatalf("the first registration's Facebook device ID is not the Messenger Lite session's")
 	}
 
-	none := newFakeMeta()
-	none.sessionUUID = uuid.Nil
-	h2 := newHarnessOver(t, filepath.Join(t.TempDir(), "connect"), none)
+	web := newFakeMeta()
+	dir := filepath.Join(t.TempDir(), "connect")
+	h2 := newHarnessOver(t, dir, web)
 	h2.signIn(t)
-	_, _, ids := none.registered()
-	kept, err := uuid.Parse(h2.m.value(deviceUUIDKey))
-	if err != nil || len(ids) != 1 || ids[0] == uuid.Nil || ids[0] != kept {
-		t.Fatalf("without a session device ID, the registration did not use the one kept")
+	_, _, ids := web.registered()
+	if len(ids) != 1 || ids[0] == uuid.Nil {
+		t.Fatalf("a web session's registration had no Facebook device ID")
+	}
+	if h2.m.value("fbdevice") != "" {
+		t.Errorf("a Facebook device ID was kept in the store")
+	}
+	h2.close()
+	if saved := savedDevices(t, dir); len(saved) != 1 || saved[0].fbUUID != ids[0] {
+		t.Errorf("the device was not saved with the device ID it registered with")
+	}
+}
+
+// A fetch of the list that fails, or a list with no identity in it, writes
+// its line and does nothing else: no registration, no marker.
+func TestNoListNoReRegistration(t *testing.T) {
+	for _, tc := range []struct {
+		name, line string
+		setup      func(f *fakeMeta)
+	}{
+		{"the fetch fails", "ICDC list failed", func(f *fakeMeta) { f.icdcErr = errors.New("invented: refused") }},
+		{"the list is empty", "ICDC list has 0 identities", func(f *fakeMeta) { f.icdc, f.icdcSkip = nil, 1 }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFakeMeta()
+			tc.setup(f)
+			h := newHarnessOver(t, filepath.Join(t.TempDir(), "connect"), f)
+			h.signIn(t)
+			h.waitDiag(t, "ICDC list", 1)
+			h.settle()
+			h.f.clock.Advance(48 * time.Hour)
+			h.settle()
+			if l := h.icdcLines(t); len(l) != 1 || !strings.Contains(l[0], tc.line) {
+				t.Errorf("the ICDC lines are %q, want one with %q", l, tc.line)
+			}
+			if n, _, _ := f.registered(); n != 1 {
+				t.Errorf("Meta was asked to register %d times, want 1", n)
+			}
+			if h.m.value(reregisteredKey) != "" || strings.Contains(h.diagText(t), "re-registration") {
+				t.Errorf("a re-registration was marked or logged")
+			}
+		})
+	}
+}
+
+// A run retired while the re-registration begins (after its marker is
+// kept) arms nothing: no device to replace, no registration, and the
+// marker stays set.
+func TestAReRegistrationOfARetiredRunArmsNothing(t *testing.T) {
+	h := newHarness(t)
+	h.signIn(t)
+	h.settle()
+	h.m.mu.Lock()
+	gen := h.m.gen
+	h.m.mu.Unlock()
+	h.m.testReregister = func() {
+		h.m.mu.Lock()
+		h.m.retire()
+		h.m.mu.Unlock()
+	}
+	began, err := h.m.reregister(context.Background(), gen)
+	if began || err != nil {
+		t.Fatalf("reregister of a retired run began %v, %v", began, err)
+	}
+	h.m.dmu.Lock()
+	armed := h.m.replacing != nil
+	h.m.dmu.Unlock()
+	if armed {
+		t.Errorf("a retired run armed a device to replace")
+	}
+	h.settle()
+	if n, _, _ := h.f.registered(); n != 1 {
+		t.Errorf("Meta was asked to register %d times, want 1", n)
+	}
+	if h.m.value(reregisteredKey) == "" {
+		t.Errorf("the marker was cleared")
+	}
+}
+
+// A marker that cannot be read counts as set: nothing re-registers on it.
+func TestAnUnreadableMarkerCountsAsSet(t *testing.T) {
+	h := newHarness(t)
+	h.signIn(t)
+	h.settle()
+	h.m.mu.Lock()
+	gen := h.m.gen
+	h.m.mu.Unlock()
+	h.m.vmu.Lock()
+	delete(h.m.values, reregisteredKey)
+	h.m.vmu.Unlock()
+	h.st.Close() // every read of the store fails now
+	if !h.m.reregistered() {
+		t.Fatalf("an unreadable marker reads as unset")
+	}
+	if began, _ := h.m.reregister(context.Background(), gen); began {
+		t.Errorf("a re-registration began on an unreadable marker")
+	}
+	if n, _, _ := h.f.registered(); n != 1 {
+		t.Errorf("Meta was asked to register %d times, want 1", n)
 	}
 }

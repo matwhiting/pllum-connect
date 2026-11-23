@@ -30,6 +30,7 @@ func (f roundTrip) RoundTrip(r *http.Request) (*http.Response, error) { return f
 // stateClient is a real messagix client holding invented page configs (as
 // a synced client would), its requests answered by rt.
 func stateClient(t *testing.T, mqttID string, rt roundTrip) realClient {
+	// mqttID is the page's MQTT web device ID, which is never a device ID
 	t.Helper()
 	ck := &cookies.Cookies{Platform: types.Facebook}
 	ck.UpdateValues(map[cookies.MetaCookieName]string{"c_user": "2000001", "xs": "xs-invented-1", "datr": "datr-invented-1"})
@@ -77,8 +78,8 @@ func TestTheRealClientFetchesTheICDCList(t *testing.T) {
 	if got.Get("fbid") != "2000001" || got.Get("fb_cat") != "cat-invented-1" || got.Get("app_id") != "77001" || got.Get("device_id") != devUUID.String() {
 		t.Errorf("the form was %v", got)
 	}
-	if id := c.SessionDeviceID(); id != inventedSessionUUID {
-		t.Errorf("SessionDeviceID is %v, want the page's device ID", id)
+	if id := c.SessionDeviceID(); id != uuid.Nil {
+		t.Errorf("a web session's SessionDeviceID is %v, want none (the page's MQTT ID is not a device ID)", id)
 	}
 }
 
@@ -102,9 +103,6 @@ func TestTheRealClientsICDCRefusals(t *testing.T) {
 		_, _, err := c.FetchICDC(context.Background(), 2000001, uuid.Nil)
 		if err == nil || errors.Is(err, httpclient.ErrRateLimited) != tc.limit {
 			t.Errorf("status %d %q: err %v", tc.status, tc.body, err)
-		}
-		if id := c.SessionDeviceID(); id != uuid.Nil {
-			t.Errorf("a page device ID that is no UUID gave %v", id)
 		}
 	}
 }
