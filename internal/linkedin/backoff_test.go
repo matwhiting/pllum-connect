@@ -233,3 +233,125 @@ func TestAPauseStillPausesEverythingWhileAChatBacksOff(t *testing.T) {
 		t.Errorf("state = %s/%s during the pause, want offline/rateLimited", st, kind)
 	}
 }
+
+// The account-wide catch-ups (by the sync token, and the inbox listed by
+// cursor) that keep failing back off the same way, even while the stream
+// keeps asking for them; any answer starts them over.
+
+// runPoking is runFor, with poke called after each minute (the stream
+// asking for a catch-up, say).
+func runPoking(r *rig, d time.Duration, poke func()) {
+	r.t.Helper()
+	until := r.clock.Now().Add(d)
+	for r.clock.Now().Before(until) {
+		r.clock.Advance(min(time.Minute, until.Sub(r.clock.Now())))
+		poke()
+		r.settled()
+	}
+}
+
+// callTimes are the times of every call by that name.
+func callTimes(r *rig, name string) []time.Time {
+	var out []time.Time
+	for _, c := range r.f.callsNow() {
+		if c.name == name {
+			out = append(out, c.at)
+		}
+	}
+	return out
+}
+
+var backedOff = []time.Duration{3 * time.Minute, 6 * time.Minute, 12 * time.Minute, 24 * time.Minute,
+	48 * time.Minute, 96 * time.Minute, 192 * time.Minute, 240 * time.Minute, 240 * time.Minute}
+
+func TestASyncCatchUpLinkedInKeepsFailingBacksOff(t *testing.T) {
+	for name, perr := range map[string]error{"503": statusErr(503), "unreadable": passingErrors()["unreadable"]} {
+		t.Run(name, func(t *testing.T) {
+			r := newRig(t)
+			c := r.live()
+			token := r.value("syncToken")
+			r.f.setErr("GetConversationsBySyncToken", perr)
+			before := len(callTimes(r, "GetConversationsBySyncToken"))
+			c.dispatch(convDeleteless())
+			r.settled()
+			runPoking(r, 17*time.Hour, func() { c.dispatch(convDeleteless()) })
+			checkGaps(t, gapsOf(callTimes(r, "GetConversationsBySyncToken")[before:]), backedOff)
+			if got := r.value("syncToken"); got != token {
+				t.Errorf("the failing catch-ups dropped the sync token (kept %q)", got)
+			}
+		})
+	}
+}
+
+func TestASyncCatchUpsSuccessStartsItsBackOffOver(t *testing.T) {
+	r := newRig(t)
+	c := r.live()
+	r.f.setErr("GetConversationsBySyncToken", statusErr(502))
+	before := len(callTimes(r, "GetConversationsBySyncToken"))
+	c.dispatch(convDeleteless())
+	r.settled()
+	runPoking(r, 22*time.Minute, func() { c.dispatch(convDeleteless()) }) // fails at 0, 3, 9 and 21 minutes
+	if n := len(callTimes(r, "GetConversationsBySyncToken")) - before; n != 4 {
+		t.Fatalf("the catch-up was asked %d times in 22 minutes, want 4", n)
+	}
+	r.f.setErr("GetConversationsBySyncToken", nil)
+	runFor(r, 25*time.Minute) // its fifth, at 45 minutes, is answered
+	answered := len(callTimes(r, "GetConversationsBySyncToken"))
+	if answered-before != 5 {
+		t.Fatalf("the catch-up was asked %d times by 47 minutes, want 5", answered-before)
+	}
+	// Failing again, it waits passingWait, then twice that: not from where
+	// it was.
+	r.f.setErr("GetConversationsBySyncToken", statusErr(502))
+	c.dispatch(convDeleteless())
+	r.settled()
+	runPoking(r, 15*time.Minute, func() { c.dispatch(convDeleteless()) })
+	checkGaps(t, gapsOf(callTimes(r, "GetConversationsBySyncToken")[answered:]), []time.Duration{passingWait, 2 * passingWait})
+}
+
+func TestAListingLinkedInKeepsFailingBacksOff(t *testing.T) {
+	r := newRig(t)
+	r.f.syncPage = func(string) *linkedingo.CollectionResponse[linkedingo.ConversationSyncMetadata, linkedingo.Conversation] {
+		return syncPageOf([]linkedingo.Conversation{conv(1, start.Add(-time.Hour))})
+	}
+	c := r.live()
+	c.dispatch(&linkedingo.ClientConnection{})
+	r.settled()
+	r.f.setErr("GetConversationsWithNextCursor", statusErr(504))
+	// The stream keeps reconnecting under new sessions, each asking for the
+	// gap to be listed.
+	sess := byte(0)
+	reconnect := func() {
+		sess++
+		c.dispatch(&linkedingo.ClientConnection{SessID: [16]byte{9, sess}})
+	}
+	reconnect()
+	r.settled()
+	runPoking(r, 17*time.Hour, reconnect)
+	checkGaps(t, gapsOf(callTimes(r, "GetConversationsWithNextCursor")), backedOff)
+}
+
+func TestAPauseStillPausesEverythingWhileACatchUpBacksOff(t *testing.T) {
+	r := newRig(t)
+	c := r.live()
+	r.f.setErr("GetConversationsBySyncToken", statusErr(503))
+	before := len(callTimes(r, "GetConversationsBySyncToken"))
+	c.dispatch(convDeleteless())
+	r.settled()
+	runFor(r, 10*time.Minute) // asked at 0, 3 and 9 minutes
+	if n := len(callTimes(r, "GetConversationsBySyncToken")) - before; n != 3 {
+		t.Fatalf("the catch-up was asked %d times in 10 minutes, want 3", n)
+	}
+	r.f.setErr("GetConversationsBySyncToken", statusErr(429))
+	runFor(r, 12*time.Minute) // its fourth, at 21 minutes, is pushed back
+	r.waitState(network.Offline, wire.RateLimited)
+	until, blocked := r.l.pause.blocked()
+	if !blocked || until.Sub(r.clock.Now()) < 13*time.Minute {
+		t.Fatalf("the pause holds until %v (blocked %v), want 15 minutes from the 429", until, blocked)
+	}
+	n := len(r.f.callsNow())
+	runFor(r, until.Sub(r.clock.Now())-time.Second)
+	if got := len(r.f.callsNow()); got != n {
+		t.Errorf("%d requests during the pause, want none", got-n)
+	}
+}

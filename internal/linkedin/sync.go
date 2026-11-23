@@ -32,7 +32,8 @@ const (
 	// 5xx, an answer the helper can't read, a timeout) waits before it is
 	// asked again, unless something wakes it sooner.
 	passingWait = 3 * time.Minute
-	// asideCap is the longest a chat LinkedIn keeps failing is set aside:
+	// asideCap is the longest a chat, or a catch-up (by the sync token, or
+	// the inbox listed by cursor), LinkedIn keeps failing is set aside:
 	// each passing failure of it in a row doubles its wait from
 	// passingWait (3, 6, 12 … minutes) up to this.
 	asideCap = 4 * time.Hour
@@ -113,12 +114,16 @@ func (l *LinkedIn) stayCaughtUp(ctx context.Context, gen int, cli liClient) {
 		if !l.current(gen) {
 			return
 		}
+		if err == nil && j != jobNone {
+			l.jobAnswered(j)
+		}
 		if err != nil {
 			// A passing failure (no connection, a 5xx, an answer it could not
 			// read, a timeout) settles nothing: the work waits passingWait,
 			// or until the stream or a nudge asks sooner, rather than asking
 			// again and again. A chat it failed on waits longer each time in
-			// a row (pass); the others go on after passingWait.
+			// a row (pass), and so does a catch-up (later); the rest goes
+			// on after passingWait.
 			l.later(gen, j)
 			if !l.waitForJob(ctx) {
 				return
@@ -134,6 +139,16 @@ func (l *LinkedIn) takeJob(gen int) (j job, ok bool) {
 	defer l.mu.Unlock()
 	if gen != l.gen || l.stopped {
 		return jobNone, false
+	}
+	// A catch-up backing off (later) waits its turn, however often the
+	// stream asks for it.
+	if l.due.pages && l.jobWaiting(jobPages) {
+		l.due.pages, l.held.pages = false, true
+		l.wakeAt(gen, l.jobAside[jobPages].until)
+	}
+	if l.due.sync && l.jobWaiting(jobSync) {
+		l.due.sync, l.held.sync = false, true
+		l.wakeAt(gen, l.jobAside[jobSync].until)
 	}
 	switch {
 	case l.due.pages:
@@ -191,6 +206,8 @@ func (l *LinkedIn) catchUp(ctx context.Context, gen int, cli liClient) error {
 			return err
 		}
 		l.later(gen, jobSync)
+	} else {
+		l.jobAnswered(jobSync)
 	}
 	if l.listingOwed() {
 		return l.listBack(ctx, gen, cli, true)
@@ -243,28 +260,56 @@ func (l *LinkedIn) syncByToken(ctx context.Context, gen int, cli liClient) error
 // other failure passes, and the work is asked again later.
 func settled(err error) bool { return errors.Is(err, errGone) }
 
-// later asks again, in passingWait, for the work a passing failure of run
-// gen stopped: the catch-up j, or (jobNone) the other chats, which the work
-// goes on with then (the chat that failed is set aside on its own: pass).
-// l.mu is not held.
+// later asks again for the work a passing failure of run gen stopped: the
+// rest of the work in passingWait (the chat that failed is set aside on its
+// own: pass), and the catch-up j (jobSync, jobPages) once its own wait is
+// over: passingWait after its first passing failure in a row, then twice as
+// long each time, up to asideCap, until LinkedIn next answers it
+// (jobAnswered). Held in memory only, across runs: a restart starts afresh.
+// A pause is not counted here: it ends the run first. l.mu is not held.
 func (l *LinkedIn) later(gen int, j job) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if gen != l.gen || l.stopped {
 		return
 	}
-	switch j {
-	case jobSync:
-		l.held.sync = true
-	case jobPages:
-		l.held.pages = true
+	now := l.clock.Now()
+	if j == jobSync || j == jobPages {
+		if l.jobAside == nil {
+			l.jobAside = map[job]backoff{}
+		}
+		b := l.jobAside[j]
+		b.fails++
+		b.until = now.Add(asideWait(b.fails))
+		l.jobAside[j] = b
+		if j == jobSync {
+			l.held.sync = true
+		} else {
+			l.held.pages = true
+		}
 	}
-	l.wakeAt(gen, l.clock.Now().Add(passingWait))
+	l.wakeAt(gen, now.Add(passingWait))
+}
+
+// jobWaiting reports whether the catch-up j is backing off now (later).
+// l.mu is held.
+func (l *LinkedIn) jobWaiting(j job) bool {
+	b, ok := l.jobAside[j]
+	return ok && l.clock.Now().Before(b.until)
+}
+
+// jobAnswered: LinkedIn answered the catch-up j, so its passing failures
+// start over.
+func (l *LinkedIn) jobAnswered(j job) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	delete(l.jobAside, j)
 }
 
 // wakeAt wakes run gen's background work at at, unless a wake is already
-// due by then: the catch-ups held by later become due, and the chats set
-// aside until then may be asked. l.mu is held.
+// due by then: the catch-ups held by later whose wait is over become due,
+// the chats set aside until then may be asked, and a wake is set for the
+// first held catch-up still waiting. l.mu is held.
 func (l *LinkedIn) wakeAt(gen int, at time.Time) {
 	if l.stopLater != nil {
 		if !l.laterAt.After(at) {
@@ -282,9 +327,18 @@ func (l *LinkedIn) wakeAt(gen int, at time.Time) {
 			return // an older run's, or a wake moved sooner
 		}
 		l.stopLater = nil
-		l.due.sync = l.due.sync || l.held.sync
-		l.due.pages = l.due.pages || l.held.pages
-		l.held.sync, l.held.pages = false, false
+		if l.held.sync && !l.jobWaiting(jobSync) {
+			l.due.sync, l.held.sync = true, false
+		}
+		if l.held.pages && !l.jobWaiting(jobPages) {
+			l.due.pages, l.held.pages = true, false
+		}
+		if l.held.sync {
+			l.wakeAt(gen, l.jobAside[jobSync].until)
+		}
+		if l.held.pages {
+			l.wakeAt(gen, l.jobAside[jobPages].until)
+		}
 		l.signal()
 	})
 }
@@ -309,10 +363,10 @@ func (l *LinkedIn) wakeForAside(gen int) {
 	}
 }
 
-// asideChat is a chat LinkedIn has failed on (a passing failure) since it
-// last answered for it: how many times in a row, and when it may be asked
-// again.
-type asideChat struct {
+// backoff is a chat, or a catch-up, LinkedIn has failed on (a passing
+// failure) since it last answered: how many times in a row, and when it may
+// be asked again.
+type backoff struct {
 	fails int
 	until time.Time
 }
@@ -332,7 +386,7 @@ func (l *LinkedIn) pass(gen int, chat string) {
 		return
 	}
 	if l.aside == nil {
-		l.aside = map[string]asideChat{}
+		l.aside = map[string]backoff{}
 	}
 	a := l.aside[chat]
 	a.fails++

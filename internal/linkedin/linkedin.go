@@ -181,7 +181,10 @@ type LinkedIn struct {
 	// aside are the chats LinkedIn has failed on (sync.go's pass), each
 	// backed off on its own. Kept across runs, in memory only: a restart
 	// starts every chat afresh.
-	aside map[string]asideChat
+	aside map[string]backoff
+	// jobAside are the catch-ups (jobSync, jobPages) LinkedIn has failed
+	// on (sync.go's later), backed off the same way, kept the same way.
+	jobAside map[job]backoff
 
 	// A sign-in being checked: its profile is read before anything else
 	// changes, so another account's is refused with the run in force, the
