@@ -681,6 +681,9 @@ type fakePage struct {
 	before  int64
 	more    bool
 	unmoved bool
+	// unreadable is how many more lines the page holds that Decrypt
+	// leaves out, as the library passes over a line it cannot decrypt.
+	unreadable int
 }
 
 // script gives a thread's pages of the backup.
@@ -780,6 +783,9 @@ func (h *fakeHistory) FetchMessages(ctx context.Context, device *securehistory.D
 		next = ts
 	}
 	r := &securehistory.MessageRange{BackupID: device.BackupID, Range: &securehistory.MessageRangeInfo{HasMoreBefore: &more, HasMoreAfter: &no, Before: next}}
+	for range len(p.msgs) + p.unreadable {
+		r.Messages = append(r.Messages, &securehistory.ArchiveMessage{})
+	}
 	h.given[r] = p.msgs
 	return r, nil
 }

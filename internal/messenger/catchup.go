@@ -176,6 +176,7 @@ func (m *Messenger) fetchEncNewest(ctx context.Context, gen int, cli msgrClient,
 	}
 	device = m.saveEpochs(device, page)
 	msgs := h.Decrypt(ctx, page, device, thread, fbid, group)
+	m.passedOver(page, len(msgs))
 	added, ok := m.storeArchive(chat, thread, group, fbid, msgs)
 	if !ok {
 		m.encStall(chat)

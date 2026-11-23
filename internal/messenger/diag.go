@@ -24,8 +24,9 @@ import (
 // (0600, on his Mac only, started again past diagLimit): the library's
 // warnings about decrypting a message, a self-check each time the
 // encrypted socket comes up, and its ICDC half and any re-registration in
-// each run's setup (each of their requests through the pace). Every
-// line but the self-check's (words, yes/no and counts) loses its numbers
+// each run's setup (each of their requests through the pace), and how many
+// of a backup page's lines the library could not decrypt. Every line but
+// the self-check's and those (words, yes/no and counts) loses its numbers
 // (sanitize), so it
 // holds no ID, JID, device number or time but its own timestamp, and never
 // a word of a message: the library's warnings name a message by its ID only.
@@ -40,8 +41,9 @@ func sanitize(s string) string { return digits.ReplaceAllString(s, "#") }
 // diag appends one line, sanitized, under the time it was written.
 func (m *Messenger) diag(line string) { m.diagLine(sanitize(line)) }
 
-// diagLine appends a line as it is: only the self-check's, made of words,
-// yes/no and counts, never an ID.
+// diagLine appends a line as it is: only the self-check's and a backup
+// page's passed-over lines (passedOver), made of words, yes/no and counts,
+// never an ID.
 func (m *Messenger) diagLine(line string) {
 	m.diagmu.Lock()
 	defer m.diagmu.Unlock()

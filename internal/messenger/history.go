@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -98,6 +100,22 @@ func (h realHistory) Decrypt(ctx context.Context, r *securehistory.MessageRange,
 }
 
 func (h realHistory) RegistrationID() string { return h.c.RegistrationID }
+
+// passedOver writes to the diagnostics file, in counts only, how many of a
+// backup page's lines the library could not decrypt and left out (got is
+// how many Decrypt gave). A line the library skips on purpose (none, or
+// tagged visibility metadata) is not one of the page's lines.
+func (m *Messenger) passedOver(page *securehistory.MessageRange, got int) {
+	n := 0
+	for _, a := range page.Messages {
+		if a != nil && (a.Protobufs == nil || !slices.Contains(a.Protobufs.Tags, "EB_VISIBILITY_METADATA")) {
+			n++
+		}
+	}
+	if n > got {
+		m.diagLine(fmt.Sprintf("backup page: %d of %d lines could not be read", n-got, n))
+	}
+}
 
 // HistoryState is "noBackup", "needsPIN", "restored" or "skipped"; empty
 // until the run has looked (after the encrypted socket is set up).
@@ -378,6 +396,7 @@ func (m *Messenger) sample(ctx context.Context, gen int, cli msgrClient, fbid in
 	// Meta moved his backup on to newer keys: kept, as the connector does.
 	device = m.saveEpochs(device, page)
 	lines := h.Decrypt(ctx, page, device, threadID, fbid, false)
+	m.passedOver(page, len(lines))
 	if !m.current(gen) {
 		return
 	}
@@ -416,7 +435,8 @@ func (m *Messenger) sample(ctx context.Context, gen int, cli msgrClient, fbid in
 //     ("estalled.<chat>", kept across restarts), for 6 h the first time,
 //     24 h the second and 7 days after that ("estallN.<chat>"); a line of
 //     a page that cannot be decrypted is left out by the library and the
-//     rest of the page kept;
+//     rest of the page kept, and the diagnostics file says how many
+//     (passedOver);
 //   - two failed requests in a row, across any chats, pause the whole
 //     backup the same way ("epause", "epauseN"; "efails" counts them), and
 //     end the first restore's read: a failure of the whole backup is asked
@@ -663,6 +683,7 @@ func (m *Messenger) fetchEncPage(ctx context.Context, gen int, cli msgrClient, f
 	}
 	device = m.saveEpochs(device, page)
 	msgs := h.Decrypt(ctx, page, device, thread, fbid, group)
+	m.passedOver(page, len(msgs))
 	added, ok := m.storeArchive(chat, thread, group, fbid, msgs)
 	if !ok {
 		m.encStall(chat)
