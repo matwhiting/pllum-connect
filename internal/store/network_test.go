@@ -193,3 +193,42 @@ func TestLineStateReadsWhatShows(t *testing.T) {
 		t.Fatalf("a revoked line read through an alias is %+v, %v", gone, ok)
 	}
 }
+
+// HoldsUnreadable says whether a chat still shows a line from someone that
+// couldn't be read: one taken over, settled or his own doesn't count.
+func TestHoldsUnreadableCountsShownPlaceholdersFromOthers(t *testing.T) {
+	s := openTest(t)
+	shown, hidden := false, true
+	placeholder := func(id, kind string, fromMe bool, h *bool) Message {
+		return Message{ID: id, ChatID: phoneChat, TimeMs: base, Kind: kind, FromMe: fromMe, Hidden: h, Source: SourceLive}
+	}
+	if s.HoldsUnreadable(net, phoneChat) {
+		t.Fatalf("an empty chat holds an unreadable line")
+	}
+	put(t, s, text(phoneChat, "3EB0U0001", base, "invented readable"))
+	put(t, s, placeholder("3EB0U0002", "undecryptable", true, &shown))
+	put(t, s, placeholder("3EB0U0003", "unavailable", false, &hidden))
+	if s.HoldsUnreadable(net, phoneChat) {
+		t.Fatalf("a chat with only his own or settled placeholders holds an unreadable line")
+	}
+	put(t, s, placeholder("3EB0U0004", "unavailable", false, &shown))
+	if err := s.Alias(net, lidChat, phoneChat); err != nil {
+		t.Fatal(err)
+	}
+	if !s.HoldsUnreadable(net, lidChat) {
+		t.Fatalf("a shown unavailable line read through an alias doesn't count")
+	}
+	readable := text(phoneChat, "3EB0U0004", base, "invented now readable")
+	readable.Hidden = &shown
+	put(t, s, readable)
+	if s.HoldsUnreadable(net, phoneChat) {
+		t.Fatalf("a line taken over still counts")
+	}
+	put(t, s, placeholder("3EB0U0005", "undecryptable", false, &shown))
+	if _, err := s.SettlePlaceholder(net, phoneChat, "3EB0U0005"); err != nil {
+		t.Fatal(err)
+	}
+	if s.HoldsUnreadable(net, phoneChat) || s.HoldsUnreadable(net, otherChat) {
+		t.Fatalf("a settled line, or another chat, counts")
+	}
+}

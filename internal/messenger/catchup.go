@@ -15,8 +15,14 @@ import (
 // the newest page of its chat's backup, which his phone keeps, and takes
 // its undecryptable or unavailable line over by its ID.
 //
-//   - fillDelay after such a line, its chat's newest page is read, once
-//     for every such line in that wait (a re-send may have landed first);
+//   - fillDelay after such a line from someone, its chat's newest page is
+//     read, once for every such line in that wait (a re-send may have
+//     landed first);
+//   - refillDelay after it, the newest page is read again (his phone may
+//     not have backed the message up by fillDelay), once for every such
+//     line in that wait, counted apart from fillDelay's, and only while the
+//     chat still shows a line from someone that couldn't be read (one taken
+//     over or settled asks nothing);
 //   - once a day, after the first restore's read, the newest page of each
 //     encrypted chat active in the last catchUpWithin, at most catchUpChats
 //     of them, newest first ("ecatchup" holds when it last ran);
@@ -25,46 +31,59 @@ import (
 //     held chat, a paused backup or an ended session asks nothing.
 const (
 	fillDelay     = 2 * time.Minute
+	refillDelay   = time.Hour
 	catchUpWithin = 3 * 24 * time.Hour
 	catchUpChats  = 30
 )
 
 // fillLater reads chat's newest page of the backup fillDelay from now,
-// unless that is already due.
+// unless that is already due, and again refillDelay from now, unless that
+// is already due, if the chat still shows a line that couldn't be read.
 func (m *Messenger) fillLater(chat string) {
+	m.fillAfter(chat, fillDelay, &m.filling, false)
+	m.fillAfter(chat, refillDelay, &m.refilling, true)
+}
+
+// fillAfter reads chat's newest page of the backup d from now, unless due
+// (filling or refilling, under m.fillmu) already marks one for it; with
+// unreadOnly, only if the chat then still shows a line that couldn't be
+// read.
+func (m *Messenger) fillAfter(chat string, d time.Duration, due *map[string]bool, unreadOnly bool) {
 	m.fillmu.Lock()
-	if m.filling == nil {
-		m.filling = map[string]bool{}
+	if *due == nil {
+		*due = map[string]bool{}
 	}
-	if m.filling[chat] {
+	if (*due)[chat] {
 		m.fillmu.Unlock()
 		return
 	}
-	m.filling[chat] = true
+	(*due)[chat] = true
 	m.fillmu.Unlock()
-	m.afterFunc(fillDelay, func() {
+	done := func() {
+		m.fillmu.Lock()
+		delete(*due, chat)
+		m.fillmu.Unlock()
+	}
+	m.afterFunc(d, func() {
 		m.mu.Lock()
 		gen, cli, runCtx, fbid := m.gen, m.cli, m.runCtx, m.fbid
 		if m.stopped || cli == nil || runCtx == nil {
 			m.mu.Unlock()
-			m.doneFilling(chat)
+			done()
 			return
 		}
 		m.work.Add(1)
 		m.mu.Unlock()
 		go func() {
 			defer m.work.Done()
-			defer m.doneFilling(chat)
+			defer done()
 			defer func() { _ = recover() }()
+			if unreadOnly && !m.st.HoldsUnreadable(Name, chat) {
+				return // taken over or settled since: no page wasted
+			}
 			_, _, _ = m.fetchEncNewest(runCtx, gen, cli, fbid, chat)
 		}()
 	})
-}
-
-func (m *Messenger) doneFilling(chat string) {
-	m.fillmu.Lock()
-	delete(m.filling, chat)
-	m.fillmu.Unlock()
 }
 
 // catchUp reads the newest page of each encrypted chat active lately, once

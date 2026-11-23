@@ -261,3 +261,160 @@ func TestAReadableLineIsNeverSettled(t *testing.T) {
 		t.Errorf("the chat's newest is %q, want the real line", c.LastMessageID)
 	}
 }
+
+// pagesAsked is how many pages of Alice's backup have been asked.
+func pagesAsked(h *harness) int {
+	return len(h.f.history.asked(fmt.Sprint(aliceFBID)))
+}
+
+// advanceTo moves the clock on to at (never back) and waits for what that
+// asks to end.
+func advanceTo(h *harness, at time.Time) {
+	if d := at.Sub(h.f.clock.Now()); d > 0 {
+		h.f.clock.Advance(d)
+	}
+	h.settle()
+	time.Sleep(100 * time.Millisecond)
+	h.settle()
+}
+
+// filledAt waits for the chat's newest page due now to be read.
+func filledAt(t *testing.T, h *harness, chat string, want int) {
+	t.Helper()
+	eventually(t, "the chat's newest page to be read", func() bool {
+		return pagesAsked(h) >= want && !h.fillingNow(chat)
+	})
+	h.settle()
+}
+
+// refillingNow reports whether chat's hour-later page is due or being read.
+func (h *harness) refillingNow(chat string) bool {
+	h.m.fillmu.Lock()
+	defer h.m.fillmu.Unlock()
+	return h.m.refilling[chat]
+}
+
+// A message his phone hadn't backed up by the two minutes is read again an
+// hour after it came: one more newest page, which takes its line over.
+func TestAMessageStillUnreadableAnHourOnIsReadAgain(t *testing.T) {
+	h := newHarness(t)
+	h.m.gate = false
+	alice := fmt.Sprint(aliceFBID) + "@msgr"
+	restored(t, h)
+	at := h.f.clock.Now()
+	h.f.history.script(fmt.Sprint(aliceFBID),
+		fakePage{more: true, before: at.Add(-time.Hour).UnixMilli()},
+		fakePage{more: true, before: at.Add(-time.Hour).UnixMilli(),
+			msgs: []*securehistory.DecryptedMessage{archived("WAINVENTED86", aliceFBID, at, textContent(canary+" backed up late"))}})
+	asked := pagesAsked(h)
+
+	unreadable(t, h, aliceFBID, "WAINVENTED86", at, false)
+	h.f.clock.Advance(fillDelay)
+	filledAt(t, h, alice, asked+1)
+	if l, _ := h.line(t, alice, "WAINVENTED86"); l.Kind != "undecryptable" {
+		t.Fatalf("after the two minutes' page the line reads %+v, want it still unreadable", l)
+	}
+	advanceTo(h, at.Add(refillDelay-time.Minute))
+	if n := pagesAsked(h) - asked; n != 1 {
+		t.Fatalf("%d pages were asked before the hour, want the two minutes' one alone", n)
+	}
+	h.f.clock.Advance(at.Add(refillDelay).Sub(h.f.clock.Now()))
+	waitLine(t, h, alice, "WAINVENTED86", canary+" backed up late")
+	advanceTo(h, at.Add(3*refillDelay))
+	if n := pagesAsked(h) - asked; n != 2 {
+		t.Errorf("%d pages were asked in all, want two: at two minutes and at the hour", n)
+	}
+}
+
+// A message the two minutes' page took over, or a reaction it settled,
+// asks nothing at the hour.
+func TestALineSettledBeforeTheHourAsksNothingThen(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		id   string
+		page func(at time.Time) []*securehistory.DecryptedMessage
+	}{
+		{"taken over", "WAINVENTED87", func(at time.Time) []*securehistory.DecryptedMessage {
+			return []*securehistory.DecryptedMessage{archived("WAINVENTED87", aliceFBID, at, textContent(canary+" in time"))}
+		}},
+		{"settled", "WAINVENTED88-react", func(at time.Time) []*securehistory.DecryptedMessage {
+			react := backup("WAINVENTED88-react", aliceFBID, at, reactionContent("WAINVENTED88", "❤"))
+			return []*securehistory.DecryptedMessage{archived("WAINVENTED88", selfFBID, at.Add(-time.Minute), textContent(canary+" mine"), react)}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t)
+			h.m.gate = false
+			alice := fmt.Sprint(aliceFBID) + "@msgr"
+			restored(t, h)
+			at := h.f.clock.Now()
+			h.f.history.script(fmt.Sprint(aliceFBID), fakePage{more: true, before: at.Add(-time.Hour).UnixMilli(), msgs: tc.page(at)})
+			asked := pagesAsked(h)
+
+			unreadable(t, h, aliceFBID, tc.id, at, false)
+			h.f.clock.Advance(fillDelay)
+			filledAt(t, h, alice, asked+1)
+			if l, _ := h.line(t, alice, tc.id); l.Kind == "undecryptable" && (l.Hidden == nil || !*l.Hidden) {
+				t.Fatalf("after the two minutes' page the line reads %+v, want it settled or taken over", l)
+			}
+			advanceTo(h, at.Add(2*refillDelay))
+			if n := pagesAsked(h) - asked; n != 1 {
+				t.Errorf("%d pages were asked, want the two minutes' one alone", n)
+			}
+		})
+	}
+}
+
+// Two unreadable messages in one chat within the hour read the backup once
+// at the hour (besides each one's two minutes).
+func TestUnreadableMessagesWithinTheHourReadAgainOnce(t *testing.T) {
+	h := newHarness(t)
+	h.m.gate = false
+	alice := fmt.Sprint(aliceFBID) + "@msgr"
+	restored(t, h)
+	at := h.f.clock.Now()
+	h.f.history.script(fmt.Sprint(aliceFBID), fakePage{more: true, before: at.Add(-time.Hour).UnixMilli()})
+	asked := pagesAsked(h)
+
+	unreadable(t, h, aliceFBID, "WAINVENTED89", at, false)
+	h.f.clock.Advance(fillDelay)
+	filledAt(t, h, alice, asked+1)
+	advanceTo(h, at.Add(30*time.Minute))
+	unreadable(t, h, aliceFBID, "WAINVENTED89-b", h.f.clock.Now(), true)
+	advanceTo(h, at.Add(30*time.Minute+fillDelay))
+	if n := pagesAsked(h) - asked; n != 2 {
+		t.Fatalf("%d pages were asked by the second's two minutes, want 2", n)
+	}
+	advanceTo(h, at.Add(refillDelay))
+	if n := pagesAsked(h) - asked; n != 3 {
+		t.Fatalf("%d pages were asked by the hour, want 3", n)
+	}
+	advanceTo(h, at.Add(3*refillDelay))
+	if n := pagesAsked(h) - asked; n != 3 {
+		t.Errorf("%d pages were asked in all, want the chat read once at the hour", n)
+	}
+}
+
+// A stopped network asks nothing at the hour.
+func TestAStoppedNetworkAsksNothingAtTheHour(t *testing.T) {
+	h := newHarness(t)
+	h.m.gate = false
+	alice := fmt.Sprint(aliceFBID) + "@msgr"
+	restored(t, h)
+	at := h.f.clock.Now()
+	h.f.history.script(fmt.Sprint(aliceFBID), fakePage{more: true, before: at.Add(-time.Hour).UnixMilli()})
+	asked := pagesAsked(h)
+
+	unreadable(t, h, aliceFBID, "WAINVENTED95", at, false)
+	h.f.clock.Advance(fillDelay)
+	filledAt(t, h, alice, asked+1)
+	h.m.Stop()
+	h.f.clock.Advance(2 * refillDelay)
+	time.Sleep(200 * time.Millisecond)
+	if n := pagesAsked(h) - asked; n != 1 {
+		t.Errorf("%d pages were asked, want the two minutes' one alone", n)
+	}
+	if h.refillingNow(alice) {
+		t.Errorf("the chat's hour-later page is still marked due")
+	}
+}

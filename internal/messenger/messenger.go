@@ -215,7 +215,11 @@ type Messenger struct {
 	checked  atomic.Bool     // this run's self-check has run (diag.go)
 	fillmu   sync.Mutex      // filling
 	filling  map[string]bool // chats whose newest backup page is due (catchup.go)
-	odmu     sync.Mutex      // the day's pages of the backup asked on demand
+	// refilling: chats whose newest backup page is due again an hour on
+	// (catchup.go). Both are in memory only: a restart forgets them, and
+	// the daily catch-up still reads the chat.
+	refilling map[string]bool
+	odmu      sync.Mutex // the day's pages of the backup asked on demand
 
 	// what the gate counts (gate.go)
 	cmu                   sync.Mutex

@@ -237,3 +237,22 @@ func (s *Store) SettlePlaceholder(network, chatID, msgID string) (settled bool, 
 	}
 	return settled, nil
 }
+
+// HoldsUnreadable reports whether a chat (or the chat an alias names) still
+// shows a line from someone that stands in for a message that couldn't be
+// read (kind undecryptable or unavailable): not taken over by the message,
+// not settled, not deleted.
+func (s *Store) HoldsUnreadable(network, chatID string) bool {
+	if s.ready() != nil || chatID == "" {
+		return false
+	}
+	chat, err := resolve(s.db, network, chatID)
+	if err != nil {
+		return false
+	}
+	var one int
+	err = s.db.QueryRow(`SELECT 1 FROM messages
+			WHERE network = ? AND chat_id = ? AND from_me = 0 AND early = 0 AND hidden = 0 AND deleted = 0
+			AND kind IN ('undecryptable', 'unavailable') LIMIT 1`, network, chat).Scan(&one)
+	return err == nil
+}
