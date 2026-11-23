@@ -23,8 +23,10 @@ import (
 // What the network keeps for itself lives in the store's meta table, under
 // "linkedin.<name>": "self" (his profile ID, set at the first sign-in and
 // compared at every later one), "syncToken" (LinkedIn's conversations sync
-// token), "listed" and "listCursor" (the first sign-in's listing of the inbox,
-// done or where it got to), "cursor.<chat>" (where that chat's history goes
+// token), "listed", "listedFolders" and "listCursor" (the listing of the
+// folders, INBOX then ARCHIVE: done, done over both folders (listedFolders,
+// "2"; an account listed before it lists them once more), or where it got
+// to, as "<folder>:<cursor>"), "cursor.<chat>" (where that chat's history goes
 // on), "histDone.<chat>" (its history reached 730 days), "fresh.<chat>"
 // (what came in it is still to fetch), "pause" (the back-off) and "block"
 // (the session LinkedIn ended, by its hash). His Disconnect forgets all but
@@ -97,7 +99,7 @@ func conversationOwner(chatID string) string {
 
 // accountValues are the stored values that belong to the account signed in,
 // besides the per-chat ones (chatValues).
-var accountValues = []string{"self", "syncToken", "listed", "listCursor", "block"}
+var accountValues = []string{"self", "syncToken", "listed", "listedFolders", "listCursor", "block"}
 
 // chatValues prefix the per-chat stored values: a chat's fresh mark, where
 // its history goes on, and its history being done.

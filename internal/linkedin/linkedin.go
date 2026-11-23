@@ -59,12 +59,12 @@ var (
 // reaction, a mark and his sign-out). *linkedingo.Client satisfies it; tests
 // use a fake. GetConversationsUpdatedBefore is allowed but never used: LinkedIn
 // ignores its lastUpdatedBefore (mautrix/linkedin#56), so conversations are
-// listed by GetConversationsWithNextCursor, Pllum's patch.
+// listed, a folder at a time, by GetConversationsWithNextCursor, Pllum's patch.
 type liClient interface {
 	GetCurrentUserProfile(ctx context.Context) (*linkedingo.UserProfile, error)
 	GetConversationsBySyncToken(ctx context.Context) (*linkedingo.CollectionResponse[linkedingo.ConversationSyncMetadata, linkedingo.Conversation], error)
 	GetConversationsUpdatedBefore(ctx context.Context, updatedBefore time.Time) (*linkedingo.CollectionResponse[linkedingo.ConversationCursorMetadata, linkedingo.Conversation], error)
-	GetConversationsWithNextCursor(ctx context.Context, cursor string) (*linkedingo.CollectionResponse[linkedingo.ConversationCursorMetadata, linkedingo.Conversation], error)
+	GetConversationsWithNextCursor(ctx context.Context, category, cursor string) (*linkedingo.CollectionResponse[linkedingo.ConversationCursorMetadata, linkedingo.Conversation], error)
 	GetMessagesBefore(ctx context.Context, conversationURN linkedingo.URN, before time.Time, count int) (*linkedingo.CollectionResponse[linkedingo.MessageMetadata, linkedingo.Message], error)
 	GetMessagesWithPrevCursor(ctx context.Context, conversationURN linkedingo.URN, prevCursor string, count int) (*linkedingo.CollectionResponse[linkedingo.MessageMetadata, linkedingo.Message], error)
 	DownloadHTTP(ctx context.Context, url string) (*http.Response, error)

@@ -144,6 +144,8 @@ type call struct {
 	name string
 	at   time.Time
 	arg  string
+	// cat is the folder a GetConversationsWithNextCursor call asked for.
+	cat string
 }
 
 // fakeLinkedIn stands in for LinkedIn, scripted by each test.
@@ -164,8 +166,13 @@ type fakeLinkedIn struct {
 	// holds); newToken is the token the handler is given after it.
 	syncPage func(token string) *linkedingo.CollectionResponse[linkedingo.ConversationSyncMetadata, linkedingo.Conversation]
 	newToken string
-	// cursorPage answers GetConversationsWithNextCursor.
-	cursorPage func(cursor string) *linkedingo.CollectionResponse[linkedingo.ConversationCursorMetadata, linkedingo.Conversation]
+	// cursorPage answers GetConversationsWithNextCursor for the INBOX
+	// folder, and archivePage for ARCHIVE; a folder with no answer set is
+	// empty. foldersErr fails a folder's calls (by its name), and
+	// foldersErrAfter fails them from the nth call of that folder on.
+	cursorPage  func(cursor string) *linkedingo.CollectionResponse[linkedingo.ConversationCursorMetadata, linkedingo.Conversation]
+	archivePage func(cursor string) *linkedingo.CollectionResponse[linkedingo.ConversationCursorMetadata, linkedingo.Conversation]
+	foldersErr  map[string]error
 	// before answers GetMessagesBefore; prev answers GetMessagesWithPrevCursor.
 	before func(conv string, before time.Time, count int) *linkedingo.CollectionResponse[linkedingo.MessageMetadata, linkedingo.Message]
 	prev   func(conv, cursor string, count int) *linkedingo.CollectionResponse[linkedingo.MessageMetadata, linkedingo.Message]
@@ -266,9 +273,17 @@ func (f *fakeLinkedIn) failOnce(name string, err error) {
 
 // record notes a call and gives the error set for it, if any.
 func (f *fakeLinkedIn) record(c *fakeClient, name, arg string) error {
+	return f.recordIn(c, name, arg, "")
+}
+
+// recordIn is record for a call that names a folder.
+func (f *fakeLinkedIn) recordIn(c *fakeClient, name, arg, cat string) error {
 	f.mu.Lock()
-	f.calls = append(f.calls, call{name: name, at: f.clock.Now(), arg: arg})
+	f.calls = append(f.calls, call{name: name, at: f.clock.Now(), arg: arg, cat: cat})
 	err := f.errs[name]
+	if e, ok := f.foldersErr[cat]; ok && cat != "" {
+		err = e
+	}
 	if e, ok := f.errsOnce[name]; ok {
 		err = e
 		delete(f.errsOnce, name)
@@ -311,6 +326,27 @@ func (f *fakeLinkedIn) count(name string) int {
 		}
 	}
 	return n
+}
+
+// countIn is the number of listing requests made for a folder.
+func (f *fakeLinkedIn) countIn(cat string) int {
+	n := 0
+	for _, c := range f.callsNow() {
+		if c.name == "GetConversationsWithNextCursor" && c.cat == cat {
+			n++
+		}
+	}
+	return n
+}
+
+// setFolderErr fails every listing request of a folder with err.
+func (f *fakeLinkedIn) setFolderErr(cat string, err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.foldersErr == nil {
+		f.foldersErr = map[string]error{}
+	}
+	f.foldersErr[cat] = err
 }
 
 func (f *fakeLinkedIn) namesSince(i int) []string {
@@ -391,14 +427,20 @@ func (c *fakeClient) GetConversationsUpdatedBefore(ctx context.Context, updatedB
 	return nil, fmt.Errorf("LinkedIn ignores lastUpdatedBefore: never call it")
 }
 
-func (c *fakeClient) GetConversationsWithNextCursor(ctx context.Context, cursor string) (*linkedingo.CollectionResponse[linkedingo.ConversationCursorMetadata, linkedingo.Conversation], error) {
+func (c *fakeClient) GetConversationsWithNextCursor(ctx context.Context, category, cursor string) (*linkedingo.CollectionResponse[linkedingo.ConversationCursorMetadata, linkedingo.Conversation], error) {
 	c.f.enter()
 	defer c.f.leave()
-	if err := c.f.record(c, "GetConversationsWithNextCursor", cursor); err != nil {
+	if err := c.f.recordIn(c, "GetConversationsWithNextCursor", cursor, category); err != nil {
 		return nil, err
 	}
 	c.f.mu.Lock()
-	page := c.f.cursorPage
+	var page func(string) *linkedingo.CollectionResponse[linkedingo.ConversationCursorMetadata, linkedingo.Conversation]
+	switch category {
+	case "INBOX":
+		page = c.f.cursorPage
+	case "ARCHIVE":
+		page = c.f.archivePage
+	}
 	c.f.mu.Unlock()
 	if page == nil {
 		return &linkedingo.CollectionResponse[linkedingo.ConversationCursorMetadata, linkedingo.Conversation]{}, nil
@@ -661,6 +703,7 @@ func (r *rig) live() *fakeClient {
 		r.keep("syncToken", "sync-token-invented-0")
 	}
 	r.keep("listed", "1")
+	r.keep("listedFolders", "2")
 	if err := r.login(validSession()); err != nil {
 		r.t.Fatalf("Login: %v", err)
 	}

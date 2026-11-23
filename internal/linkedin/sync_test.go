@@ -38,6 +38,7 @@ func TestCatchUpFollowsTheSyncTokenThenGoesLive(t *testing.T) {
 	r.keep("self", selfID)
 	r.keep("syncToken", "sync-token-invented-7")
 	r.keep("listed", "1")
+	r.keep("listedFolders", "2")
 	r.f.syncPage = func(token string) *linkedingo.CollectionResponse[linkedingo.ConversationSyncMetadata, linkedingo.Conversation] {
 		return syncPageOf([]linkedingo.Conversation{conv(1, start.Add(-time.Minute))})
 	}
@@ -145,7 +146,7 @@ func TestAFirstConnectListsByCursorBackAYear(t *testing.T) {
 	}
 	r.waitState(network.Live, "")
 	r.idle()
-	if n := r.f.count("GetConversationsWithNextCursor"); n != 37 {
+	if n := r.f.countIn("INBOX"); n != 37 {
 		t.Errorf("%d cursor pages, want 37 (until a page's oldest is over 365 days)", n)
 	}
 	if r.f.count("GetConversationsUpdatedBefore") != 0 {
@@ -185,7 +186,7 @@ func TestAFirstConnectStopsAtFortyPages(t *testing.T) {
 	}
 	r.waitState(network.Live, "")
 	r.idle()
-	if n := r.f.count("GetConversationsWithNextCursor"); n != 40 {
+	if n := r.f.countIn("INBOX"); n != 40 {
 		t.Errorf("%d cursor pages, want at most 40", n)
 	}
 }
@@ -217,7 +218,7 @@ func TestANewRealtimeSessionPagesBackToTheNewestStored(t *testing.T) {
 	n := len(r.f.callsNow())
 	c.dispatch(&linkedingo.ClientConnection{SessID: [16]byte{1, 2, 3}})
 	r.idle()
-	if got := r.f.count("GetConversationsWithNextCursor"); got != 2 {
+	if got := r.f.countIn("INBOX"); got != 2 {
 		t.Errorf("%d cursor pages, want 2", got)
 	}
 	for _, n := range []int{2, 3, 4} {
@@ -367,6 +368,7 @@ func TestHistoryStopsAt730DaysAndResumesAfterARestart(t *testing.T) {
 	r.keep("self", selfID)
 	r.keep("syncToken", "sync-token-invented-0")
 	r.keep("listed", "1")
+	r.keep("listedFolders", "2")
 	if err := r.login(validSession()); err != nil {
 		t.Fatal(err)
 	}
@@ -428,6 +430,7 @@ func TestATokenLinkedInWontTakeIsDroppedAndTheRunGoesOn(t *testing.T) {
 	r.keep("self", selfID)
 	r.keep("syncToken", "sync-token-invented-stale")
 	r.keep("listed", "1")
+	r.keep("listedFolders", "2")
 	r.f.failOnce("GetConversationsBySyncToken", statusErr(400))
 	if err := r.login(validSession()); err != nil {
 		t.Fatal(err)
@@ -547,7 +550,7 @@ func TestAFirstConnectGoesLiveBeforeFetchingMessages(t *testing.T) {
 		want = append(want, urnString(c.EntityURN))
 	}
 	fetchesInOrder(t, r, 0, want)
-	if got := r.f.count("GetConversationsWithNextCursor"); got != 2 {
+	if got := r.f.countIn("INBOX"); got != 2 {
 		t.Errorf("%d listing pages, want 2", got)
 	}
 }
@@ -710,6 +713,7 @@ func TestAPassingErrorKeepsTheSyncToken(t *testing.T) {
 			r.keep("self", selfID)
 			r.keep("syncToken", "sync-token-invented-7")
 			r.keep("listed", "1")
+			r.keep("listedFolders", "2")
 			r.f.failOnce("GetConversationsBySyncToken", perr)
 			if err := r.login(validSession()); err != nil {
 				t.Fatal(err)

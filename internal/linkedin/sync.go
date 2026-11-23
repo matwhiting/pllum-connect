@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"slices"
+	"strings"
 	"time"
 
 	"go.mau.fi/mautrix-linkedin/pkg/linkedingo"
@@ -31,7 +32,16 @@ const (
 	// 5xx, an answer the helper can't read, a timeout) waits before it is
 	// asked again, unless something wakes it sooner.
 	passingWait = 3 * time.Minute
+	// listedFoldersNow marks (as "listedFolders") that an account's inbox
+	// has been listed over listFolders. An account listed before that (its
+	// first listing was of the primary inbox alone) lists them once more.
+	listedFoldersNow = "2"
 )
+
+// listFolders are the LinkedIn folders (the category of the by-category
+// query) the listing pages in turn, each by cursor with the same stop rules:
+// INBOX (a superset of PRIMARY_INBOX), then ARCHIVE. Spam stays out.
+var listFolders = []string{"INBOX", "ARCHIVE"}
 
 // The background work a run does between catch-ups and history.
 type job int
@@ -164,7 +174,8 @@ func (l *LinkedIn) signal() {
 
 // catchUp is a run's catch-up before the stream: by the sync token kept in
 // the store (syncByToken). The first sign-in has none: the sync token's
-// newest chats (and a token), then the inbox listed by cursor back a year.
+// newest chats (and a token), then the folders listed by cursor back a year
+// (listBack); an account listed before the folders existed lists them once.
 //
 // A passing answer (a 5xx, one the helper can't read) keeps the token: the
 // run goes on, and the catch-up is asked again later. No connection or a
@@ -176,10 +187,19 @@ func (l *LinkedIn) catchUp(ctx context.Context, gen int, cli liClient) error {
 		}
 		l.later(gen, jobSync)
 	}
-	if l.value("listed") == "" {
+	if l.listingOwed() {
 		return l.listBack(ctx, gen, cli, true)
 	}
 	return nil
+}
+
+// listingOwed reports whether the run still owes the full listing: the first
+// sign-in's, or the one-off re-list of an account listed before the folders
+// (listedFolders) existed. Either is a listing of every folder back a year,
+// chats first (the messages come behind, from the background work), and
+// sets both marks.
+func (l *LinkedIn) listingOwed() bool {
+	return l.value("listed") == "" || l.value("listedFolders") != listedFoldersNow
 }
 
 // syncByToken is a catch-up by the sync token. A token LinkedIn won't take
@@ -205,7 +225,8 @@ func (l *LinkedIn) syncByToken(ctx context.Context, gen int, cli liClient) error
 		l.tokenDropped = true
 	}
 	l.mu.Unlock()
-	if l.value("listed") == "" {
+	if l.listingOwed() {
+		// The full listing is still to come in this run, and covers it.
 		return nil
 	}
 	return l.listBack(ctx, gen, cli, false)
@@ -309,33 +330,71 @@ func (l *LinkedIn) catchUpByToken(ctx context.Context, gen int, cli liClient) er
 	return nil
 }
 
-// listBack lists the inbox by cursor, newest activity first: on a first
-// sign-in (first) until a page's oldest activity is over a year old, resuming
-// where an interrupted listing got to; otherwise back to the newest activity
-// the store held before it began. At most listPages pages either way.
+// listBack lists the folders (listFolders) by cursor, newest activity first,
+// each in turn: on a full listing (first: a first sign-in, or the one-off
+// re-list) until a page's oldest activity is over a year old, resuming where
+// an interrupted listing got to; otherwise back to the newest activity the
+// store held before it began (taken once, before any folder is stored). At
+// most listPages pages a folder either way. A folder LinkedIn refuses (a
+// settled answer: a 400, no GraphQL data) is skipped and the others go on; a
+// pause or a passing failure stops the listing, which resumes later.
 func (l *LinkedIn) listBack(ctx context.Context, gen int, cli liClient, first bool) error {
 	stopAt := l.clock.Now().Add(-firstListing)
-	cursor := ""
+	folder, cursor := 0, ""
 	if first {
-		cursor = l.value("listCursor")
+		folder, cursor = l.listResume()
 	} else if newest, ok := l.newestStored(); ok {
 		stopAt = newest
 	}
+	for ; folder < len(listFolders); folder++ {
+		if err := l.listFolder(ctx, gen, cli, listFolders[folder], cursor, first, stopAt); err != nil {
+			return err
+		}
+		cursor = ""
+		if first && folder+1 < len(listFolders) {
+			_ = l.keep("listCursor", listFolders[folder+1]+":")
+		}
+	}
+	if first {
+		_ = l.keep("listed", "1")
+		_ = l.keep("listedFolders", listedFoldersNow)
+		_ = l.keep("listCursor", "")
+	}
+	return nil
+}
+
+// listResume is where an interrupted full listing goes on: the folder's index
+// in listFolders and its cursor ("<folder>:<cursor>" is kept as listCursor).
+// A cursor no folder claims (one an earlier version kept for the primary
+// inbox) starts afresh.
+func (l *LinkedIn) listResume() (folder int, cursor string) {
+	name, cursor, ok := strings.Cut(l.value("listCursor"), ":")
+	if i := slices.Index(listFolders, name); ok && i >= 0 {
+		return i, cursor
+	}
+	return 0, ""
+}
+
+// listFolder lists one folder by cursor from cursor, storing what it finds,
+// until its stop rule (see listBack). A refused folder ends quietly; any
+// other failure is returned.
+func (l *LinkedIn) listFolder(ctx context.Context, gen int, cli liClient, folder, cursor string, first bool, stopAt time.Time) error {
 	for range listPages {
 		var page *linkedingo.CollectionResponse[linkedingo.ConversationCursorMetadata, linkedingo.Conversation]
 		err := l.request(ctx, gen, true, func(ctx context.Context) (err error) {
-			page, err = cli.GetConversationsWithNextCursor(ctx, cursor)
+			page, err = cli.GetConversationsWithNextCursor(ctx, folder, cursor)
 			return err
 		})
 		if settled(err) {
-			// LinkedIn lists nothing further: the listing ends here.
-			break
+			// LinkedIn lists nothing further of this folder: it ends here,
+			// and the other folders go on.
+			return nil
 		}
 		if err != nil {
 			return err
 		}
 		if page == nil {
-			break
+			return nil
 		}
 		var oldest time.Time
 		for _, c := range page.Elements {
@@ -351,19 +410,15 @@ func (l *LinkedIn) listBack(ctx context.Context, gen int, cli liClient, first bo
 		l.storeConversations(page.Elements)
 		next := page.Metadata.NextCursor
 		if first {
-			_ = l.keep("listCursor", next)
+			_ = l.keep("listCursor", folder+":"+next)
 		}
 		if len(page.Elements) == 0 || next == "" {
-			break
+			return nil
 		}
 		if !oldest.IsZero() && (first && oldest.Before(stopAt) || !first && !oldest.After(stopAt)) {
-			break
+			return nil
 		}
 		cursor = next
-	}
-	if first {
-		_ = l.keep("listed", "1")
-		_ = l.keep("listCursor", "")
 	}
 	return nil
 }

@@ -356,7 +356,7 @@ func otherConv(n int, at time.Time) linkedingo.Conversation {
 // keptAccountValues are the stored values that belong to the account signed in.
 func keptAccountValues(r *rig) map[string]string {
 	out := map[string]string{}
-	for _, name := range []string{"self", "syncToken", "listed", "listCursor", "block",
+	for _, name := range []string{"self", "syncToken", "listed", "listedFolders", "listCursor", "block",
 		"fresh." + convURN(1), "cursor." + convURN(1), "histDone." + convURN(1)} {
 		if v := r.value(name); v != "" {
 			out[name] = v

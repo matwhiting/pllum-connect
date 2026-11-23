@@ -1,8 +1,9 @@
 // mautrix-linkedin - A Matrix-LinkedIn puppeting bridge.
 // Copyright (C) 2025 Sumner Evans
 //
-// Modified by Pllum Connect on 2026-11-19: GetConversationsWithNextCursor
-// added (see PLLUM-CHANGES.md at the root of this copy).
+// Modified by Pllum Connect on 2026-11-19 and 2026-11-23:
+// GetConversationsWithNextCursor added, taking the folder (category) to list
+// (see PLLUM-CHANGES.md at the root of this copy).
 //
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU Affero General Public License as published by
@@ -191,20 +192,33 @@ func (c *Client) GetConversationsUpdatedBefore(ctx context.Context, updatedBefor
 // 2026-11-19 (the ID of mautrix/linkedin PR #122). Pllum Connect addition.
 const graphQLQueryIDMessengerConversationsWithNextCursor = "messengerConversations.9501074288a12f3ae9e3c7ea243bccbf"
 
-// GetConversationsWithNextCursor is one page of 20 conversations of the
-// primary inbox, newest activity first: the first page with an empty cursor,
-// and after it the page the previous one's Metadata.NextCursor names. LinkedIn
+// conversationCategoryQuery is the by-category query's predicate for one
+// folder (category) of LinkedIn's messaging, such as PRIMARY_INBOX, INBOX or
+// ARCHIVE. Pllum Connect addition.
+func conversationCategoryQuery(category string) string {
+	return "(predicateUnions:List((conversationCategoryPredicate:(category:" + category + "))))"
+}
+
+// GetConversationsWithNextCursor is one page of 20 conversations of a folder
+// (category: PRIMARY_INBOX, INBOX, ARCHIVE, ...), newest activity first: the
+// first page with an empty cursor, and after it the page the previous one's
+// Metadata.NextCursor names. A cursor belongs to the category it came from.
+// An empty category is PRIMARY_INBOX, which the first version of this method
+// listed alone. LinkedIn
 // ignores GetConversationsUpdatedBefore's lastUpdatedBefore (it answers the
 // newest 20 every time; mautrix/linkedin#56), but pages by the cursor it
 // gives. Pllum Connect addition.
-func (c *Client) GetConversationsWithNextCursor(ctx context.Context, cursor string) (*CollectionResponse[ConversationCursorMetadata, Conversation], error) {
+func (c *Client) GetConversationsWithNextCursor(ctx context.Context, category, cursor string) (*CollectionResponse[ConversationCursorMetadata, Conversation], error) {
 	if c == nil {
 		return nil, ErrClientIsNil
+	}
+	if category == "" {
+		category = "PRIMARY_INBOX"
 	}
 	variables := map[string]string{
 		"mailboxUrn": url.QueryEscape(c.userEntityURN.WithPrefix("urn", "li", "fsd_profile").String()),
 		"count":      "20",
-		"query":      "(predicateUnions:List((conversationCategoryPredicate:(category:PRIMARY_INBOX))))",
+		"query":      conversationCategoryQuery(category),
 	}
 	if cursor != "" {
 		variables["nextCursor"] = url.QueryEscape(cursor)

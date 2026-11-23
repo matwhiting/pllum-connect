@@ -10,10 +10,10 @@ every file changed here says so at its top.
 
 Every change, and nothing else:
 
-## 1. Conversations paged by their cursor (2026-11-19)
+## 1. Conversations paged by their cursor, by folder (2026-11-19, 2026-11-23)
 
 - `pkg/linkedingo/conversations.go` gains
-  `func (c *Client) GetConversationsWithNextCursor(ctx context.Context, cursor string) (*CollectionResponse[ConversationCursorMetadata, Conversation], error)`
+  `func (c *Client) GetConversationsWithNextCursor(ctx context.Context, category, cursor string) (*CollectionResponse[ConversationCursorMetadata, Conversation], error)`
   and the query ID it uses,
   `graphQLQueryIDMessengerConversationsWithNextCursor`
   (`messengerConversations.9501074288a12f3ae9e3c7ea243bccbf`, the ID of
@@ -25,8 +25,16 @@ Every change, and nothing else:
   `metadata.nextCursor`, sent back URL-escaped as the GraphQL variable
   `nextCursor`, with this query ID: 15 pages, 300 distinct conversations.
   An empty cursor asks for the first page.
+- The folder (2026-11-23): `category` goes into the query's predicate,
+  `(predicateUnions:List((conversationCategoryPredicate:(category:<category>))))`,
+  built by `conversationCategoryQuery`; an empty `category` is
+  `PRIMARY_INBOX`, which the first version of the method asked alone. Pllum
+  Connect lists `INBOX` and `ARCHIVE` with it (conversations LinkedIn returns
+  carry `categories` such as `INBOX`, `PRIMARY_INBOX`, `SECONDARY_INBOX`,
+  `INMAIL`, `SPAM`). A cursor belongs to the category it came from.
 - Test: `pkg/linkedingo/conversations_pllum_test.go` (a fake round-tripper;
-  no request leaves the machine).
+  no request leaves the machine), including that the category variable goes
+  into the predicate.
 - Drop it when the library pages conversations itself.
 
 ## 2. A send is tried once (2026-11-19)

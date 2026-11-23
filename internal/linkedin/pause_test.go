@@ -139,6 +139,7 @@ func TestA999IsAPauseToo(t *testing.T) {
 	r.keep("self", selfID)
 	r.keep("syncToken", "sync-token-invented-0")
 	r.keep("listed", "1")
+	r.keep("listedFolders", "2")
 	r.f.setErr("GetCurrentUserProfile", statusErr(999))
 	if err := r.login(validSession()); err != nil {
 		t.Fatalf("Login: %v", err)
