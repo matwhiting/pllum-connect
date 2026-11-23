@@ -317,6 +317,65 @@ func TestUndecryptableIsAShownLineAndCounted(t *testing.T) {
 	}
 }
 
+// A reaction, an edit or an unsend that couldn't be read, sent again and
+// read, changes the line it names; the "couldn't read" line under its own
+// ID is settled: kept hidden, no longer the chat's newest or unread. An
+// "unavailable" one is settled the same way, and settling again changes
+// nothing.
+func TestAnUnreadableReactionEditOrUnsendSentAgainIsSettled(t *testing.T) {
+	h := newHarness(t)
+	h.signIn(t)
+	alice := fmt.Sprint(aliceFBID) + "@msgr"
+	t0 := time.Date(2026, 3, 5, 8, 0, 0, 0, time.UTC)
+	before := h.chat(t, alice).Unread
+
+	// a reaction to his line
+	h.deliver(t, fbMessage(oneToOne(aliceFBID), person(selfFBID), "WAINVENTED96", t0, textContent(canary+" mine"), ""))
+	unreadable(t, h, aliceFBID, "WAINVENTED96-react", t0.Add(time.Minute), false)
+	h.deliver(t, fbMessage(oneToOne(aliceFBID), person(aliceFBID), "WAINVENTED96-react", t0.Add(time.Minute), reactionContent("WAINVENTED96", "❤"), ""))
+	if l, _ := h.line(t, alice, "WAINVENTED96"); len(l.Reactions) != 1 || l.Reactions[0].Emoji != "❤" {
+		t.Errorf("the reaction on his line reads %+v", l.Reactions)
+	}
+	settled(t, h, alice, "WAINVENTED96-react", "undecryptable")
+	if c := h.chat(t, alice); c.LastMessageID != "WAINVENTED96" || c.Unread != before {
+		t.Errorf("after the reaction, the chat's newest is %q, unread %d: want his line, unread %d", c.LastMessageID, c.Unread, before)
+	}
+
+	// an edit of hers
+	h.deliver(t, fbMessage(oneToOne(aliceFBID), person(aliceFBID), "WAINVENTED97", t0.Add(2*time.Minute), textContent(canary+" first"), ""))
+	unreadable(t, h, aliceFBID, "WAINVENTED97-edit", t0.Add(3*time.Minute), false)
+	h.deliver(t, fbMessage(oneToOne(aliceFBID), person(aliceFBID), "WAINVENTED97-edit", t0.Add(3*time.Minute), editContent("WAINVENTED97", canary+" edited"), ""))
+	if l, _ := h.line(t, alice, "WAINVENTED97"); l.Text != canary+" edited" || !l.Edited {
+		t.Errorf("the edited line reads %+v", l)
+	}
+	settled(t, h, alice, "WAINVENTED97-edit", "undecryptable")
+	if c := h.chat(t, alice); c.LastMessageID != "WAINVENTED97" || c.Unread != before+1 {
+		t.Errorf("after the edit, the chat's newest is %q, unread %d: want her line, unread %d", c.LastMessageID, c.Unread, before+1)
+	}
+
+	// an unsend Meta sent no copy of
+	h.deliver(t, fbMessage(oneToOne(aliceFBID), person(aliceFBID), "WAINVENTED98", t0.Add(4*time.Minute), textContent(canary+" taken back"), ""))
+	unreadable(t, h, aliceFBID, "WAINVENTED98-revoke", t0.Add(5*time.Minute), true)
+	h.deliver(t, fbMessage(oneToOne(aliceFBID), person(aliceFBID), "WAINVENTED98-revoke", t0.Add(5*time.Minute), revokeContent("WAINVENTED98"), ""))
+	if l, _ := h.line(t, alice, "WAINVENTED98"); !l.Deleted {
+		t.Errorf("the unsent line reads %+v", l)
+	}
+	settled(t, h, alice, "WAINVENTED98-revoke", "unavailable")
+	if c := h.chat(t, alice); c.LastMessageID != "WAINVENTED97" || c.Unread != before+1 {
+		t.Errorf("after the unsend, the chat's newest is %q, unread %d: want the edited line, unread %d", c.LastMessageID, c.Unread, before+1)
+	}
+
+	// the same unsend again settles nothing more
+	time.Sleep(700 * time.Millisecond)
+	events := h.changedEvents()
+	h.deliver(t, fbMessage(oneToOne(aliceFBID), person(aliceFBID), "WAINVENTED98-revoke", t0.Add(5*time.Minute), revokeContent("WAINVENTED98"), ""))
+	time.Sleep(700 * time.Millisecond)
+	if n := h.changedEvents() - events; n != 0 {
+		t.Errorf("the same unsend again sent %d changed events, want 0", n)
+	}
+	settled(t, h, alice, "WAINVENTED98-revoke", "unavailable")
+}
+
 // live needs both connections: the main socket (groups) and the encrypted
 // one. With the encrypted one down and groups up, Messenger is offline with
 // kind unsupported, and `status` says how the encrypted connection is.

@@ -761,7 +761,10 @@ func (m *Messenger) storeArchive(chat, thread string, group bool, fbid int64, ms
 
 // withSupplementals adds a backed-up line's supplementals to what it
 // writes: its latest edit (by its sender) and each person's latest
-// reaction. Anything else among them is passed over.
+// reaction. Anything else among them is passed over. Every edit and
+// reaction of the line among them, the latest or not, a reaction taken
+// back included, settles the line kept under its own ID, if it is one
+// that couldn't be read (applyEnc).
 func (m *Messenger) withSupplementals(chat string, w encWrites, parent *events.FBMessage, dm *securehistory.DecryptedMessage, jid watypes.JID, fbid int64) encWrites {
 	type latest struct {
 		at   int64
@@ -786,6 +789,7 @@ func (m *Messenger) withSupplementals(chat string, w encWrites, parent *events.F
 			if t := r.GetKey().GetID(); t != "" && t != parent.Info.ID {
 				continue
 			}
+			w.settle = append(w.settle, settleOwn(evt.Info.ID, parent.Info.ID)...)
 			actor := evt.Info.Sender.User
 			prev, seen := reactions[actor]
 			if !seen || at > prev.at || at == prev.at && r.GetText() == "" {
@@ -796,6 +800,7 @@ func (m *Messenger) withSupplementals(chat string, w encWrites, parent *events.F
 			if t := e.GetKey().GetID(); t != "" && t != parent.Info.ID || evt.Info.Sender.User != parent.Info.Sender.User || e.GetMessage() == nil {
 				continue
 			}
+			w.settle = append(w.settle, settleOwn(evt.Info.ID, parent.Info.ID)...)
 			if !edit.set || at > edit.at {
 				edit = latest{at: at, text: e.GetMessage().GetText(), set: true}
 			}

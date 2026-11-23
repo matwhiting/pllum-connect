@@ -202,3 +202,38 @@ func (s *Store) LineState(network, chatID, msgID string) (LineState, bool) {
 	}
 	return st, true
 }
+
+// SettlePlaceholder hides a line the chat (or the chat an alias names) holds
+// under msgID only while it stands in for a message that couldn't be read
+// (kind undecryptable or unavailable) and shows: news about another line
+// (a reaction, an edit, an unsend) has come under that ID, so the message
+// will never come back as a line of its own. A line of any other kind is
+// left as it is. settled reports whether it hid one; settling again does
+// nothing. The chat's newest line and unread count follow.
+func (s *Store) SettlePlaceholder(network, chatID, msgID string) (settled bool, err error) {
+	if network == "" || chatID == "" || msgID == "" {
+		return false, errBadRequest
+	}
+	err = s.write(func(tx *sql.Tx) error {
+		chat, err := resolve(tx, network, chatID)
+		if err != nil {
+			return err
+		}
+		res, err := tx.Exec(`UPDATE messages SET hidden = 1
+				WHERE network = ? AND chat_id = ? AND msg_id = ? AND hidden = 0
+				AND kind IN ('undecryptable', 'unavailable')`, network, chat, msgID)
+		if err != nil {
+			return err
+		}
+		n, err := res.RowsAffected()
+		if err != nil || n == 0 {
+			return err
+		}
+		settled = true
+		return refresh(tx, network, chat)
+	})
+	if err != nil {
+		return false, err
+	}
+	return settled, nil
+}

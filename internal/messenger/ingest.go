@@ -874,10 +874,14 @@ func (m *Messenger) encryptedChatFor(j watypes.JID) (string, bool, error) {
 }
 
 // encWrites is what one encrypted message writes: lines (a whole line
-// before news about it) and reactions.
+// before news about it), reactions, and the IDs of reactions, edits and
+// unsends applied to other lines. A message under one of those IDs never
+// comes back as a line of its own, so an "undecryptable" or "unavailable"
+// line kept under it (onUndecryptable) is settled: hidden.
 type encWrites struct {
 	puts      []store.Message
 	reactions []encReaction
+	settle    []string
 }
 
 type encReaction struct {
@@ -936,6 +940,13 @@ func (m *Messenger) applyEnc(chat string, w encWrites) (added int, changed bool,
 		}
 		changed = true
 	}
+	for _, id := range w.settle {
+		settled, err := m.st.SettlePlaceholder(Name, chat, id)
+		if err != nil {
+			return added, changed, err
+		}
+		changed = changed || settled
+	}
 	return added, changed, nil
 }
 
@@ -956,7 +967,7 @@ func (m *Messenger) encPrep(chat string, evt *events.FBMessage, source string, p
 	}
 	news := func(n store.Message) encWrites {
 		n.ChatID, n.Source = chat, source
-		return encWrites{puts: []store.Message{n}}
+		return encWrites{puts: []store.Message{n}, settle: settleOwn(info.ID, n.ID)}
 	}
 
 	var b body
@@ -974,7 +985,8 @@ func (m *Messenger) encPrep(chat string, evt *events.FBMessage, source string, p
 			if r := c.GetReactionMessage(); r != nil {
 				if target := r.GetKey().GetID(); target != "" && sender != "" {
 					return encWrites{reactions: []encReaction{{msgID: target,
-						r: store.Reaction{Emoji: r.GetText(), SenderID: sender, FromMe: fromMe}}}}
+						r: store.Reaction{Emoji: r.GetText(), SenderID: sender, FromMe: fromMe}}},
+						settle: settleOwn(info.ID, target)}
 				}
 				return encWrites{}
 			}
@@ -1027,6 +1039,15 @@ func (m *Messenger) encPrep(chat string, evt *events.FBMessage, source string, p
 		}
 	}
 	return encWrites{puts: []store.Message{line}}
+}
+
+// settleOwn is the message to settle when news under id changes the line
+// target: id, unless it names that line itself.
+func settleOwn(id, target string) []string {
+	if id == "" || id == target {
+		return nil
+	}
+	return []string{id}
 }
 
 // consumerBody reads what a consumer application's content shows; ok is
@@ -1136,7 +1157,9 @@ func (m *Messenger) onEncReceipt(e *events.Receipt) (bool, error) {
 // an "undecryptable" line under its ID, or, when Meta says it was sent
 // with no copy for this device, an "unavailable" one: shown (Pllum says
 // which), and when it comes again readable, it lands in that row. One
-// already held is left as it is.
+// already held is left as it is. When it was a reaction, an edit or an
+// unsend, it comes again (live, or as a supplemental from his backup) only
+// as news about another line, and that settles it (applyEnc): hidden.
 func (m *Messenger) onUndecryptable(e *events.UndecryptableMessage) (bool, error) {
 	if e.Info.ID == "" {
 		return false, nil
