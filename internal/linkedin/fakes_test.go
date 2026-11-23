@@ -176,6 +176,10 @@ type fakeLinkedIn struct {
 	// before answers GetMessagesBefore; prev answers GetMessagesWithPrevCursor.
 	before func(conv string, before time.Time, count int) *linkedingo.CollectionResponse[linkedingo.MessageMetadata, linkedingo.Message]
 	prev   func(conv, cursor string, count int) *linkedingo.CollectionResponse[linkedingo.MessageMetadata, linkedingo.Message]
+	// convErr, when set, fails a GetMessagesBefore or
+	// GetMessagesWithPrevCursor call (by name) of one conversation with
+	// what it gives, after the call is recorded.
+	convErr func(name, conv string) error
 	// rotate, when set, is applied to the client's jar on every request: the
 	// cookies LinkedIn sets as it answers.
 	rotate func(jar *linkedingo.StringCookieJar, n int)
@@ -296,6 +300,17 @@ func (f *fakeLinkedIn) recordIn(c *fakeClient, name, arg, cat string) error {
 		rotate(c.jar, n)
 	}
 	return err
+}
+
+// failConv is the error convErr gives a call of conv, if any.
+func (f *fakeLinkedIn) failConv(name, conv string) error {
+	f.mu.Lock()
+	fail := f.convErr
+	f.mu.Unlock()
+	if fail == nil {
+		return nil
+	}
+	return fail(name, conv)
 }
 
 func (f *fakeLinkedIn) enter() {
@@ -454,6 +469,9 @@ func (c *fakeClient) GetMessagesBefore(ctx context.Context, conv linkedingo.URN,
 	if err := c.f.record(c, "GetMessagesBefore", conv.String()); err != nil {
 		return nil, err
 	}
+	if err := c.f.failConv("GetMessagesBefore", conv.String()); err != nil {
+		return nil, err
+	}
 	c.f.mu.Lock()
 	page := c.f.before
 	c.f.mu.Unlock()
@@ -467,6 +485,9 @@ func (c *fakeClient) GetMessagesWithPrevCursor(ctx context.Context, conv linkedi
 	c.f.enter()
 	defer c.f.leave()
 	if err := c.f.record(c, "GetMessagesWithPrevCursor", conv.String()+" "+prevCursor); err != nil {
+		return nil, err
+	}
+	if err := c.f.failConv("GetMessagesWithPrevCursor", conv.String()); err != nil {
 		return nil, err
 	}
 	c.f.mu.Lock()

@@ -170,13 +170,18 @@ type LinkedIn struct {
 	due        struct{ sync, pages bool } // catch-ups the realtime stream asked for
 
 	// Background work a passing failure stopped (sync.go's later): the
-	// catch-ups to ask again and the chats passed over until the timer
-	// fires. All belong to the run in force, and retire forgets them.
+	// catch-ups to ask again when the timer fires (at laterAt; laterSeq
+	// tells a timer replaced by a sooner one). All belong to the run in
+	// force, and retire forgets them.
 	stopLater    func() bool
+	laterAt      time.Time
+	laterSeq     int
 	held         struct{ sync, pages bool }
-	passed       map[string]bool
-	passDue      bool // the timer has fired: the chats passed over may be asked again
 	tokenDropped bool // the run's client holds a sync token LinkedIn won't take
+	// aside are the chats LinkedIn has failed on (sync.go's pass), each
+	// backed off on its own. Kept across runs, in memory only: a restart
+	// starts every chat afresh.
+	aside map[string]asideChat
 
 	// A sign-in being checked: its profile is read before anything else
 	// changes, so another account's is refused with the run in force, the
@@ -434,7 +439,7 @@ func (l *LinkedIn) retire() {
 		l.stopLater = nil
 	}
 	l.held.sync, l.held.pages = false, false
-	l.passed, l.passDue, l.tokenDropped = nil, false, false
+	l.tokenDropped = false
 	l.connected, l.sessID = false, uuid.Nil
 	if old := l.cli; old != nil && l.realtime {
 		// RealtimeDisconnect waits for the stream to stop, which may be
