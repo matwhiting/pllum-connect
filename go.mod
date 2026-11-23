@@ -9,7 +9,7 @@ require (
 	github.com/google/uuid v1.6.0
 	github.com/ncruces/go-sqlite3 v0.35.6
 	github.com/rs/zerolog v1.35.1
-	go.mau.fi/libsignal v0.2.2
+	go.mau.fi/libsignal v0.2.3
 	go.mau.fi/mautrix-linkedin v0.2609.1-0.20261103213510-3127fea810c0
 	go.mau.fi/mautrix-meta v0.2610.0
 	go.mau.fi/util v0.11.0
