@@ -175,12 +175,7 @@ func (m *Messenger) fetchEncNewest(ctx context.Context, gen int, cli msgrClient,
 		return 0, true, errInternal
 	}
 	device = m.saveEpochs(device, page)
-	msgs, err := h.Decrypt(page, device, thread, fbid, group)
-	if err != nil {
-		m.encStall(chat)
-		m.encFailed()
-		return 0, true, errInternal
-	}
+	msgs := h.Decrypt(ctx, page, device, thread, fbid, group)
 	added, ok := m.storeArchive(chat, thread, group, fbid, msgs)
 	if !ok {
 		m.encStall(chat)

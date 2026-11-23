@@ -784,17 +784,17 @@ func (h *fakeHistory) FetchMessages(ctx context.Context, device *securehistory.D
 	return r, nil
 }
 
-func (h *fakeHistory) Decrypt(r *securehistory.MessageRange, device *securehistory.Device, threadID string, self int64, isGroup bool) ([]*securehistory.DecryptedMessage, error) {
+func (h *fakeHistory) Decrypt(_ context.Context, r *securehistory.MessageRange, device *securehistory.Device, threadID string, self int64, isGroup bool) []*securehistory.DecryptedMessage {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.pages != nil {
-		return h.given[r], nil
+		return h.given[r]
 	}
 	out := make([]*securehistory.DecryptedMessage, h.sample)
 	for i := range out {
 		out[i] = &securehistory.DecryptedMessage{ID: canary + "-line"}
 	}
-	return out, nil
+	return out
 }
 
 func (h *fakeHistory) RegistrationID() string { return "registration-invented-1" }

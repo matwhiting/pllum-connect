@@ -52,7 +52,9 @@ type historyClient interface {
 	AddDevice(ctx context.Context, enrollment *securehistory.Enrollment) (*securehistory.Device, error)
 	FetchMessages(ctx context.Context, device *securehistory.Device, threadID string, before bool, timestampMS int64, count int) (*securehistory.MessageRange, error)
 	// Decrypt is MessageRange.Decrypt, here so a test can stand in for it.
-	Decrypt(r *securehistory.MessageRange, device *securehistory.Device, threadID string, selfUserID int64, isGroup bool) ([]*securehistory.DecryptedMessage, error)
+	// A line of the page that cannot be decrypted is left out (the library
+	// passes it over), so a page never fails as a whole.
+	Decrypt(ctx context.Context, r *securehistory.MessageRange, device *securehistory.Device, threadID string, selfUserID int64, isGroup bool) []*securehistory.DecryptedMessage
 	RegistrationID() string
 }
 
@@ -91,8 +93,8 @@ func (h realHistory) FetchMessages(ctx context.Context, d *securehistory.Device,
 	return h.c.FetchMessages(ctx, d, threadID, before, ts, count)
 }
 
-func (h realHistory) Decrypt(r *securehistory.MessageRange, d *securehistory.Device, threadID string, self int64, isGroup bool) ([]*securehistory.DecryptedMessage, error) {
-	return r.Decrypt(d, threadID, self, isGroup)
+func (h realHistory) Decrypt(ctx context.Context, r *securehistory.MessageRange, d *securehistory.Device, threadID string, self int64, isGroup bool) []*securehistory.DecryptedMessage {
+	return r.Decrypt(ctx, d, threadID, self, isGroup)
 }
 
 func (h realHistory) RegistrationID() string { return h.c.RegistrationID }
@@ -375,8 +377,8 @@ func (m *Messenger) sample(ctx context.Context, gen int, cli msgrClient, fbid in
 	}
 	// Meta moved his backup on to newer keys: kept, as the connector does.
 	device = m.saveEpochs(device, page)
-	lines, err := h.Decrypt(page, device, threadID, fbid, false)
-	if err != nil || !m.current(gen) {
+	lines := h.Decrypt(ctx, page, device, threadID, fbid, false)
+	if !m.current(gen) {
 		return
 	}
 	m.cmu.Lock()
@@ -409,10 +411,12 @@ func (m *Messenger) sample(ctx context.Context, gen int, cli msgrClient, fbid in
 //
 // Nothing of the backup is asked twice the same way (review I2):
 //
-//   - a page that does not reach back past where it was asked from, cannot
-//     be read or cannot be decrypted, or a request Meta fails, holds the
-//     chat ("estalled.<chat>", kept across restarts), for 6 h the first
-//     time, 24 h the second and 7 days after that ("estallN.<chat>");
+//   - a page that does not reach back past where it was asked from or
+//     cannot be read, or a request Meta fails, holds the chat
+//     ("estalled.<chat>", kept across restarts), for 6 h the first time,
+//     24 h the second and 7 days after that ("estallN.<chat>"); a line of
+//     a page that cannot be decrypted is left out by the library and the
+//     rest of the page kept;
 //   - two failed requests in a row, across any chats, pause the whole
 //     backup the same way ("epause", "epauseN"; "efails" counts them), and
 //     end the first restore's read: a failure of the whole backup is asked
@@ -658,12 +662,7 @@ func (m *Messenger) fetchEncPage(ctx context.Context, gen int, cli msgrClient, f
 		return 0, pageStall, true, errInternal
 	}
 	device = m.saveEpochs(device, page)
-	msgs, err := h.Decrypt(page, device, thread, fbid, group)
-	if err != nil {
-		m.encStall(chat)
-		m.encFailed()
-		return 0, pageStall, true, errInternal
-	}
+	msgs := h.Decrypt(ctx, page, device, thread, fbid, group)
 	added, ok := m.storeArchive(chat, thread, group, fbid, msgs)
 	if !ok {
 		m.encStall(chat)
