@@ -13,6 +13,7 @@ import (
 	waLog "go.mau.fi/whatsmeow/util/log"
 
 	"github.com/matwhiting/pllum-connect/internal/meta"
+	"github.com/matwhiting/pllum-connect/internal/quiet"
 	"github.com/matwhiting/pllum-connect/internal/store"
 	"github.com/matwhiting/pllum-connect/internal/wire"
 )
@@ -149,6 +150,10 @@ func (m *Messenger) connectE2EE(ctx context.Context, gen int, cli msgrClient, fb
 		// the library's warnings about decrypting go to diagnostics.txt, without numbers (diag.go)
 		wc.Client.Log = m.diagLogger()
 	}
+	// and libsignal's, which say why a message failed ("no valid sessions"
+	// is all whatsmeow says); WhatsApp's land here too, as libsignal has one
+	// logger for the helper
+	quiet.SignalTo(func(line string) { m.diag("signal: " + line) })
 	e.AddEventHandlerWithSuccessStatus(m.e2eeHandler(gen))
 	m.mu.Lock()
 	if gen != m.gen || m.stopped {
