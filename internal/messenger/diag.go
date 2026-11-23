@@ -12,15 +12,19 @@ import (
 	"time"
 
 	"go.mau.fi/libsignal/keys/prekey"
+	"go.mau.fi/whatsmeow"
 	waBinary "go.mau.fi/whatsmeow/binary"
 	watypes "go.mau.fi/whatsmeow/types"
 	waLog "go.mau.fi/whatsmeow/util/log"
+
+	"github.com/matwhiting/pllum-connect/internal/wire"
 )
 
 // Diagnostics for the encrypted side, in <dir>/messenger/diagnostics.txt
 // (0600, on his Mac only, started again past diagLimit): the library's
-// warnings about decrypting a message, and a self-check each time the
-// encrypted socket comes up (each of its requests through the pace). Every
+// warnings about decrypting a message, a self-check each time the
+// encrypted socket comes up, and its ICDC half and any re-registration in
+// each run's setup (each of their requests through the pace). Every
 // line but the self-check's (words, yes/no and counts) loses its numbers
 // (sanitize), so it
 // holds no ID, JID, device number or time but its own timestamp, and never
@@ -79,19 +83,83 @@ func (d diagLog) Debugf(string, ...any)             {}
 func (d diagLog) Sub(string) waLog.Logger           { return d }
 
 // selfCheck asks Meta what it holds for this device and writes the answers
-// as yes/no and counts: whether its own device list names this device;
-// whether the key bundle others are given for it (fetching it uses one
-// one-time key) has this device's identity, signed prekey and registration
-// ID, and a one-time key held here; how many one-time keys Meta has left;
-// and how many devices each of his five latest encrypted one-to-ones lists.
+// as yes/no and counts (checkDevice), each time the encrypted socket first
+// comes up in this helper. Its other half, the ICDC list, is checkICDC,
+// which the run's setup makes in line (icdcCheck).
 func (m *Messenger) selfCheck(gen int, e e2eeClient) {
 	wc, ok := e.(waClient)
 	if !ok || wc.Client == nil || wc.Client.Store == nil || wc.Client.Store.ID == nil {
 		return
 	}
-	cli, own := wc.Client, *wc.Client.Store.ID
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
+	m.checkDevice(ctx, gen, wc.Client)
+}
+
+// icdcCheck is the self-check's ICDC half, once in each run's setup, right
+// after the encrypted side is set up and before anything reads with it:
+// checkICDC, and when it finds this device's identity missing from the
+// list, the one re-registration ever (reregister), then the list checked
+// again for the new device. ok is false when a re-registration failed:
+// the run has ended then.
+func (m *Messenger) icdcCheck(ctx context.Context, gen int) (ok bool) {
+	if !m.checkICDC(ctx, gen) {
+		return true
+	}
+	if m.value(reregisteredKey) != "" {
+		m.diagLine("re-registration: not attempted, it was done once before")
+		return true
+	}
+	began, err := m.reregister(ctx, gen)
+	if !began {
+		return true
+	}
+	if err != nil {
+		return false
+	}
+	m.checkICDC(ctx, gen)
+	return true
+}
+
+// checkICDC fetches his account's ICDC list once (the request registering
+// makes first; through the pace) and writes whether this device's identity
+// is in it, how many identities it has and its seq, never what it holds.
+// It reports whether the identity is surely missing: the list came, has
+// identities, and none is this device's.
+func (m *Messenger) checkICDC(ctx context.Context, gen int) (missing bool) {
+	m.mu.Lock()
+	cli, fbid := m.cli, m.fbid
+	ok := gen == m.gen && !m.stopped && cli != nil
+	m.mu.Unlock()
+	m.dmu.Lock()
+	dev := m.dev
+	m.dmu.Unlock()
+	if !ok || dev == nil || dev.IdentityKey == nil || dev.IdentityKey.Pub == nil {
+		return false
+	}
+	own := *dev.IdentityKey.Pub
+	var ids [][32]byte
+	seq := 0
+	if err := m.request(ctx, gen, func(ctx context.Context) (err error) {
+		ids, seq, err = cli.FetchICDC(ctx, fbid, dev.FacebookUUID)
+		return err
+	}); err != nil {
+		m.diagLine("self-check: ICDC list failed (" + string(wire.KindOf(err)) + ")")
+		return false
+	}
+	in := slices.Contains(ids, own)
+	m.diagLine(fmt.Sprintf("self-check: ICDC list has %d identities, this device's among them %v; Meta's ICDC seq %d; re-registered before %v",
+		len(ids), in, seq, m.value(reregisteredKey) != ""))
+	return !in && len(ids) > 0
+}
+
+// checkDevice writes whether Meta's own device list names this device;
+// whether the key bundle others are given for it (fetching it uses one
+// one-time key) has this device's identity, signed prekey and registration
+// ID, and a one-time key held here; how many one-time keys Meta has left;
+// and how many devices each of his five latest encrypted one-to-ones lists.
+func (m *Messenger) checkDevice(ctx context.Context, gen int, cli *whatsmeow.Client) {
+	own := *cli.Store.ID
 	listed, devices := false, 0
 	var devs []watypes.JID
 	if err := m.request(ctx, gen, func(ctx context.Context) (err error) {

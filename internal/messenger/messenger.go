@@ -6,7 +6,9 @@
 // own sign-in window (`login` with method "session"), loads the messages
 // page and connects the main (lightspeed) socket; on its first connect, as
 // mautrix-meta's connector does, it registers Pllum as a Messenger device
-// (once, ever) and connects the encrypted socket (e2ee.go), looks for his
+// (once, ever, with the session's Facebook device ID; replaced once, ever,
+// if the self-check finds its identity missing from his account's ICDC
+// list) and connects the encrypted socket (e2ee.go), looks for his
 // history backup, which his PIN restores (history.go), lists every folder
 // of his inbox and fetches the recent history of the unencrypted threads
 // (backfill.go). Everything the messages page, the pages and the main
@@ -51,6 +53,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/rs/zerolog"
 	"go.mau.fi/mautrix-meta/pkg/messagix"
 	"go.mau.fi/mautrix-meta/pkg/messagix/cookies"
@@ -102,6 +105,12 @@ type msgrClient interface {
 	GetCookies() *cookies.Cookies
 	SetDevice(dev *wastore.Device)
 	RegisterE2EE(ctx context.Context, fbid int64) error
+	// FetchICDC is the account's ICDC list as Meta gives it: every device
+	// identity in it, and its seq (icdc.go).
+	FetchICDC(ctx context.Context, fbid int64, deviceUUID uuid.UUID) (identities [][32]byte, seq int, err error)
+	// SessionDeviceID is the session's Facebook device ID, uuid.Nil when
+	// it names none (icdc.go).
+	SessionDeviceID() uuid.UUID
 	// PrepareE2EE is the whatsmeow client for the encrypted chats, made
 	// silent and acking only once its handlers have run.
 	PrepareE2EE() (e2eeClient, error)
@@ -203,6 +212,10 @@ type Messenger struct {
 	// failed in this helper: the next sign-in registers its keys again.
 	pending    *wastore.Device
 	pendingFor int64
+	// replacing is the device a re-registration replaces (reregister):
+	// while it is set, the pending device is registered in its place and
+	// its row deleted once that has gone.
+	replacing *wastore.Device
 
 	// the secure history (history.go)
 	hmu      sync.Mutex // one restore at a time
@@ -601,7 +614,7 @@ func (m *Messenger) Stop() {
 	m.dmu.Lock()
 	if m.db != nil {
 		m.db.Close()
-		m.db, m.container, m.dev, m.pending = nil, nil, nil, nil
+		m.db, m.container, m.dev, m.pending, m.replacing = nil, nil, nil, nil, nil
 	}
 	m.dmu.Unlock()
 }
@@ -763,27 +776,12 @@ func (m *Messenger) beginE2EE(gen int, cli msgrClient, fbid int64) {
 		// standard error, as in the main handler.
 		defer func() { _ = recover() }()
 		if err := m.connectE2EE(ctx, gen, cli, fbid); err != nil {
-			if wire.KindOf(err) == wire.RegistrationUnclear {
-				// A device may exist: kept as the session's block, so
-				// nothing registers again (with new keys, after a restart)
-				// until he signs in again.
-				m.mu.Lock()
-				if gen == m.gen {
-					m.e2eeFailed = true
-				}
-				m.mu.Unlock()
-				m.pace.Fail(meta.ReconnectNeeded)
-				m.pushedBack(gen, wire.RegistrationUnclear)
-				return
-			}
-			if k := wire.KindOf(err); k == wire.Unclear || k == wire.Internal {
-				m.mu.Lock()
-				if gen == m.gen {
-					m.e2eeFailed = true
-				}
-				m.mu.Unlock()
-			}
-			m.failed(gen, wire.KindOf(err))
+			m.e2eeSetupFailed(gen, err) // e2ee.go
+			return
+		}
+		// the self-check's ICDC list, and the one re-registration it may
+		// call for (diag.go), before anything reads with the device
+		if !m.icdcCheck(ctx, gen) {
 			return
 		}
 		m.checkHistory(ctx, gen, cli, fbid)

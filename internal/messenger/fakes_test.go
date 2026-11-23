@@ -171,6 +171,22 @@ type fakeMeta struct {
 	registerErrs []error
 	regKeys      [][32]byte
 	regUUIDs     []uuid.UUID
+	// icdc is the account's signed list of device identities as Meta holds
+	// it, and icdcSeq its seq: each registration that goes adds its
+	// identity and moves the seq on, as the library's does, unless icdcSkip
+	// (the next registrations that do not land in it) says not. icdcErr
+	// fails the next fetch of it. sessionUUID is the device ID of the
+	// session SessionDeviceID gives (uuid.Nil: none). sameDevice gives
+	// every registration device 7, where each would get the next number.
+	icdc        [][32]byte
+	icdcSeq     int
+	icdcSkip    int
+	icdcErr     error
+	sessionUUID uuid.UUID
+	sameDevice  bool
+	// e2eeNext are the encrypted clients PrepareE2EE gives next, in order;
+	// after them, e2ee again.
+	e2eeNext []*fakeE2EE
 	// folders are the thread pages FetchThreadsTask gives for each folder
 	// (sync group and parent thread key), in order; after them, an empty
 	// answer. endless gives every folder a new page every time.
@@ -226,7 +242,8 @@ type call struct {
 func newFakeMeta() *fakeMeta {
 	f := &fakeMeta{table: inbox(), e2ee: &fakeE2EE{}, history: &fakeHistory{},
 		folders: map[folderKey][]*table.LSTable{}, older: map[int64][]*table.LSTable{}, clock: newFakeClock(),
-		writeErrs: map[string]error{}, files: map[string][]byte{}}
+		writeErrs: map[string]error{}, files: map[string][]byte{},
+		icdc: [][32]byte{inventedIdentity(0x11)}, icdcSeq: 3, sessionUUID: inventedSessionUUID}
 	f.history.rec = func(name string) {
 		f.mu.Lock()
 		defer f.mu.Unlock()
@@ -507,7 +524,19 @@ func (c *fakeClient) RegisterE2EE(ctx context.Context, fbid int64) error {
 	if err != nil {
 		return err
 	}
-	c.dev.ID = &watypes.JID{User: "2000001", Device: 7, Server: watypes.MessengerServer}
+	c.f.mu.Lock()
+	device := uint16(6 + c.f.registers)
+	if c.f.sameDevice {
+		device = 7
+	}
+	if c.f.icdcSkip > 0 {
+		c.f.icdcSkip--
+	} else {
+		c.f.icdc = append(c.f.icdc, *c.dev.IdentityKey.Pub)
+		c.f.icdcSeq++
+	}
+	c.f.mu.Unlock()
+	c.dev.ID = &watypes.JID{User: "2000001", Device: device, Server: watypes.MessengerServer}
 	c.dev.Account = &waAdv.ADVSignedDeviceIdentity{
 		Details:             []byte{},
 		AccountSignatureKey: make([]byte, 32),
@@ -517,18 +546,57 @@ func (c *fakeClient) RegisterE2EE(ctx context.Context, fbid int64) error {
 	return nil
 }
 
-func (c *fakeClient) PrepareE2EE() (e2eeClient, error) { return c.f.e2ee, nil }
+// FetchICDC gives the identity list Meta holds now, and its seq.
+func (c *fakeClient) FetchICDC(ctx context.Context, fbid int64, deviceUUID uuid.UUID) ([][32]byte, int, error) {
+	c.f.mu.Lock()
+	defer c.f.mu.Unlock()
+	c.f.record("FetchICDC")
+	if err := c.f.icdcErr; err != nil {
+		c.f.icdcErr = nil
+		return nil, 0, err
+	}
+	return append([][32]byte{}, c.f.icdc...), c.f.icdcSeq, nil
+}
+
+// SessionDeviceID is the invented device ID of the session, if any.
+func (c *fakeClient) SessionDeviceID() uuid.UUID {
+	c.f.mu.Lock()
+	defer c.f.mu.Unlock()
+	return c.f.sessionUUID
+}
+
+// PrepareE2EE gives the next encrypted client waiting, else the one there is.
+func (c *fakeClient) PrepareE2EE() (e2eeClient, error) {
+	c.f.mu.Lock()
+	defer c.f.mu.Unlock()
+	if len(c.f.e2eeNext) > 0 {
+		c.f.e2ee, c.f.e2eeNext = c.f.e2eeNext[0], c.f.e2eeNext[1:]
+	}
+	return c.f.e2ee, nil
+}
+
+// inventedSessionUUID is the invented device ID of the session.
+var inventedSessionUUID = uuid.MustParse("5e5510e0-0000-4000-8000-00000000c0de")
+
+// inventedIdentity is an invented identity key of another of his devices.
+func inventedIdentity(b byte) (k [32]byte) {
+	for i := range k {
+		k[i] = b
+	}
+	return k
+}
 
 func (c *fakeClient) History() historyClient { return c.f.history }
 
 // fakeE2EE is the encrypted socket: Connect says connected (unless the
 // test holds it), and a test delivers events through it.
 type fakeE2EE struct {
-	mu         sync.Mutex
-	handlers   []func(evt any) bool
-	connects   int
-	hold       bool
-	connectErr error // fails the next Connect
+	mu          sync.Mutex
+	handlers    []func(evt any) bool
+	connects    int
+	disconnects int
+	hold        bool
+	connectErr  error // fails the next Connect
 }
 
 func (e *fakeE2EE) AddEventHandlerWithSuccessStatus(h func(evt any) bool) {
@@ -553,7 +621,11 @@ func (e *fakeE2EE) Connect() error {
 	return nil
 }
 
-func (e *fakeE2EE) Disconnect() {}
+func (e *fakeE2EE) Disconnect() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.disconnects++
+}
 
 // dispatch delivers an event as whatsmeow does, and reports whether every
 // handler took it (whatsmeow acks only then).
