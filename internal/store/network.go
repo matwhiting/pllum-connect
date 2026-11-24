@@ -189,12 +189,17 @@ func (s *Store) LineState(network, chatID, msgID string) (LineState, bool) {
 	if s.ready() != nil || chatID == "" || msgID == "" {
 		return LineState{}, false
 	}
-	chat, err := resolve(s.db, network, chatID)
+	return lineState(s.db, network, chatID, msgID)
+}
+
+// lineState is LineState read through q.
+func lineState(q querier, network, chatID, msgID string) (LineState, bool) {
+	chat, err := resolve(q, network, chatID)
 	if err != nil {
 		return LineState{}, false
 	}
 	var st LineState
-	err = s.db.QueryRow(`SELECT kind, COALESCE(text, ''), hidden, early, deleted, edited FROM messages
+	err = q.QueryRow(`SELECT kind, COALESCE(text, ''), hidden, early, deleted, edited FROM messages
 			WHERE network = ? AND chat_id = ? AND msg_id = ?`,
 		network, chat, msgID).Scan(&st.Kind, &st.Text, &st.Hidden, &st.Early, &st.Deleted, &st.Edited)
 	if err != nil {
@@ -215,18 +220,8 @@ func (s *Store) SettlePlaceholder(network, chatID, msgID string) (settled bool, 
 		return false, errBadRequest
 	}
 	err = s.write(func(tx *sql.Tx) error {
-		chat, err := resolve(tx, network, chatID)
-		if err != nil {
-			return err
-		}
-		res, err := tx.Exec(`UPDATE messages SET hidden = 1
-				WHERE network = ? AND chat_id = ? AND msg_id = ? AND hidden = 0
-				AND kind IN ('undecryptable', 'unavailable')`, network, chat, msgID)
-		if err != nil {
-			return err
-		}
-		n, err := res.RowsAffected()
-		if err != nil || n == 0 {
+		chat, ok, err := settlePlaceholder(tx, network, chatID, msgID)
+		if err != nil || !ok {
 			return err
 		}
 		settled = true
@@ -236,6 +231,26 @@ func (s *Store) SettlePlaceholder(network, chatID, msgID string) (settled bool, 
 		return false, err
 	}
 	return settled, nil
+}
+
+// settlePlaceholder is SettlePlaceholder in tx, naming the chat; the chat
+// is not refreshed here.
+func settlePlaceholder(tx *sql.Tx, network, chatID, msgID string) (chat string, settled bool, err error) {
+	chat, err = resolve(tx, network, chatID)
+	if err != nil {
+		return "", false, err
+	}
+	res, err := tx.Exec(`UPDATE messages SET hidden = 1
+			WHERE network = ? AND chat_id = ? AND msg_id = ? AND hidden = 0
+			AND kind IN ('undecryptable', 'unavailable')`, network, chat, msgID)
+	if err != nil {
+		return "", false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return "", false, err
+	}
+	return chat, n > 0, nil
 }
 
 // HoldsUnreadable reports whether a chat (or the chat an alias names) still

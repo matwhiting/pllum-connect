@@ -21,26 +21,31 @@ func (s *Store) SetReactionSummary(network, chatID, msgID string, summary []Reac
 		return errBadRequest
 	}
 	return s.write(func(tx *sql.Tx) error {
-		chat, err := resolve(tx, network, chatID)
-		if err != nil {
-			return err
-		}
-		if _, err := tx.Exec(`DELETE FROM reactions WHERE network = ? AND chat_id = ? AND msg_id = ?
-				AND substr(sender_id, 1, ?) = ?`,
-			network, chat, msgID, len(summarySender), summarySender); err != nil {
-			return err
-		}
-		for _, r := range summary {
-			if r.Emoji == "" {
-				continue
-			}
-			if _, err := tx.Exec(`INSERT OR REPLACE INTO reactions (network, chat_id, msg_id, sender_id, emoji, from_me)
-					VALUES (?, ?, ?, ?, ?, ?)`, network, chat, msgID, summarySender+r.Emoji, r.Emoji, r.FromMe); err != nil {
-				return err
-			}
-		}
-		return nil
+		return setReactionSummary(tx, network, chatID, msgID, summary)
 	})
+}
+
+// setReactionSummary is SetReactionSummary in tx.
+func setReactionSummary(tx *sql.Tx, network, chatID, msgID string, summary []Reaction) error {
+	chat, err := resolve(tx, network, chatID)
+	if err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM reactions WHERE network = ? AND chat_id = ? AND msg_id = ?
+			AND substr(sender_id, 1, ?) = ?`,
+		network, chat, msgID, len(summarySender), summarySender); err != nil {
+		return err
+	}
+	for _, r := range summary {
+		if r.Emoji == "" {
+			continue
+		}
+		if _, err := tx.Exec(`INSERT OR REPLACE INTO reactions (network, chat_id, msg_id, sender_id, emoji, from_me)
+				VALUES (?, ?, ?, ?, ?, ?)`, network, chat, msgID, summarySender+r.Emoji, r.Emoji, r.FromMe); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // SetSummaryEmoji sets one emoji of a line's reaction counts: present adds or

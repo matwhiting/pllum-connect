@@ -182,6 +182,23 @@ func BenchmarkHistoryImport(b *testing.B) {
 	b.ReportMetric(float64(b.Elapsed().Microseconds())/float64(b.N*5000), "µs/line")
 }
 
+// BenchmarkHistoryImportBatched is the same sync a conversation at a time
+// (PutMessages: one transaction and one refresh of the chat for each).
+func BenchmarkHistoryImportBatched(b *testing.B) {
+	convs := historyImport()
+	for b.Loop() {
+		b.StopTimer()
+		s := openFixture(b)
+		b.StartTimer()
+		for _, ms := range convs {
+			if _, _, err := s.PutMessages(net, ms); err != nil {
+				b.Fatal(err)
+			}
+		}
+	}
+	b.ReportMetric(float64(b.Elapsed().Microseconds())/float64(b.N*5000), "µs/line")
+}
+
 // BenchmarkChats is the first page of 200 chats, with their participants.
 func BenchmarkChats(b *testing.B) {
 	s := openFixture(b)

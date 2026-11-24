@@ -413,10 +413,18 @@ func (s *Store) write(fn func(tx *sql.Tx) error) error {
 	if err != nil {
 		return dbErr(err)
 	}
+	// A panic in fn (a batch runs a network's own code) rolls back, so the
+	// connection never goes back to the pool holding the write lock.
+	committed := false
+	defer func() {
+		if !committed {
+			tx.Rollback()
+		}
+	}()
 	if err := fn(tx); err != nil {
-		tx.Rollback()
 		return dbErr(err)
 	}
+	committed = true
 	return dbErr(tx.Commit())
 }
 
@@ -936,59 +944,54 @@ func (s *Store) PutChat(network string, c ChatInfo) error {
 //
 // Every Media entry's Kind must be photo, video, voiceNote, sticker or file.
 func (s *Store) PutMessage(network string, m Message) (added bool, err error) {
-	if network == "" || m.ChatID == "" || m.ID == "" || m.TimeMs < 0 ||
-		strings.HasPrefix(m.ChatID, unplacedPrefix) || strings.HasPrefix(m.ID, beeperPrefix) {
+	if network == "" {
 		return false, errBadRequest
 	}
-	if m.Kind != "" && !lineKinds[m.Kind] {
-		return false, errBadRequest
+	if err := checkMessage(&m); err != nil {
+		return false, err
 	}
-	for _, x := range m.Media {
-		if !mediaKinds[x.Kind] {
-			return false, errBadRequest
-		}
-	}
-	if m.Source == "" {
-		m.Source = SourceLive
-	}
-	if m.Source != SourceLive && m.Source != SourceSync {
-		return false, errBadRequest
-	}
-	err = s.write(func(tx *sql.Tx) error {
-		chat, err := resolve(tx, network, m.ChatID)
-		if err != nil {
-			return err
-		}
-		m.ChatID = chat
-		if err := ensureChat(tx, network, chat, ""); err != nil {
-			return err
-		}
-		media, err := mediaJSON(m.Media)
-		if err != nil {
-			return err
-		}
-
-		var rid int64
-		err = tx.QueryRow(`SELECT rid FROM messages WHERE network = ? AND chat_id = ? AND msg_id = ?`,
-			network, chat, m.ID).Scan(&rid)
-		switch {
-		case err == nil:
-			if err = updateLine(tx, rid, m, media, isWhole(m)); err == nil && (isWhole(m) || m.Edited) {
-				// The line's text may now be Beeper's copy's.
-				err = absorbBeeperCopy(tx, network, rid)
-			}
-		case errors.Is(err, sql.ErrNoRows):
-			added, err = putNewID(tx, network, m, media)
-		}
-		if err != nil {
-			return err
-		}
-		return refresh(tx, network, chat)
+	err = s.Batch(network, func(b *Batch) error {
+		added, err = b.PutMessage(m)
+		return err
 	})
 	if err != nil {
 		return false, err
 	}
 	return added, nil
+}
+
+// putMessage writes one line (PutMessage, checked) in tx and names the chat
+// it went to; the chat is not refreshed here.
+func putMessage(tx *sql.Tx, network string, m Message) (chat string, added bool, err error) {
+	chat, err = resolve(tx, network, m.ChatID)
+	if err != nil {
+		return "", false, err
+	}
+	m.ChatID = chat
+	if err := ensureChat(tx, network, chat, ""); err != nil {
+		return "", false, err
+	}
+	media, err := mediaJSON(m.Media)
+	if err != nil {
+		return "", false, err
+	}
+
+	var rid int64
+	err = tx.QueryRow(`SELECT rid FROM messages WHERE network = ? AND chat_id = ? AND msg_id = ?`,
+		network, chat, m.ID).Scan(&rid)
+	switch {
+	case err == nil:
+		if err = updateLine(tx, rid, m, media, isWhole(m)); err == nil && (isWhole(m) || m.Edited) {
+			// The line's text may now be Beeper's copy's.
+			err = absorbBeeperCopy(tx, network, rid)
+		}
+	case errors.Is(err, sql.ErrNoRows):
+		added, err = putNewID(tx, network, m, media)
+	}
+	if err != nil {
+		return "", false, err
+	}
+	return chat, added, nil
 }
 
 // hasContent reports whether m carries text, media or a kind.
@@ -1268,19 +1271,24 @@ func (s *Store) SetReaction(network, chatID, msgID string, r Reaction) error {
 		return errBadRequest
 	}
 	return s.write(func(tx *sql.Tx) error {
-		chat, err := resolve(tx, network, chatID)
-		if err != nil {
-			return err
-		}
-		if r.Emoji == "" {
-			_, err = tx.Exec(`DELETE FROM reactions WHERE network = ? AND chat_id = ? AND msg_id = ? AND sender_id = ?`,
-				network, chat, msgID, r.SenderID)
-			return err
-		}
-		_, err = tx.Exec(`INSERT OR REPLACE INTO reactions (network, chat_id, msg_id, sender_id, emoji, from_me)
-				VALUES (?, ?, ?, ?, ?, ?)`, network, chat, msgID, r.SenderID, r.Emoji, r.FromMe)
-		return err
+		return setReaction(tx, network, chatID, msgID, r)
 	})
+}
+
+// setReaction is SetReaction in tx.
+func setReaction(tx *sql.Tx, network, chatID, msgID string, r Reaction) error {
+	chat, err := resolve(tx, network, chatID)
+	if err != nil {
+		return err
+	}
+	if r.Emoji == "" {
+		_, err = tx.Exec(`DELETE FROM reactions WHERE network = ? AND chat_id = ? AND msg_id = ? AND sender_id = ?`,
+			network, chat, msgID, r.SenderID)
+		return err
+	}
+	_, err = tx.Exec(`INSERT OR REPLACE INTO reactions (network, chat_id, msg_id, sender_id, emoji, from_me)
+			VALUES (?, ?, ?, ?, ?, ?)`, network, chat, msgID, r.SenderID, r.Emoji, r.FromMe)
+	return err
 }
 
 // refresh recomputes a chat's derived values: its last visible line, its
@@ -1289,6 +1297,13 @@ func (s *Store) SetReaction(network, chatID, msgID string, r Reaction) error {
 // history, and never count as unread. Early
 // rows are not lines yet, and count for none of these.
 func refresh(tx *sql.Tx, network, chat string) error {
+	return refreshAt(tx, network, chat, 0)
+}
+
+// refreshAt is refresh, with the chat's activity moved forward to at least
+// shownMs too: the newest time a line showed at in a batch that refreshes
+// the chat once, at its end.
+func refreshAt(tx *sql.Tx, network, chat string, shownMs int64) error {
 	var lastID sql.NullString
 	var lastFromMe bool
 	var lastMs sql.NullInt64
@@ -1313,11 +1328,11 @@ func refresh(tx *sql.Tx, network, chat string) error {
 	_, err = tx.Exec(`UPDATE chats SET
 			last_message_id = ?,
 			last_from_me = ?,
-			last_activity_ms = MAX(last_activity_ms, ?),
+			last_activity_ms = MAX(last_activity_ms, ?, ?),
 			unread = ?,
 			history_from_ms = ?
 		WHERE network = ? AND chat_id = ?`,
-		lastID, lastFromMe && lastID.Valid, lastMs.Int64, unread, oldest, network, chat)
+		lastID, lastFromMe && lastID.Valid, lastMs.Int64, shownMs, unread, oldest, network, chat)
 	return err
 }
 
