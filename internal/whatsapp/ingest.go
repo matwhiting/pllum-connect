@@ -212,15 +212,32 @@ func (w *WhatsApp) ingest(evt *events.Message, source string) (prep, error) {
 	return p, w.apply(p)
 }
 
-// apply writes what prepare worked out.
+// apply writes what prepare worked out, in one batch.
 func (w *WhatsApp) apply(p prep) error {
+	if len(p.puts) == 0 && len(p.reactions) == 0 {
+		return nil
+	}
+	var refused error
+	err := w.st.Batch(Name, func(b *store.Batch) error {
+		refused = applyIn(b, p)
+		return nil // what was written before a refused write is kept
+	})
+	if err != nil {
+		return err
+	}
+	return refused
+}
+
+// applyIn writes what prepare worked out into a batch: its lines in order,
+// then its reactions, as apply always has.
+func applyIn(b *store.Batch, p prep) error {
 	for _, m := range p.puts {
-		if _, err := w.st.PutMessage(Name, m); err != nil {
+		if _, err := b.PutMessage(m); err != nil {
 			return err
 		}
 	}
 	for _, r := range p.reactions {
-		if err := w.st.SetReaction(Name, r.chatID, r.msgID, r.r); err != nil {
+		if err := b.SetReaction(r.chatID, r.msgID, r.r); err != nil {
 			return err
 		}
 	}

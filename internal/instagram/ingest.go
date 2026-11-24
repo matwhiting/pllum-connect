@@ -237,9 +237,29 @@ func (g *Instagram) lineOf(chat string, m *slidetypes.Message, source string) st
 	return line
 }
 
-// storeMessage writes one message, its edit and its reactions. A message
-// Meta shows as edited is written whole, then as the edit.
+// storeMessage writes one message, its edit and its reactions, in one
+// batch. A message Meta shows as edited is written whole, then as the edit.
 func (g *Instagram) storeMessage(chat string, m *slidetypes.Message, source string, asNotice bool) (added bool, err error) {
+	var after []func()
+	var refused error
+	err = g.st.Batch(Name, func(b *store.Batch) error {
+		added, refused = g.storeMessageIn(b, chat, m, source, asNotice, &after)
+		return nil // what was written before a refused write is kept
+	})
+	if err != nil {
+		return false, err
+	}
+	for _, f := range after {
+		f()
+	}
+	return added, refused
+}
+
+// storeMessageIn writes one message, its edit and its reactions into a
+// batch. What it does beyond the store (settling his send, keeping which
+// reaction message made a reaction) it adds to after, to run once the batch
+// is kept: those are writes of their own, which would wait for the batch.
+func (g *Instagram) storeMessageIn(b *store.Batch, chat string, m *slidetypes.Message, source string, asNotice bool, after *[]func()) (added bool, err error) {
 	if m == nil {
 		return false, nil
 	}
@@ -251,12 +271,12 @@ func (g *Instagram) storeMessage(chat string, m *slidetypes.Message, source stri
 		hidden := true
 		line.Kind, line.Hidden, line.Media, line.Raw = "notice", &hidden, nil, nil
 	}
-	if added, err = g.st.PutMessage(Name, line); err != nil {
+	if added, err = b.PutMessage(line); err != nil {
 		return false, err
 	}
-	g.echoed(m, line.ID) // his own message: the send it came from is sent
+	*after = append(*after, func() { g.echoed(m, line.ID) }) // his own message: the send it came from is sent
 	if len(m.SlideEditHistory) > 0 && line.Kind == "text" {
-		if _, err := g.st.PutMessage(Name, store.Message{ID: line.ID, ChatID: chat, Text: line.Text, Edited: true}); err != nil {
+		if _, err := b.PutMessage(store.Message{ID: line.ID, ChatID: chat, Text: line.Text, Edited: true}); err != nil {
 			return added, err
 		}
 	}
@@ -264,26 +284,46 @@ func (g *Instagram) storeMessage(chat string, m *slidetypes.Message, source stri
 		if r == nil || r.Reaction == "" {
 			continue
 		}
-		if err := g.setReaction(chat, line.ID, r); err != nil {
+		sender, fromMe := g.personOf(r.SenderFBID)
+		if err := b.SetReaction(chat, line.ID, store.Reaction{Emoji: r.Reaction, SenderID: sender, FromMe: fromMe}); err != nil {
 			return added, err
 		}
+		*after = append(*after, func() { g.keepReaction(line.ID, sender, r) })
 	}
 	return added, nil
 }
 
-// storeMessages writes a page of messages and counts the lines it added.
+// storeMessages writes a page of messages in one batch (review C1) and
+// counts the lines it added. A refused write ends the page, keeping what
+// was written before it, as writing a message at a time did; a batch the
+// store loses keeps none.
 func (g *Instagram) storeMessages(chat string, edges []slidetypes.Node[*slidetypes.Message], source string) (int, error) {
-	n := 0
-	for _, e := range edges {
-		added, err := g.storeMessage(chat, e.Node, source, false)
-		if err != nil {
-			return n, err
-		}
-		if added {
-			n++
-		}
+	if len(edges) == 0 {
+		return 0, nil
 	}
-	return n, nil
+	n := 0
+	var after []func()
+	var refused error
+	err := g.st.Batch(Name, func(b *store.Batch) error {
+		for _, e := range edges {
+			added, err := g.storeMessageIn(b, chat, e.Node, source, false, &after)
+			if added {
+				n++
+			}
+			if err != nil {
+				refused = err
+				return nil
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	for _, f := range after {
+		f()
+	}
+	return n, refused
 }
 
 // setReaction keeps one reaction, and which reaction message made it, for an
@@ -293,10 +333,16 @@ func (g *Instagram) setReaction(chat, msgID string, r *slidetypes.Reaction) erro
 	if err := g.st.SetReaction(Name, chat, msgID, store.Reaction{Emoji: r.Reaction, SenderID: sender, FromMe: fromMe}); err != nil {
 		return err
 	}
+	g.keepReaction(msgID, sender, r)
+	return nil
+}
+
+// keepReaction keeps which reaction message made a reaction, for an unsend
+// that names only that.
+func (g *Instagram) keepReaction(msgID, sender string, r *slidetypes.Reaction) {
 	if r.LogMessageID != "" {
 		_ = g.keep("reaction."+r.LogMessageID, msgID+"\n"+sender)
 	}
-	return nil
 }
 
 // storeThread writes what a thread says of its chat: kind, title, people,

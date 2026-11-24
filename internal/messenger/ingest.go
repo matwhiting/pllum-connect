@@ -311,7 +311,16 @@ func (m *Messenger) ingest(tbl *table.LSTable, source string) {
 		changed = true
 	}
 
+	// The table's lines land in one batch (review C1): one transaction and
+	// one refresh of each chat, not one for every line. A line the store
+	// refuses is passed over, as it always was; a batch the store loses
+	// keeps none of them, so none counts.
+	type placed struct {
+		chat, src string
+		w         *wrapped
+	}
 	added, got := map[int64]int{}, map[int64]int{}
+	var todo []placed
 	for _, w := range lines(tbl) {
 		chat, ok := m.placeKey(tc, w.ThreadKey)
 		if !ok {
@@ -322,16 +331,32 @@ func (m *Messenger) ingest(tbl *table.LSTable, source string) {
 		if w.upsert {
 			src = store.SourceSync
 		}
-		n, c, err := m.storeLine(chat, w, src)
-		if err != nil {
-			continue
-		}
-		added[w.ThreadKey] += n
-		if c {
-			changed = true // a line held already, sent again, changes nothing
-		}
-		if _, mine := m.personOf(w.SenderId); mine {
-			m.echoed(w.OfflineThreadingId, w.MessageId) // his send's echo settles it (writes.go)
+		todo = append(todo, placed{chat: chat, src: src, w: w})
+	}
+	if len(todo) > 0 {
+		stored := map[int64]int{}
+		var echoes []*wrapped
+		lineChanged := false
+		err := m.st.Batch(Name, func(b *store.Batch) error {
+			for _, t := range todo {
+				n, c, err := m.storeLine(b, t.chat, t.w, t.src)
+				if err != nil {
+					continue
+				}
+				stored[t.w.ThreadKey] += n
+				lineChanged = lineChanged || c // a line held already, sent again, changes nothing
+				if _, mine := m.personOf(t.w.SenderId); mine {
+					echoes = append(echoes, t.w)
+				}
+			}
+			return nil
+		})
+		if err == nil {
+			added = stored
+			changed = changed || lineChanged
+			for _, w := range echoes {
+				m.echoed(w.OfflineThreadingId, w.MessageId) // his send's echo settles it (writes.go)
+			}
 		}
 	}
 	for _, r := range tbl.LSReplaceOptimsiticMessage {
@@ -620,14 +645,15 @@ func (m *Messenger) members(tc *tableCtx, tbl *table.LSTable) bool {
 }
 
 // storeLine writes one line (and, for a line Meta shows as edited, the
-// edit): 1 when it made a new row; changed when anything Pllum shows
-// changed: a new row, or a row whose state differs after the write (an
-// early row from its edit or revoke taken over by the line, a new text,
+// edit) into a batch: 1 when it made a new row; changed when anything Pllum
+// shows changed: a new row, or a row whose state differs after the write
+// (an early row from its edit or revoke taken over by the line, a new text,
 // kind, edit or revoke). The same line sent again changes nothing (review
-// C1; fix round 3).
-func (m *Messenger) storeLine(chat string, w *wrapped, source string) (n int, changed bool, err error) {
-	b := bodyOf(w)
-	hidden := b.hidden
+// C1; fix round 3). The batch tells each write's change itself, so no
+// state is read before and after (quality review C1).
+func (m *Messenger) storeLine(b *store.Batch, chat string, w *wrapped, source string) (n int, changed bool, err error) {
+	bd := bodyOf(w)
+	hidden := bd.hidden
 	sender, fromMe := m.personOf(w.SenderId)
 	line := store.Message{
 		ID:         w.MessageId,
@@ -636,10 +662,10 @@ func (m *Messenger) storeLine(chat string, w *wrapped, source string) (n int, ch
 		SenderName: m.nameOf(w.SenderId),
 		FromMe:     fromMe,
 		TimeMs:     max(w.TimestampMs, 0),
-		Text:       b.text,
-		Kind:       b.kind,
+		Text:       bd.text,
+		Kind:       bd.kind,
 		Hidden:     &hidden,
-		Media:      b.media,
+		Media:      bd.media,
 		Source:     source,
 	}
 	if fromMe {
@@ -648,25 +674,24 @@ func (m *Messenger) storeLine(chat string, w *wrapped, source string) (n int, ch
 	if w.ReplySourceId != "" && w.ReplySourceType == 1 {
 		line.ReplyTo = w.ReplySourceId
 	}
-	if b.keepRaw {
+	if bd.keepRaw {
 		line.Raw = w.rawOf()
 	}
-	before, held := m.st.LineState(Name, chat, w.MessageId)
-	added, err := m.st.PutMessage(Name, line)
+	p, err := b.Put(line)
 	if err != nil {
 		return 0, false, err
 	}
 	m.seenLine(w.MessageId, chat)
+	var after store.Put
 	if w.IsUnsent {
-		_, _ = m.st.PutMessage(Name, store.Message{ID: w.MessageId, ChatID: chat, Deleted: true})
-	} else if w.EditCount > 0 && b.kind == "text" {
-		_, _ = m.st.PutMessage(Name, store.Message{ID: w.MessageId, ChatID: chat, Text: b.text, Edited: true})
+		after, _ = b.Put(store.Message{ID: w.MessageId, ChatID: chat, Deleted: true})
+	} else if w.EditCount > 0 && bd.kind == "text" {
+		after, _ = b.Put(store.Message{ID: w.MessageId, ChatID: chat, Text: bd.text, Edited: true})
 	}
-	if added {
+	if p.Added {
 		return 1, true, nil
 	}
-	after, _ := m.st.LineState(Name, chat, w.MessageId)
-	return 0, !held || after != before, nil
+	return 0, p.Changed || after.Changed, nil
 }
 
 // readThrough moves his read marker forward to ms.
@@ -909,39 +934,61 @@ func (m *Messenger) onFBMessage(evt *events.FBMessage) (bool, error) {
 	return changed, nil
 }
 
-// applyEnc writes what encPrep worked out. added counts the new rows;
-// changed reports whether anything Pllum shows changed: a new row, a row
-// whose state differs after the write (a hidden notice or an edit's early
-// row taken over by its line, a new text, kind, edit or revoke), or a
-// reaction. Only a line sent again unchanged changes nothing (reviews M1,
-// N1).
+// applyEnc writes what encPrep worked out, in one batch, then settles his
+// sends its lines carry. added counts the new rows; changed reports whether
+// anything Pllum shows changed: a new row, a row whose state differs after
+// the write (a hidden notice or an edit's early row taken over by its line,
+// a new text, kind, edit or revoke), or a reaction. Only a line sent again
+// unchanged changes nothing (reviews M1, N1).
 func (m *Messenger) applyEnc(chat string, w encWrites) (added int, changed bool, err error) {
+	var echoes []string
+	var refused error
+	err = m.st.Batch(Name, func(b *store.Batch) error {
+		added, changed, refused = m.applyEncIn(b, chat, w, &echoes)
+		return nil // what was written before a refused write is kept
+	})
+	if err != nil {
+		return 0, false, err
+	}
+	m.echoedEncryptedAll(echoes)
+	return added, changed, refused
+}
+
+// echoedEncryptedAll settles the encrypted sends his lines carry the IDs
+// of (writes.go), once the lines are kept.
+func (m *Messenger) echoedEncryptedAll(ids []string) {
+	for _, id := range ids {
+		m.echoedEncrypted(id)
+	}
+}
+
+// applyEncIn writes what encPrep worked out into a batch, as applyEnc
+// describes, and adds the IDs of his lines to echoes: their sends are
+// settled once the batch is kept, since settling is a write of its own. The
+// first write refused ends it, with the error, and what it wrote before
+// stays in the batch, as one at a time it stayed in the store.
+func (m *Messenger) applyEncIn(b *store.Batch, chat string, w encWrites, echoes *[]string) (added int, changed bool, err error) {
 	for _, l := range w.puts {
-		before, held := m.st.LineState(Name, l.ChatID, l.ID)
-		got, err := m.st.PutMessage(Name, l)
+		p, err := b.Put(l)
 		if err != nil {
 			return added, changed, err
 		}
 		if l.FromMe {
-			m.echoedEncrypted(l.ID) // his send coming back settles it (writes.go)
+			*echoes = append(*echoes, l.ID) // his send coming back settles it (writes.go)
 		}
-		if got {
+		if p.Added {
 			added++
-			changed = true
-			continue
 		}
-		if after, _ := m.st.LineState(Name, l.ChatID, l.ID); !held || after != before {
-			changed = true
-		}
+		changed = changed || p.Changed
 	}
 	for _, r := range w.reactions {
-		if err := m.st.SetReaction(Name, chat, r.msgID, r.r); err != nil {
+		if err := b.SetReaction(chat, r.msgID, r.r); err != nil {
 			return added, changed, err
 		}
 		changed = true
 	}
 	for _, id := range w.settle {
-		settled, err := m.st.SettlePlaceholder(Name, chat, id)
+		settled, err := b.SettlePlaceholder(chat, id)
 		if err != nil {
 			return added, changed, err
 		}

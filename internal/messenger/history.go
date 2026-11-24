@@ -743,6 +743,7 @@ func (m *Messenger) storeArchive(chat, thread string, group bool, fbid int64, ms
 		jid = watypes.NewJID(thread, watypes.GroupServer)
 	}
 	ok = true
+	var preps []encWrites
 	for _, dm := range msgs {
 		if dm == nil || dm.Message == nil {
 			continue
@@ -765,14 +766,32 @@ func (m *Messenger) storeArchive(chat, thread string, group bool, fbid int64, ms
 			paths = nil
 		}
 		w := m.encPrep(chat, evt, store.SourceSync, paths)
-		w = m.withSupplementals(chat, w, evt, dm, jid, fbid)
-		n, c, err := m.applyEnc(chat, w)
-		added += n
-		changed = changed || c
-		if err != nil {
-			ok = false
-		}
+		preps = append(preps, m.withSupplementals(chat, w, evt, dm, jid, fbid))
 	}
+	// The page's lines land in one batch (review C1), each line's writes
+	// as applyEnc makes them: one refused ends that line's, and the page
+	// goes on. A batch the store loses keeps none of them.
+	if len(preps) == 0 {
+		return 0, ok
+	}
+	var echoes []string
+	stored := 0
+	err := m.st.Batch(Name, func(b *store.Batch) error {
+		for _, w := range preps {
+			n, c, err := m.applyEncIn(b, chat, w, &echoes)
+			stored += n
+			changed = changed || c
+			if err != nil {
+				ok = false
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return 0, false
+	}
+	added = stored
+	m.echoedEncryptedAll(echoes)
 	if changed {
 		m.changed()
 	}

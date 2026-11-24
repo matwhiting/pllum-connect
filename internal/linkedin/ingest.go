@@ -139,37 +139,58 @@ func (l *LinkedIn) readOnly(chat string) {
 // chatOfMessage is the conversation a message is in: the one it names, else
 // the chat holding it already.
 func (l *LinkedIn) chatOfMessage(m linkedingo.Message) string {
+	return chatOfMessageBy(m, func(id string) (string, bool) { return l.st.ChatOfLine(Name, id) })
+}
+
+// chatOfMessageBy is chatOfMessage, asking chatOfLine for the chat holding
+// a line (in a batch, the batch's own, which sees its lines).
+func chatOfMessageBy(m linkedingo.Message, chatOfLine func(id string) (string, bool)) string {
 	if id := cmp.Or(urnString(m.Conversation.EntityURN), urnString(m.ConversationURN)); isConversation(id) {
 		return id
 	}
-	if chat, ok := l.st.ChatOfLine(Name, urnString(m.EntityURN)); ok {
+	if chat, ok := chatOfLine(urnString(m.EntityURN)); ok {
 		return chat
 	}
 	return ""
 }
 
-// storeMessages writes messages as lines, each before it returns, and reports
-// whether any was a line the store already held (so a page reached what was
-// stored). The same URN is always the same row, from a page or the stream.
+// storeMessages writes messages as lines, in one batch (review C1), and
+// reports whether any was a line the store already held (so a page reached
+// what was stored). The same URN is always the same row, from a page or the
+// stream. A line the store refuses is passed over, as it always was.
 func (l *LinkedIn) storeMessages(msgs []linkedingo.Message, source string) (heldAny bool) {
-	for _, m := range msgs {
-		id := urnString(m.EntityURN)
-		chat := l.chatOfMessage(m)
-		if id == "" || chat == "" {
-			continue
-		}
-		st, ok := l.st.LineState(Name, chat, id)
-		held := ok && !st.Early
-		heldAny = heldAny || held
-		l.storeMessage(m, chat, id, source, held)
+	if len(msgs) == 0 {
+		return false
 	}
+	_ = l.st.Batch(Name, func(b *store.Batch) error {
+		for _, m := range msgs {
+			id := urnString(m.EntityURN)
+			chat := chatOfMessageBy(m, b.ChatOfLine)
+			if id == "" || chat == "" {
+				continue
+			}
+			st, ok := b.LineState(chat, id)
+			held := ok && !st.Early
+			heldAny = heldAny || held
+			l.storeMessageIn(b, m, chat, id, source, held)
+		}
+		return nil
+	})
 	return heldAny
 }
 
-// storeMessage writes one message: a whole line, then an edit or a recall
+// storeMessage writes one message in a batch of its own (storeMessageIn).
+func (l *LinkedIn) storeMessage(m linkedingo.Message, chat, id, source string, held bool) {
+	_ = l.st.Batch(Name, func(b *store.Batch) error {
+		l.storeMessageIn(b, m, chat, id, source, held)
+		return nil
+	})
+}
+
+// storeMessageIn writes one message into a batch: a whole line, then an edit or a recall
 // over it (a line first seen edited or recalled is written whole first, so
 // it has its time and side), and its reaction counts.
-func (l *LinkedIn) storeMessage(m linkedingo.Message, chat, id, source string, held bool) {
+func (l *LinkedIn) storeMessageIn(batch *store.Batch, m linkedingo.Message, chat, id, source string, held bool) {
 	b := bodyOf(m)
 	self := l.self()
 	sender := profileID(m.Sender.EntityURN)
@@ -196,21 +217,21 @@ func (l *LinkedIn) storeMessage(m linkedingo.Message, chat, id, source string, h
 			whole.Text, whole.Kind, whole.Media, whole.Raw = "", "text", nil, nil
 			hidden := false
 			whole.Hidden = &hidden
-			_, _ = l.st.PutMessage(Name, whole)
+			_, _ = batch.PutMessage(whole)
 		}
-		_, _ = l.st.PutMessage(Name, store.Message{ID: id, ChatID: chat, TimeMs: whole.TimeMs, Deleted: true, Source: source})
+		_, _ = batch.PutMessage(store.Message{ID: id, ChatID: chat, TimeMs: whole.TimeMs, Deleted: true, Source: source})
 	case linkedingo.MessageBodyRenderFormatEdited:
 		if !held {
-			_, _ = l.st.PutMessage(Name, whole)
+			_, _ = batch.PutMessage(whole)
 		}
-		_, _ = l.st.PutMessage(Name, store.Message{ID: id, ChatID: chat, Text: b.text, Edited: true, Source: source})
+		_, _ = batch.PutMessage(store.Message{ID: id, ChatID: chat, Text: b.text, Edited: true, Source: source})
 	case linkedingo.MessageBodyRenderFormatSystem:
 		whole.Kind, whole.Media, whole.Raw, whole.ReplyTo = "notice", nil, nil, ""
 		hidden := true
 		whole.Hidden = &hidden
-		_, _ = l.st.PutMessage(Name, whole)
+		_, _ = batch.PutMessage(whole)
 	default:
-		_, _ = l.st.PutMessage(Name, whole)
+		_, _ = batch.PutMessage(whole)
 	}
 	// A page's copy is the message whole, so its counts replace what is held,
 	// none included; the stream's carries them only sometimes.
@@ -221,7 +242,7 @@ func (l *LinkedIn) storeMessage(m linkedingo.Message, chat, id, source string, h
 				summary = append(summary, store.Reaction{Emoji: r.Emoji, FromMe: r.ViewerReacted})
 			}
 		}
-		_ = l.st.SetReactionSummary(Name, chat, id, summary)
+		_ = batch.SetReactionSummary(chat, id, summary)
 	}
 }
 

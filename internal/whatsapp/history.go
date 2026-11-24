@@ -312,13 +312,34 @@ func (w *WhatsApp) storeConversation(cli waClient, conv *waHistorySync.Conversat
 			return "", 0, err
 		}
 	}
-	for _, p := range preps {
-		if err := w.apply(p); err != nil {
+	// The lines land in batches (review C1): one transaction and one
+	// refresh of the chat for each, not one for every line. A batch is
+	// capped, so a long conversation never holds the store's writes for
+	// long. A refused write fails the conversation, keeping what was
+	// written before it, as it always has.
+	for start := 0; start < len(preps); start += historyBatch {
+		chunk := preps[start:min(start+historyBatch, len(preps))]
+		var refused error
+		err := w.st.Batch(Name, func(b *store.Batch) error {
+			for _, p := range chunk {
+				if refused = applyIn(b, p); refused != nil {
+					return nil
+				}
+			}
+			return nil
+		})
+		if err == nil {
+			err = refused
+		}
+		if err != nil {
 			return "", 0, err
 		}
 	}
 	return chatID, n, nil
 }
+
+// historyBatch is the most history messages one batch writes.
+const historyBatch = 500
 
 // chatInfo is what a history conversation says about its chat.
 func (w *WhatsApp) chatInfo(chatID string, jid types.JID, conv *waHistorySync.Conversation) store.ChatInfo {
