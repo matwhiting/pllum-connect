@@ -1,6 +1,8 @@
 package store
 
 import (
+	"database/sql"
+	"fmt"
 	"slices"
 	"testing"
 )
@@ -400,5 +402,84 @@ func TestACaptionlessMediaLineTakesOverByItsKind(t *testing.T) {
 	// A media kind with no media entries still shows.
 	if c := chatOf(t, s, phoneChat); c.LastMessageID != "3EB0C0002" {
 		t.Fatalf("lastMessageID = %q", c.LastMessageID)
+	}
+}
+
+// TestCopyNearSkipsOnlyWhatCouldNotMatch checks copyNear against the
+// lookups it lets a write skip: for every line it says has no copy near,
+// beeperLineNaming and beeperLineLike find nothing, and it does say so for
+// the lines that are near.
+func TestCopyNearSkipsOnlyWhatCouldNotMatch(t *testing.T) {
+	s := openTest(t)
+	put(t, s, text(phoneChat, "3EB0CN0000", base-90_000, "a direct line"))
+	put(t, s, text(phoneChat, "3EB0CN0099", base+30_000, "hello"))
+	seedCopies(t, s, phoneChat, "bc-1",
+		copyLine{beeperID: "bm-1", ms: base, text: "hello"},
+		copyLine{beeperID: "bm-2", ms: base + 10_000, text: "Alex hi", fromMe: true},
+		copyLine{beeperID: "bm-3", ms: base + 20_000, kind: "photo"},
+		copyLine{beeperID: "bm-4", ms: base + 40_000, text: "named", networkID: "3EB0CN0004"})
+	seedCopies(t, s, otherChat, "bc-2", copyLine{beeperID: "bm-5", ms: base, text: "hello"})
+
+	var skipped, near int
+	err := s.write(func(tx *sql.Tx) error {
+		for _, chat := range []string{phoneChat, otherChat, groupChat} {
+			for _, d := range []int64{-60_000, -2001, -2000, -1, 0, 1, 2000, 2001, 9_999, 10_000, 20_000, 30_000, 40_000, 120_000} {
+				for _, fromMe := range []bool{false, true} {
+					for _, body := range []string{"hello", "Alex hi", "", "named"} {
+						for _, id := range []string{"3EB0CN0001", "3EB0CN0004"} {
+							m := text(chat, id, base+d, body)
+							m.FromMe = fromMe
+							if body == "" {
+								m.Kind, m.Media = "photo", []Media{{Kind: "photo"}}
+							}
+							ok, err := copyNear(tx, net, chat, m.ID, m.TimeMs, isWhole(m))
+							if err != nil {
+								return err
+							}
+							if ok {
+								near++
+								continue
+							}
+							skipped++
+							rid, _, err := beeperLineNaming(tx, net, m)
+							if err != nil {
+								return err
+							}
+							like, _, err := beeperLineLike(tx, net, m, 0)
+							if err != nil {
+								return err
+							}
+							if rid != 0 || like != 0 {
+								return fmt.Errorf("%s at %+d (fromMe %v, %q, %s): skipped, but naming %d, like %d",
+									chat, d, fromMe, body, id, rid, like)
+							}
+						}
+					}
+				}
+			}
+		}
+		// News about a line (an edit, with no time) is looked up by its ID
+		// alone: near when a copy names it, else nothing to find.
+		for id, want := range map[string]bool{"3EB0CN0004": true, "3EB0CN0001": false} {
+			m := Message{ID: id, ChatID: phoneChat, Text: "renamed", Edited: true}
+			ok, err := copyNear(tx, net, phoneChat, id, m.TimeMs, isWhole(m))
+			if err != nil {
+				return err
+			}
+			rid, _, err := beeperLineNaming(tx, net, m)
+			if err != nil {
+				return err
+			}
+			if ok != want || (rid != 0) != want {
+				return fmt.Errorf("an edit of %s: near %v, naming %d; want %v", id, ok, rid, want)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if skipped == 0 || near == 0 {
+		t.Fatalf("skipped %d, near %d: the grid tests nothing", skipped, near)
 	}
 }

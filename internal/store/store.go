@@ -46,7 +46,8 @@ const (
 // The networks can still deliver the lines they copied (history syncs,
 // backfills, older pages), so a direct line still takes over its copy
 // (putNewID, absorbBeeperCopy) and a merge still joins a copy to its line
-// (mergeLine).
+// (mergeLine); a write whose chat holds no copy near it skips all of that
+// in one query (copyNear).
 
 // beeperPrefix starts the ID of a line that exists only in Beeper's copy.
 const beeperPrefix = "beeper:"
@@ -1103,16 +1104,23 @@ func isReceipt(m Message) bool {
 //     ID (or Beeper's copy naming it), lands in it and stays edited, deleted
 //     or hidden.
 func putNewID(tx *sql.Tx, network string, m Message, media any) (added bool, err error) {
-	rid, oldID, err := beeperLineNaming(tx, network, m)
+	near, err := copyNear(tx, network, m.ChatID, m.ID, m.TimeMs, isWhole(m))
 	if err != nil {
 		return false, err
+	}
+	var rid int64
+	var oldID string
+	if near {
+		if rid, oldID, err = beeperLineNaming(tx, network, m); err != nil {
+			return false, err
+		}
 	}
 	switch {
 	case rid != 0 && isWhole(m):
 		return false, takeOver(tx, network, rid, oldID, m, media, false)
 	case rid != 0:
 		return false, updateLine(tx, rid, m, media, false)
-	case isWhole(m):
+	case isWhole(m) && near:
 		if rid, oldID, err = beeperLineLike(tx, network, m, 0); err != nil {
 			return false, err
 		}
@@ -1126,6 +1134,24 @@ func putNewID(tx *sql.Tx, network string, m Message, media any) (added bool, err
 		return false, err
 	}
 	return true, nil
+}
+
+// copyNear reports whether chat holds a line of Beeper's copy that a line
+// arriving with ID id could be: one naming id as its network ID, or, when
+// byTime (a whole line, the only kind that matches by content), one within
+// matchWindowMs of ms. When it holds none, beeperLineNaming, beeperLineLike
+// and beeperTwin can find nothing (each looks only at copied lines, named by
+// id or in that window), so a write skips them in this one query: every
+// line written live, whose time is after the last copy was made, and every
+// line in a chat that holds no copy.
+func copyNear(tx *sql.Tx, network, chat, id string, ms int64, byTime bool) (bool, error) {
+	var near bool
+	err := tx.QueryRow(`SELECT EXISTS (SELECT 1 FROM messages
+				WHERE network = ?1 AND chat_id = ?2 AND network_id = ?3 AND source = 'beeper')
+			OR (?4 AND EXISTS (SELECT 1 FROM messages
+				WHERE network = ?1 AND chat_id = ?2 AND ts_ms BETWEEN ?5 AND ?6 AND source = 'beeper'))`,
+		network, chat, id, byTime, ms-matchWindowMs, ms+matchWindowMs).Scan(&near)
+	return near, err
 }
 
 // insertLine adds m as a new row: a line when it is whole, else an early row.
@@ -1192,6 +1218,15 @@ func updateLine(tx *sql.Tx, rid int64, m Message, media any, whole bool) error {
 // Beeper's). A Beeper line from a Beeper chat the line already carries a
 // message of is a different message.
 func absorbBeeperCopy(tx *sql.Tx, network string, rid int64) error {
+	// The copies this could fold are all within the window of the line's
+	// time, in its chat: with none there, nothing is read further.
+	var near bool
+	if err := tx.QueryRow(`SELECT EXISTS (SELECT 1 FROM messages AS d JOIN messages AS b
+				ON b.network = d.network AND b.chat_id = d.chat_id
+				AND b.ts_ms BETWEEN d.ts_ms - ?2 AND d.ts_ms + ?2 AND b.source = 'beeper'
+			WHERE d.rid = ?1)`, rid, matchWindowMs).Scan(&near); err != nil || !near {
+		return err
+	}
 	m, _, _, err := loadLine(tx, rid)
 	if err != nil {
 		return err
