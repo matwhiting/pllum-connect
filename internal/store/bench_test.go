@@ -258,3 +258,26 @@ func BenchmarkNextChatByPages(b *testing.B) {
 		}
 	}
 }
+
+// BenchmarkNextChatByIDs is the same walk through ChatIDs, as LinkedIn finds
+// its next chat now: chat IDs only, narrowed in the query.
+func BenchmarkNextChatByIDs(b *testing.B) {
+	s := openFixture(b)
+	for b.Loop() {
+		cursor, seen := "", 0
+		for range 50 {
+			ids, next, err := s.ChatIDs(net, ChatFilter{Writable: true, HistoryOpen: true}, cursor, 200)
+			if err != nil {
+				b.Fatal(err)
+			}
+			seen += len(ids)
+			if next == "" {
+				break
+			}
+			cursor = next
+		}
+		if seen != benchChats {
+			b.Fatalf("walked %d chats", seen)
+		}
+	}
+}

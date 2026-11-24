@@ -539,23 +539,11 @@ func (l *LinkedIn) listFolder(ctx context.Context, gen int, cli liClient, folder
 // newestStored is the newest activity of a LinkedIn conversation the store
 // holds; ok is false when it holds none.
 func (l *LinkedIn) newestStored() (time.Time, bool) {
-	cursor := ""
-	for range 50 {
-		page, err := l.st.Chats(Name, 0, cursor, 200)
-		if err != nil {
-			return time.Time{}, false
-		}
-		for _, c := range page.Items {
-			if isConversation(c.ID) && c.LastActivityMs > 0 {
-				return time.UnixMilli(c.LastActivityMs), true
-			}
-		}
-		if page.Cursor == "" {
-			break
-		}
-		cursor = page.Cursor
+	ms, ok, err := l.st.NewestActivity(Name, conversationPrefix)
+	if err != nil || !ok {
+		return time.Time{}, false
 	}
-	return time.Time{}, false
+	return time.UnixMilli(ms), true
 }
 
 // storeConversations stores conversations and marks each one with activity
@@ -579,8 +567,8 @@ func (l *LinkedIn) storeConversations(convs []linkedingo.Conversation) {
 // isn't there (gone) is cleared too. A passing failure keeps the mark, and
 // the chat is set aside (pass).
 func (l *LinkedIn) freshStep(ctx context.Context, gen int, cli liClient) (did bool, err error) {
-	chat, ok := l.nextChat(func(c store.Chat) bool {
-		return !c.ReadOnly && l.value("fresh."+c.ID) != "" && !l.passedOver(c.ID)
+	chat, ok := l.nextChat(store.ChatFilter{Writable: true}, func(chat string) bool {
+		return l.value("fresh."+chat) != "" && !l.passedOver(chat)
 	})
 	if !ok {
 		return false, nil
@@ -707,29 +695,32 @@ func (l *LinkedIn) historyPaged(chat, cursor string, page *linkedingo.Collection
 // nextHistoryChat is the newest LinkedIn conversation whose history has more
 // to page: not at its start, not paged to 730 days, not read-only.
 func (l *LinkedIn) nextHistoryChat() (string, bool) {
-	return l.nextChat(func(c store.Chat) bool {
-		return !c.HistoryComplete && !c.ReadOnly && l.value("histDone."+c.ID) == "" && !l.passedOver(c.ID)
+	return l.nextChat(store.ChatFilter{Writable: true, HistoryOpen: true}, func(chat string) bool {
+		return l.value("histDone."+chat) == "" && !l.passedOver(chat)
 	})
 }
 
-// nextChat is the newest LinkedIn conversation the store holds for which
-// want is true.
-func (l *LinkedIn) nextChat(want func(c store.Chat) bool) (string, bool) {
+// nextChat is the newest LinkedIn conversation the store holds that f lets
+// through and want is true for. The store narrows by what it holds (review
+// C2), so only the IDs of conversations it lets through are read, and want
+// is asked only of those.
+func (l *LinkedIn) nextChat(f store.ChatFilter, want func(chat string) bool) (string, bool) {
+	f.Prefix = conversationPrefix
 	cursor := ""
 	for range 50 {
-		page, err := l.st.Chats(Name, 0, cursor, 200)
+		ids, next, err := l.st.ChatIDs(Name, f, cursor, 200)
 		if err != nil {
 			return "", false
 		}
-		for _, c := range page.Items {
-			if isConversation(c.ID) && want(c) {
-				return c.ID, true
+		for _, id := range ids {
+			if want(id) {
+				return id, true
 			}
 		}
-		if page.Cursor == "" {
+		if next == "" {
 			break
 		}
-		cursor = page.Cursor
+		cursor = next
 	}
 	return "", false
 }

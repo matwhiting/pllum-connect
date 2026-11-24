@@ -82,26 +82,58 @@ func scanChat(rows interface{ Scan(...any) error }) (Chat, int64, error) {
 	return c, rid, err
 }
 
+// participants reads a chat's participants (participantsOf, for one).
 func (s *Store) participants(network, chat string) ([]Participant, error) {
-	rows, err := s.db.Query(`SELECT participant_id, name, phone, is_self FROM participants
-			WHERE network = ? AND chat_id = ? ORDER BY position, participant_id LIMIT ?`,
-		network, chat, maxParticipants)
-	if err != nil {
-		return nil, err
+	by, err := participantsOf(s.db, network, []string{chat})
+	return by[chat], err
+}
+
+// participantsOf reads the participants of several chats at once, by chat:
+// each chat's first maxParticipants in position order, and an empty list
+// for a chat with none. One query for a page, not one a chat. The cap is
+// kept here rather than in SQL: a window function per chat cost more on a
+// page of 200 than the rows past the cap a very large group adds.
+func participantsOf(q querier, network string, chats []string) (map[string][]Participant, error) {
+	out := make(map[string][]Participant, len(chats))
+	for _, c := range chats {
+		out[c] = []Participant{}
 	}
-	defer rows.Close()
-	out := []Participant{}
-	for rows.Next() {
-		var p Participant
-		var name, phone sql.NullString
-		if err := rows.Scan(&p.ID, &name, &phone, &p.IsSelf); err != nil {
+	for start := 0; start < len(chats); start += maxIn {
+		chunk := chats[start:min(start+maxIn, len(chats))]
+		args := []any{network}
+		for _, c := range chunk {
+			args = append(args, c)
+		}
+		rows, err := q.Query(`SELECT chat_id, participant_id, name, phone, is_self FROM participants
+				WHERE network = ? AND chat_id IN (?`+strings.Repeat(", ?", len(chunk)-1)+`)
+				ORDER BY chat_id, position, participant_id`, args...)
+		if err != nil {
 			return nil, err
 		}
-		p.Name, p.Phone = name.String, phone.String
-		out = append(out, p)
+		for rows.Next() {
+			var chat string
+			var p Participant
+			var name, phone sql.NullString
+			if err := rows.Scan(&chat, &p.ID, &name, &phone, &p.IsSelf); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			p.Name, p.Phone = name.String, phone.String
+			if len(out[chat]) < maxParticipants {
+				out[chat] = append(out[chat], p)
+			}
+		}
+		err = rows.Err()
+		rows.Close()
+		if err != nil {
+			return nil, err
+		}
 	}
-	return out, rows.Err()
+	return out, nil
 }
+
+// maxIn is the most values one IN (...) list carries.
+const maxIn = 500
 
 // Chats is a page of chats active since sinceMs, newest activity first.
 // Unplaced chats are among them, read-only.
@@ -151,15 +183,100 @@ func (s *Store) Chats(network string, sinceMs int64, cursor string, limit int) (
 		last := page.Items[limit-1]
 		page.Cursor = encodeCursor(last.LastActivityMs, rids[limit-1])
 	}
+	chats := make([]string, len(page.Items))
+	for i, c := range page.Items {
+		chats[i] = c.ID
+	}
+	people, err := participantsOf(s.db, network, chats)
+	if err != nil {
+		return ChatPage{}, dbErr(err)
+	}
 	for i := range page.Items {
-		if page.Items[i].Participants, err = s.participants(network, page.Items[i].ID); err != nil {
-			return ChatPage{}, dbErr(err)
-		}
+		page.Items[i].Participants = people[page.Items[i].ID]
 	}
 	if page.Items == nil {
 		page.Items = []Chat{}
 	}
 	return page, nil
+}
+
+// ChatFilter narrows ChatIDs. Zero values narrow nothing.
+type ChatFilter struct {
+	Prefix      string // only chats whose ID starts with this
+	Writable    bool   // only chats not read-only
+	HistoryOpen bool   // only chats whose history is not complete
+}
+
+// ChatIDs is a page of a network's chat IDs, newest activity first as Chats
+// orders them, narrowed by f, with nothing else read: for a network looking
+// for the next chat to work on. next, passed as cursor, gives the page after
+// this one, and is empty on the last.
+func (s *Store) ChatIDs(network string, f ChatFilter, cursor string, limit int) (ids []string, next string, err error) {
+	if err := s.ready(); err != nil {
+		return nil, "", err
+	}
+	limit, err = pageLimit(limit, maxChats)
+	if err != nil {
+		return nil, "", err
+	}
+	q := `SELECT chat_id, last_activity_ms, rid FROM chats WHERE network = ?`
+	args := []any{network}
+	if f.Prefix != "" {
+		q += ` AND substr(chat_id, 1, ?) = ?`
+		args = append(args, len(f.Prefix), f.Prefix)
+	}
+	if f.Writable {
+		q += ` AND read_only = 0`
+	}
+	if f.HistoryOpen {
+		q += ` AND history_complete = 0`
+	}
+	if cursor != "" {
+		ms, rid, err := decodeCursor(cursor)
+		if err != nil {
+			return nil, "", err
+		}
+		q += ` AND (last_activity_ms < ? OR (last_activity_ms = ? AND rid < ?))`
+		args = append(args, ms, ms, rid)
+	}
+	q += ` ORDER BY last_activity_ms DESC, rid DESC LIMIT ?`
+	args = append(args, limit+1)
+	rows, err := s.db.Query(q, args...)
+	if err != nil {
+		return nil, "", dbErr(err)
+	}
+	defer rows.Close()
+	var lastMs, lastRid int64
+	for rows.Next() {
+		if len(ids) == limit {
+			next = encodeCursor(lastMs, lastRid)
+			break
+		}
+		var id string
+		if err := rows.Scan(&id, &lastMs, &lastRid); err != nil {
+			return nil, "", dbErr(err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, "", dbErr(err)
+	}
+	return ids, next, nil
+}
+
+// NewestActivity is the newest activity among a network's chats whose ID
+// starts with prefix; ok is false when none has any.
+func (s *Store) NewestActivity(network, prefix string) (ms int64, ok bool, err error) {
+	if err := s.ready(); err != nil {
+		return 0, false, err
+	}
+	var newest sql.NullInt64
+	if err := s.db.QueryRow(`SELECT MAX(last_activity_ms) FROM chats
+			WHERE network = ? AND substr(chat_id, 1, ?) = ? AND last_activity_ms > 0`,
+		network, len(prefix), prefix).Scan(&newest); err != nil {
+		return 0, false, dbErr(err)
+	}
+	return newest.Int64, newest.Valid, nil
 }
 
 // Chat is one chat, found by its ID or an alias; ok is false when there is
@@ -259,33 +376,66 @@ func (s *Store) readMessages(network, q string, args ...any) ([]Message, []int64
 	if err != nil {
 		return nil, nil, err
 	}
-	for i := range out {
-		if out[i].Reactions, err = s.reactions(network, out[i].ChatID, out[i].ID); err != nil {
-			return nil, nil, err
-		}
+	if err := reactionsOf(s.db, network, out); err != nil {
+		return nil, nil, err
 	}
 	return out, rids, nil
 }
 
-func (s *Store) reactions(network, chat, msgID string) ([]Reaction, error) {
-	rows, err := s.db.Query(`SELECT emoji, sender_id, from_me FROM reactions
-			WHERE network = ? AND chat_id = ? AND msg_id = ? ORDER BY sender_id`, network, chat, msgID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	out := []Reaction{}
-	for rows.Next() {
-		var r Reaction
-		if err := rows.Scan(&r.Emoji, &r.SenderID, &r.FromMe); err != nil {
-			return nil, err
+// reactionsOf gives each line its reactions, ordered by sender, and an
+// empty list a line with none: one query for each chat the lines are in,
+// not one a line. A count per emoji (summarySender) is from no one in
+// particular, so its senderID is empty.
+func reactionsOf(q querier, network string, ms []Message) error {
+	byChat := map[string][]int{}
+	var order []string
+	for i := range ms {
+		ms[i].Reactions = []Reaction{}
+		if _, ok := byChat[ms[i].ChatID]; !ok {
+			order = append(order, ms[i].ChatID)
 		}
-		if strings.HasPrefix(r.SenderID, summarySender) {
-			r.SenderID = "" // a count per emoji, from no one in particular
-		}
-		out = append(out, r)
+		byChat[ms[i].ChatID] = append(byChat[ms[i].ChatID], i)
 	}
-	return out, rows.Err()
+	for _, chat := range order {
+		lines := byChat[chat]
+		at := make(map[string]int, len(lines))
+		for _, i := range lines {
+			at[ms[i].ID] = i
+		}
+		for start := 0; start < len(lines); start += maxIn {
+			chunk := lines[start:min(start+maxIn, len(lines))]
+			args := []any{network, chat}
+			for _, i := range chunk {
+				args = append(args, ms[i].ID)
+			}
+			rows, err := q.Query(`SELECT msg_id, emoji, sender_id, from_me FROM reactions
+					WHERE network = ? AND chat_id = ? AND msg_id IN (?`+strings.Repeat(", ?", len(chunk)-1)+`)
+					ORDER BY msg_id, sender_id`, args...)
+			if err != nil {
+				return err
+			}
+			for rows.Next() {
+				var id string
+				var r Reaction
+				if err := rows.Scan(&id, &r.Emoji, &r.SenderID, &r.FromMe); err != nil {
+					rows.Close()
+					return err
+				}
+				if strings.HasPrefix(r.SenderID, summarySender) {
+					r.SenderID = ""
+				}
+				if i, ok := at[id]; ok {
+					ms[i].Reactions = append(ms[i].Reactions, r)
+				}
+			}
+			err = rows.Err()
+			rows.Close()
+			if err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 // Messages is a page of a chat's lines, oldest first within the page, from
