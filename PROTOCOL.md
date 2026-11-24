@@ -2,7 +2,7 @@
 
 The contract between Pllum and this helper. Pllum refuses any other protocol version.
 
-**Transport.** One JSON object per line, UTF-8, `\n`-terminated, at most 16 MiB a line. Pllum writes requests to the helper's standard input; the helper writes responses and events to its standard output and nothing else. Standard error is never read for content. End of input means "shut down": the helper disconnects and exits within 5 s.
+**Transport.** One JSON object per line, UTF-8, `\n`-terminated, at most 16 MiB a line. Pllum writes requests to the helper's standard input; the helper writes responses and events to its standard output and nothing else. (Its one log is Messenger's diagnostics file in its data folder, counts and warnings with no message text or ID; see Messenger below.) Standard error is never read for content. End of input means "shut down": the helper disconnects and exits within 5 s.
 
 **Shapes.**
 - Request: `{"id":"<string>","method":"<name>","params":{…}}`. IDs are Pllum's, unique while the helper runs. Every method but `hello` carries `"network"` in its params.

@@ -1,6 +1,6 @@
 # Pllum Connect
 
-Pllum Connect is Pllum's network helper. Pllum, a macOS inbox, starts it as a child process and talks to it in JSON lines over its standard input and output. The helper keeps an encrypted message store on the Mac, seals the media it downloads (PROTOCOL.md, Media at rest), and connects to the messaging networks Pllum reads and sends through. It writes nothing anywhere else: no logs, and nothing on standard error.
+Pllum Connect is Pllum's network helper. Pllum, a macOS inbox, starts it as a child process and talks to it in JSON lines over its standard input and output. The helper keeps an encrypted message store on the Mac, seals the media it downloads (PROTOCOL.md, Media at rest), and connects to the messaging networks Pllum reads and sends through. Besides the store, the sealed media and a few small state files in its data folder, it writes one log, Messenger's diagnostics file `messenger/diagnostics.txt` (0600, started again past 64 KB). That file holds the encrypted side's warnings and self-checks as words, yes/no answers and counts, with every other number replaced by `#`. It never holds a word of a message, an ID, a JID or a device number (PROTOCOL.md, Messenger). The helper writes nothing on standard error.
 
 The protocol is in [PROTOCOL.md](PROTOCOL.md).
 
