@@ -372,7 +372,7 @@ func (m *Messenger) writeCtx() (context.Context, context.CancelFunc) {
 // client is signed in.
 func (m *Messenger) writer() (int, msgrWriter) {
 	m.mu.Lock()
-	gen, cli, e := m.gen, m.cli, m.e2ee
+	gen, cli, e := m.runs.Gen, m.cli, m.e2ee
 	m.mu.Unlock()
 	if cli == nil || m.newWriter == nil {
 		return gen, nil
@@ -527,13 +527,13 @@ func (m *Messenger) Send(ctx context.Context, o network.Outgoing) (string, error
 		return "", errInternal
 	}
 	if err := m.st.PutOutgoing(Name, store.Outgoing{ID: id, ChatID: chat, Kind: outMessage, Client: o.ClientID,
-		MadeMs: m.now().UnixMilli(), Request: body}); err != nil {
+		MadeMs: m.clock.Now().UnixMilli(), Request: body}); err != nil {
 		if raced, held, rerr := m.keyed(o.ClientID, chat); rerr == nil && held {
 			return raced.ID, nil // another call with this key kept it first, and sends it
 		}
 		return "", err
 	}
-	m.enqueue(id)
+	m.outbox.Enqueue(id)
 	return id, nil
 }
 
@@ -572,28 +572,28 @@ func (m *Messenger) resume(o store.Outgoing) (string, error) {
 	if err := m.writeGate(); err != nil {
 		return "", err
 	}
-	m.smu.Lock()
+	m.rmu.Lock()
 	cur, ok, err := m.st.Outgoing(Name, o.ID)
 	if err != nil || !ok {
-		m.smu.Unlock()
+		m.rmu.Unlock()
 		return "", cmp.Or[error](err, errNotFound)
 	}
 	if cur.State != store.OutFailed {
-		m.smu.Unlock()
+		m.rmu.Unlock()
 		return cur.ID, nil // already going again
 	}
 	p := progressOf(cur)
 	p.Asking = false
 	if err := m.keepProgress(cur.ID, p); err != nil {
-		m.smu.Unlock()
+		m.rmu.Unlock()
 		return "", err
 	}
 	if err := m.st.SetOutgoingState(Name, cur.ID, store.OutSending, ""); err != nil {
-		m.smu.Unlock()
+		m.rmu.Unlock()
 		return "", err
 	}
-	m.smu.Unlock()
-	m.enqueue(cur.ID)
+	m.rmu.Unlock()
+	m.outbox.Enqueue(cur.ID)
 	return cur.ID, nil
 }
 
@@ -705,54 +705,17 @@ func readSendFile(req sendRequest) ([]byte, error) {
 	return data, nil
 }
 
-// enqueue puts a send in line; one goroutine sends them, in order.
-func (m *Messenger) enqueue(id string) {
-	m.busy.Add(1)
-	m.smu.Lock()
-	m.queue = append(m.queue, id)
-	if m.draining {
-		m.smu.Unlock()
-		return
-	}
-	m.draining = true
-	m.smu.Unlock()
+// beginSends starts the goroutine that sends what is in line (the
+// outbox's Begin): counted in the network's work, under the network's
+// context; false once it has begun stopping.
+func (m *Messenger) beginSends() (context.Context, bool) {
 	m.mu.Lock()
+	defer m.mu.Unlock()
 	ok := m.started && !m.stopped
 	if ok {
 		m.work.Add(1)
 	}
-	ctx := m.ctx
-	m.mu.Unlock()
-	if !ok {
-		m.drain(nil)
-		return
-	}
-	go func() {
-		defer m.work.Done()
-		m.drain(ctx)
-	}()
-}
-
-// drain sends what is in line until none is left. A send whose turn comes
-// after the helper began stopping never went: refused.
-func (m *Messenger) drain(ctx context.Context) {
-	for {
-		m.smu.Lock()
-		if len(m.queue) == 0 {
-			m.draining = false
-			m.smu.Unlock()
-			return
-		}
-		id := m.queue[0]
-		m.queue = m.queue[1:]
-		m.smu.Unlock()
-		if ctx == nil || ctx.Err() != nil {
-			m.failStopped(id)
-		} else {
-			m.deliver(id)
-		}
-		m.busy.Add(-1)
-	}
+	return m.ctx, ok
 }
 
 // failStopped fails a send whose turn came after the helper began
@@ -978,7 +941,7 @@ func (s *sender) upload(data []byte) error {
 		b, err := proto.Marshal(&waMediaTransport.WAMediaTransport{
 			Integral: &waMediaTransport.WAMediaTransport_Integral{
 				FileSHA256: up.FileSHA256, MediaKey: up.MediaKey, FileEncSHA256: up.FileEncSHA256,
-				DirectPath: proto.String(up.DirectPath), MediaKeyTimestamp: proto.Int64(s.m.now().Unix()),
+				DirectPath: proto.String(up.DirectPath), MediaKeyTimestamp: proto.Int64(s.m.clock.Now().Unix()),
 			},
 			Ancillary: &waMediaTransport.WAMediaTransport_Ancillary{
 				FileLength: proto.Uint64(uint64(len(data))), Mimetype: &mimetype,
@@ -1199,7 +1162,7 @@ func (s *sender) sendFB(id string, app *waConsumerApplication.ConsumerApplicatio
 	}
 	ms := resp.Timestamp.UnixMilli()
 	if resp.Timestamp.IsZero() || ms <= 0 {
-		ms = s.m.now().UnixMilli()
+		ms = s.m.clock.Now().UnixMilli()
 	}
 	return id, ms, sentOK
 }
@@ -1255,7 +1218,7 @@ func sentOf(resp *table.LSTable, otid string) (lineID string, refused bool) {
 // when that is within an hour of now (as the connector checks it), else
 // now.
 func (m *Messenger) sentAt(lineID string) int64 {
-	now := m.now()
+	now := m.clock.Now()
 	if ms, err := methods.ParseMessageID(lineID); err == nil {
 		if t := time.UnixMilli(ms); t.After(now.Add(-time.Hour)) && t.Before(now.Add(time.Hour)) {
 			return ms
@@ -1375,7 +1338,7 @@ func (m *Messenger) React(ctx context.Context, chatID, messageID, emoji, transac
 			return errInternal
 		}
 		o = store.Outgoing{ID: "reaction:" + itoa(methods.GenerateEpochID()), ChatID: chat, Kind: outReaction,
-			Txn: transactionID, MadeMs: m.now().UnixMilli(), Request: body}
+			Txn: transactionID, MadeMs: m.clock.Now().UnixMilli(), Request: body}
 		if err := m.st.PutOutgoing(Name, o); err != nil {
 			if _, raced, _ := m.st.OutgoingTxn(Name, transactionID); raced {
 				return nil // another call with this transaction kept it first, and sends it
@@ -1406,7 +1369,7 @@ func (m *Messenger) react(o store.Outgoing, emoji string, l store.Line) error {
 	var raw error
 	if isMetaLine(l.ID) {
 		key, _ := m.threadOfChat(o.ChatID)
-		_, ran, raw, err := m.execute(ctx, gen, w, &socket.SendReactionTask{ThreadKey: key, TimestampMs: m.now().UnixMilli(),
+		_, ran, raw, err := m.execute(ctx, gen, w, &socket.SendReactionTask{ThreadKey: key, TimestampMs: m.clock.Now().UnixMilli(),
 			MessageID: l.ID, ActorID: fbid, Reaction: emoji, SyncGroup: 1, SendAttribution: table.MESSENGER_INBOX_IN_THREAD})
 		if err != nil {
 			return m.reactFailed(o, ran, raw, err)
@@ -1426,7 +1389,7 @@ func (m *Messenger) react(o store.Outgoing, emoji string, l store.Line) error {
 		}
 		app := consumerApp(&waConsumerApplication.ConsumerApplication_Content{
 			Content: &waConsumerApplication.ConsumerApplication_Content_ReactionMessage{ReactionMessage: &waConsumerApplication.ConsumerApplication_ReactionMessage{
-				Key: key, Text: proto.String(emoji), SenderTimestampMS: proto.Int64(m.now().UnixMilli())}}})
+				Key: key, Text: proto.String(emoji), SenderTimestampMS: proto.Int64(m.clock.Now().UnixMilli())}}})
 		var err error
 		ran, raw, err = m.ask(ctx, gen, func(ctx context.Context) error {
 			_, err := w.SendFBMessage(ctx, jid, app, nil, whatsmeow.SendRequestExtra{ID: watypes.MessageID(req.WAID)})
@@ -1523,7 +1486,7 @@ func (m *Messenger) MarkRead(ctx context.Context, chatID, through string) error 
 			if err != nil {
 				return errInternal
 			}
-			now := m.now()
+			now := m.clock.Now()
 			for _, by := range senders {
 				var sender watypes.JID
 				if by != "" {

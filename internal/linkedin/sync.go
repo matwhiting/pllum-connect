@@ -67,7 +67,7 @@ func (l *LinkedIn) stayCaughtUp(ctx context.Context, gen int, cli liClient) {
 		return
 	}
 	l.mu.Lock()
-	if gen != l.gen || l.stopped {
+	if gen != l.runs.Gen || l.stopped {
 		l.mu.Unlock()
 		return
 	}
@@ -137,7 +137,7 @@ func (l *LinkedIn) stayCaughtUp(ctx context.Context, gen int, cli liClient) {
 func (l *LinkedIn) takeJob(gen int) (j job, ok bool) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if gen != l.gen || l.stopped {
+	if gen != l.runs.Gen || l.stopped {
 		return jobNone, false
 	}
 	// A catch-up backing off (later) waits its turn, however often the
@@ -238,7 +238,7 @@ func (l *LinkedIn) listingOwed() bool {
 // first listing, that listing covers it.
 func (l *LinkedIn) syncByToken(ctx context.Context, gen int, cli liClient) error {
 	l.mu.Lock()
-	dropped := l.tokenDropped && gen == l.gen
+	dropped := l.tokenDropped && gen == l.runs.Gen
 	l.mu.Unlock()
 	if dropped {
 		return l.listBack(ctx, gen, cli, false)
@@ -249,7 +249,7 @@ func (l *LinkedIn) syncByToken(ctx context.Context, gen int, cli liClient) error
 	}
 	_ = l.keep("syncToken", "")
 	l.mu.Lock()
-	if gen == l.gen {
+	if gen == l.runs.Gen {
 		l.tokenDropped = true
 	}
 	l.mu.Unlock()
@@ -276,7 +276,7 @@ func settled(err error) bool { return errors.Is(err, errGone) }
 func (l *LinkedIn) later(gen int, j job) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if gen != l.gen || l.stopped {
+	if gen != l.runs.Gen || l.stopped {
 		return
 	}
 	now := l.clock.Now()
@@ -329,7 +329,7 @@ func (l *LinkedIn) wakeAt(gen int, at time.Time) {
 	l.stopLater = l.clock.AfterFunc(max(at.Sub(l.clock.Now()), 0), func() {
 		l.mu.Lock()
 		defer l.mu.Unlock()
-		if gen != l.gen || l.stopped || seq != l.laterSeq {
+		if gen != l.runs.Gen || l.stopped || seq != l.laterSeq {
 			return // an older run's, or a wake moved sooner
 		}
 		l.stopLater = nil
@@ -354,7 +354,7 @@ func (l *LinkedIn) wakeAt(gen int, at time.Time) {
 func (l *LinkedIn) wakeForAside(gen int) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if gen != l.gen || l.stopped {
+	if gen != l.runs.Gen || l.stopped {
 		return
 	}
 	now := l.clock.Now()
@@ -388,7 +388,7 @@ type backoff struct {
 func (l *LinkedIn) pass(gen int, chat string) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if gen != l.gen || l.stopped {
+	if gen != l.runs.Gen || l.stopped {
 		return
 	}
 	if l.aside == nil {
@@ -785,7 +785,7 @@ func (l *LinkedIn) handlersFor(gen int) linkedingo.Handlers {
 func (l *LinkedIn) heard(gen int) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if gen != l.gen || l.stopped || !l.realtime {
+	if gen != l.runs.Gen || l.stopped || !l.realtime {
 		return
 	}
 	if l.state == network.Offline && l.kind == "" {
@@ -800,7 +800,7 @@ func (l *LinkedIn) heard(gen int) {
 func (l *LinkedIn) clientConnected(gen int, c *linkedingo.ClientConnection) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if gen != l.gen || l.stopped || !l.realtime {
+	if gen != l.runs.Gen || l.stopped || !l.realtime {
 		return
 	}
 	if l.state == network.Offline && l.kind == "" {
@@ -837,7 +837,7 @@ func (l *LinkedIn) disconnected(gen int, err error) {
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if gen != l.gen || l.stopped {
+	if gen != l.runs.Gen || l.stopped {
 		return
 	}
 	if l.state == network.Live || l.state == network.CatchingUp {
@@ -880,7 +880,7 @@ func (l *LinkedIn) onEvent(gen int, e *linkedingo.DecoratedEvent) {
 			// Something changed and LinkedIn didn't say what: a catch-up by
 			// the sync token, in turn.
 			l.mu.Lock()
-			if gen == l.gen && !l.stopped {
+			if gen == l.runs.Gen && !l.stopped {
 				l.queue(false)
 			}
 			l.mu.Unlock()

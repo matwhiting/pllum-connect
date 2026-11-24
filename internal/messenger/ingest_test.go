@@ -68,7 +68,7 @@ func settleOn(m *Messenger, f *fakeMeta) {
 // past it, and what that starts settles), and is how many have come.
 func (h *harness) quiet() int {
 	h.settle()
-	h.f.clock.Advance(changedEvery)
+	h.f.clock.Advance(network.ChangedEvery)
 	h.settle()
 	return h.changedEvents()
 }

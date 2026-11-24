@@ -51,8 +51,6 @@ const (
 	// maxMuteWait is the longest the mute timer sleeps before looking again.
 	maxMuteWait = 72 * time.Hour
 
-	// changedEvery is the least time between two changed events.
-	changedEvery = 500 * time.Millisecond
 	// historyRetry is how long a history download that failed waits before
 	// it is tried again, when nothing else (a reconnect) prompts it first.
 	historyRetry = time.Minute
@@ -83,18 +81,6 @@ type waClient interface {
 	waWriter
 }
 
-// clock is the time the adapter's timers run on; tests move a fake one.
-type clock interface {
-	Now() time.Time
-	AfterFunc(d time.Duration, f func()) (stop func() bool)
-}
-
-type realClock struct{}
-
-func (realClock) Now() time.Time { return time.Now() }
-
-func (realClock) AfterFunc(d time.Duration, f func()) func() bool { return time.AfterFunc(d, f).Stop }
-
 // WhatsApp is the whatsapp network. Its methods are safe from any goroutine.
 type WhatsApp struct {
 	st   *store.Store
@@ -103,7 +89,7 @@ type WhatsApp struct {
 	emit network.Emit
 
 	newClient func(dev *wastore.Device) waClient
-	clock     clock
+	clock     network.Clock // the adapter's timers; tests move a fake one
 	kick      chan struct{} // wakes the history worker
 
 	mu          sync.Mutex
@@ -133,9 +119,7 @@ type WhatsApp struct {
 	hDone     bool
 	hStop     func() bool
 
-	cmu      sync.Mutex
-	cLast    time.Time
-	cPending bool
+	changes network.Changed
 
 	tmu      sync.Mutex
 	muteStop func() bool // the timer for the soonest timed mute's end
@@ -175,7 +159,7 @@ func New(st *store.Store, dir string, key [32]byte, emit network.Emit) *WhatsApp
 		key:       key,
 		emit:      emit,
 		newClient: func(dev *wastore.Device) waClient { return newWhatsmeowClient(dev) },
-		clock:     realClock{},
+		clock:     network.RealClock{},
 		kick:      make(chan struct{}, 1),
 		state:     network.NotConnected,
 		tries:     map[int64]int{},
@@ -654,24 +638,4 @@ func (w *WhatsApp) ended(s network.State) {
 
 // changed tells Pllum there is something to re-read: at once, or when 500 ms
 // have passed since the last time.
-func (w *WhatsApp) changed() {
-	w.cmu.Lock()
-	defer w.cmu.Unlock()
-	if w.cPending {
-		return
-	}
-	now := w.clock.Now()
-	if wait := w.cLast.Add(changedEvery).Sub(now); wait > 0 {
-		w.cPending = true
-		w.clock.AfterFunc(wait, func() {
-			w.cmu.Lock()
-			w.cPending = false
-			w.cLast = w.clock.Now()
-			w.cmu.Unlock()
-			w.emit(map[string]any{"event": "changed"})
-		})
-		return
-	}
-	w.cLast = now
-	w.emit(map[string]any{"event": "changed"})
-}
+func (w *WhatsApp) changed() { w.changes.Tell(w.clock, w.emit) }

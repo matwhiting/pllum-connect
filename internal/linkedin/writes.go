@@ -91,7 +91,7 @@ type sendRequest struct {
 // not paused (else rateLimited).
 func (l *LinkedIn) writeGate() (gen int, cli liClient, err error) {
 	l.mu.Lock()
-	s, gen, cli := l.state, l.gen, l.cli
+	s, gen, cli := l.state, l.runs.Gen, l.cli
 	ok := l.started && !l.stopped
 	l.mu.Unlock()
 	switch s {
@@ -235,7 +235,7 @@ func (l *LinkedIn) Send(ctx context.Context, m network.Outgoing) (string, error)
 		}
 		return "", err
 	}
-	l.enqueue(id)
+	l.outbox.Enqueue(id)
 	return id, nil
 }
 
@@ -361,55 +361,19 @@ func readSendFile(path string) ([]byte, error) {
 	return data, nil
 }
 
-// enqueue puts a send in line; one goroutine sends them, in order, beside
-// (never through) the background work.
-func (l *LinkedIn) enqueue(id string) {
-	l.busy.Add(1)
-	l.smu.Lock()
-	l.outbox = append(l.outbox, id)
-	if l.draining {
-		l.smu.Unlock()
-		return
-	}
-	l.draining = true
-	l.smu.Unlock()
+// beginSends starts the goroutine that sends what is in line (the
+// outbox's Begin), beside (never through) the background work: counted in
+// the network's work, under the network's context; false once it has
+// begun stopping (each send in line then fails notConnected: it was never
+// asked).
+func (l *LinkedIn) beginSends() (context.Context, bool) {
 	l.mu.Lock()
+	defer l.mu.Unlock()
 	ok := l.started && !l.stopped
 	if ok {
 		l.work.Add(1)
 	}
-	ctx := l.ctx
-	l.mu.Unlock()
-	if !ok {
-		l.drain(nil)
-		return
-	}
-	go func() {
-		defer l.work.Done()
-		l.drain(ctx)
-	}()
-}
-
-// drain sends what is in line until none is left. A send whose turn comes
-// after the helper began stopping was never asked: failed, notConnected.
-func (l *LinkedIn) drain(ctx context.Context) {
-	for {
-		l.smu.Lock()
-		if len(l.outbox) == 0 {
-			l.draining = false
-			l.smu.Unlock()
-			return
-		}
-		id := l.outbox[0]
-		l.outbox = l.outbox[1:]
-		l.smu.Unlock()
-		if ctx == nil || ctx.Err() != nil {
-			l.fail(id, wire.NotConnected)
-		} else {
-			l.deliver(ctx, id)
-		}
-		l.busy.Add(-1)
-	}
+	return l.ctx, ok
 }
 
 // fail marks a write failed with kind.
@@ -429,7 +393,7 @@ func (l *LinkedIn) settle(id, lineID string) {
 func (l *LinkedIn) running() (int, liClient) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	return l.gen, l.cli
+	return l.runs.Gen, l.cli
 }
 
 // deliver sends one send, if it is still sending: the file uploaded first

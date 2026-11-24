@@ -64,9 +64,9 @@ func (m *Messenger) fillAfter(chat string, d time.Duration, due *map[string]bool
 		delete(*due, chat)
 		m.fillmu.Unlock()
 	}
-	m.afterFunc(d, func() {
+	m.clock.AfterFunc(d, func() {
 		m.mu.Lock()
-		gen, cli, runCtx, fbid := m.gen, m.cli, m.runCtx, m.fbid
+		gen, cli, runCtx, fbid := m.runs.Gen, m.cli, m.runs.Ctx(), m.fbid
 		if m.stopped || cli == nil || runCtx == nil {
 			m.mu.Unlock()
 			done()
@@ -92,7 +92,7 @@ func (m *Messenger) catchUp(ctx context.Context, gen int, cli msgrClient, fbid i
 	if m.gate || m.HistoryState() != historyRestored {
 		return
 	}
-	now := m.now()
+	now := m.clock.Now()
 	if last, err := strconv.ParseInt(m.value("ecatchup"), 10, 64); err == nil && now.UnixMilli()-last < (24*time.Hour).Milliseconds() && now.UnixMilli() >= last {
 		return
 	}
@@ -137,7 +137,7 @@ func (m *Messenger) fetchEncNewest(ctx context.Context, gen int, cli msgrClient,
 		return 0, false, nil // the day's pages are spent
 	}
 	thread, group := encThread(chat)
-	ref := m.now().Add(time.Minute).UnixMilli()
+	ref := m.clock.Now().Add(time.Minute).UnixMilli()
 	h := cli.History()
 	var page *securehistory.MessageRange
 	var answer error

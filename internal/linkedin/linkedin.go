@@ -86,28 +86,7 @@ var _ liClient = (*linkedingo.Client)(nil)
 
 // Clock is the time the network's timers and its pace run on; tests move a
 // fake one.
-type Clock interface {
-	Now() time.Time
-	AfterFunc(d time.Duration, f func()) (stop func() bool)
-	Sleep(ctx context.Context, d time.Duration) error
-}
-
-type realClock struct{}
-
-func (realClock) Now() time.Time { return time.Now() }
-
-func (realClock) AfterFunc(d time.Duration, f func()) func() bool { return time.AfterFunc(d, f).Stop }
-
-func (realClock) Sleep(ctx context.Context, d time.Duration) error {
-	t := time.NewTimer(d)
-	defer t.Stop()
-	select {
-	case <-t.C:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-}
+type Clock = network.Clock
 
 // Options are what tests change; the zero value is the real thing.
 type Options struct {
@@ -136,9 +115,6 @@ func realClient(self linkedingo.URN, jar *linkedingo.StringCookieJar, ua, syncTo
 // silent is ctx carrying a logger that writes nothing, for the library.
 func silent(ctx context.Context) context.Context { return zerolog.Nop().WithContext(ctx) }
 
-// changedEvery is the least time between two changed events.
-const changedEvery = 500 * time.Millisecond
-
 // LinkedIn is the linkedin network. Its methods are safe from any goroutine.
 type LinkedIn struct {
 	st   *store.Store
@@ -159,13 +135,11 @@ type LinkedIn struct {
 	cancel     context.CancelFunc
 	state      network.State
 	kind       wire.Kind
-	gen        int             // counts runs: events and results of an older one are dropped
+	runs       network.Run     // the run in force: its number (events and results of an older one are dropped) and context
 	session    network.Session // the cookies held now; never written anywhere
 	hashes     []string        // sessionHash of every version of the session held since the login
 	cli        liClient        // the run's signed-in client, nil before the profile check
 	jar        *linkedingo.StringCookieJar
-	runCtx     context.Context
-	runCancel  context.CancelFunc
 	realtime   bool      // the run's client has its realtime stream started
 	connected  bool      // a ClientConnection has come in this run
 	sessID     uuid.UUID // the realtime session of the last ClientConnection
@@ -209,14 +183,10 @@ type LinkedIn struct {
 	pmu    sync.Mutex
 	nextBg time.Time // the earliest the next background request may go
 
-	cmu      sync.Mutex
-	cLast    time.Time
-	cPending bool
+	changes network.Changed
 
 	// The sends in line (writes.go): one goroutine sends them, in order.
-	smu      sync.Mutex
-	outbox   []string
-	draining bool
+	outbox network.Outbox
 
 	// The media folder every network shares (media.go).
 	media *mediacache.Cache
@@ -248,7 +218,7 @@ func New(st *store.Store, dir string, key [32]byte, emit network.Emit, opts Opti
 		l.newClient = realClient
 	}
 	if l.clock == nil {
-		l.clock = realClock{}
+		l.clock = network.RealClock{}
 	}
 	if l.rand == nil {
 		l.rand = rand.Float64
@@ -256,6 +226,8 @@ func New(st *store.Store, dir string, key [32]byte, emit network.Emit, opts Opti
 	if l.media == nil {
 		l.media = mediacache.New(dir, key)
 	}
+	l.outbox = network.Outbox{Begin: l.beginSends, End: l.work.Done, Deliver: l.deliver,
+		Stopped: func(id string) { l.fail(id, wire.NotConnected) }, Busy: func(d int) { l.busy.Add(int32(d)) }}
 	l.pause = &pause{now: func() time.Time { return l.clock.Now() }}
 	return l
 }
@@ -429,17 +401,12 @@ func passing(kind wire.Kind) bool { return kind == wire.Offline || kind == wire.
 // and (by moving gen on) any event or result still to come from it. l.mu is
 // held.
 func (l *LinkedIn) retire() {
-	l.gen++
+	l.runs.Retire()
 	l.retry = false
 	if l.stopResume != nil {
 		l.stopResume()
 		l.stopResume = nil
 	}
-	if l.runCancel != nil {
-		l.runCancel()
-		l.runCancel = nil
-	}
-	l.runCtx = nil
 	l.due.sync, l.due.pages = false, false
 	if l.stopLater != nil {
 		l.stopLater()
@@ -462,13 +429,11 @@ func (l *LinkedIn) retire() {
 	l.cli, l.jar, l.realtime = nil, nil, false
 }
 
-// startRun starts run l.gen in the background, signed in as urn with the
+// startRun starts the next run in the background, signed in as urn with the
 // cookies in jar (signIn has checked they are his). l.mu is held.
 func (l *LinkedIn) startRun(urn linkedingo.URN, jar *linkedingo.StringCookieJar) {
-	ctx, cancel := context.WithCancel(l.ctx)
-	l.runCtx, l.runCancel = ctx, cancel
+	ctx, gen := l.runs.Begin(l.ctx)
 	l.jar = jar
-	gen := l.gen
 	l.work.Add(1)
 	l.busy.Add(1)
 	go func() {
@@ -481,7 +446,7 @@ func (l *LinkedIn) startRun(urn linkedingo.URN, jar *linkedingo.StringCookieJar)
 // again signs in again with the held cookies, unless a run or a sign-in is
 // in force, there are none, or a pause forbids a request. l.mu is held.
 func (l *LinkedIn) again() {
-	if !l.started || l.stopped || l.session == nil || l.runCtx != nil || l.probing {
+	if !l.started || l.stopped || l.session == nil || l.runs.Ctx() != nil || l.probing {
 		return
 	}
 	if _, blocked := l.pause.blocked(); blocked {
@@ -536,7 +501,7 @@ func (l *LinkedIn) probeCurrent(pg int) bool {
 // session taken (Pllum keeps a session only once connecting is followed by
 // catchingUp). l.mu is held.
 func (l *LinkedIn) backToBefore(s network.State, kind wire.Kind) {
-	if l.runCtx == nil {
+	if l.runs.Ctx() == nil {
 		return
 	}
 	l.setState(s, kind)
@@ -662,7 +627,7 @@ func (l *LinkedIn) probeRequest(ctx context.Context, pg int, session network.Ses
 		// kept before; the run in force, if any, goes on.
 		l.endProbe()
 		_ = l.keep("block", strings.Join(append(l.keptBlock(), hash), ","))
-		if l.runCtx != nil {
+		if l.runs.Ctx() != nil {
 			l.backToBefore(network.ReconnectNeeded, "")
 			return errNotConnected
 		}
@@ -693,7 +658,7 @@ func (l *LinkedIn) probeFailed(pg int, session network.Session, hash string, kin
 		l.resumeAfterPause()
 		return
 	}
-	if l.runCtx != nil {
+	if l.runs.Ctx() != nil {
 		l.backToBefore(network.NotConnected, kind)
 		return
 	}
@@ -723,11 +688,11 @@ func (l *LinkedIn) scheduleResume() {
 	if l.stopResume != nil {
 		l.stopResume()
 	}
-	gen := l.gen
+	gen := l.runs.Gen
 	l.stopResume = l.clock.AfterFunc(until.Sub(l.clock.Now()), func() {
 		l.mu.Lock()
 		defer l.mu.Unlock()
-		if gen == l.gen {
+		if gen == l.runs.Gen {
 			l.stopResume = nil
 			l.again()
 		}
@@ -738,7 +703,7 @@ func (l *LinkedIn) scheduleResume() {
 func (l *LinkedIn) current(gen int) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	return gen == l.gen && !l.stopped
+	return gen == l.runs.Gen && !l.stopped
 }
 
 // run is his signed-in run gen: his client, the catch-up, the realtime
@@ -746,7 +711,7 @@ func (l *LinkedIn) current(gen int) bool {
 func (l *LinkedIn) run(ctx context.Context, gen int, urn linkedingo.URN, jar *linkedingo.StringCookieJar) {
 	cli := l.newClient(urn, jar, userAgent, l.value("syncToken"), l.handlersFor(gen))
 	l.mu.Lock()
-	if gen != l.gen || l.stopped {
+	if gen != l.runs.Gen || l.stopped {
 		l.mu.Unlock()
 		return
 	}
@@ -763,7 +728,7 @@ func (l *LinkedIn) run(ctx context.Context, gen int, urn linkedingo.URN, jar *li
 func (l *LinkedIn) failed(gen int, s network.State, kind wire.Kind) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if gen != l.gen || l.stopped {
+	if gen != l.runs.Gen || l.stopped {
 		return
 	}
 	l.retire()
@@ -867,7 +832,7 @@ func (l *LinkedIn) downloadRaw(ctx context.Context, cli liClient, url string) (r
 	kind := l.pause.checkMedia(raw)
 	if kind == reconnectNeeded {
 		l.mu.Lock()
-		gen := l.gen
+		gen := l.runs.Gen
 		l.mu.Unlock()
 		l.endSession(gen)
 		kind = wire.NotConnected
@@ -880,7 +845,7 @@ func (l *LinkedIn) downloadRaw(ctx context.Context, cli liClient, url string) (r
 func (l *LinkedIn) paused(gen int) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if gen != l.gen || l.stopped {
+	if gen != l.runs.Gen || l.stopped {
 		return
 	}
 	l.retire()
@@ -894,7 +859,7 @@ func (l *LinkedIn) paused(gen int) {
 func (l *LinkedIn) endSession(gen int) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if gen != l.gen || l.stopped || l.session == nil {
+	if gen != l.runs.Gen || l.stopped || l.session == nil {
 		return
 	}
 	hashes := l.hashes
@@ -925,7 +890,7 @@ func (l *LinkedIn) keptBlock() []string {
 func (l *LinkedIn) afterSuccess(gen int) {
 	l.mu.Lock()
 	jar := l.jar
-	ok := gen == l.gen && !l.stopped
+	ok := gen == l.runs.Gen && !l.stopped
 	l.mu.Unlock()
 	if !ok || jar == nil {
 		return
@@ -939,7 +904,7 @@ func (l *LinkedIn) afterSuccess(gen int) {
 		return
 	}
 	l.mu.Lock()
-	if gen == l.gen {
+	if gen == l.runs.Gen {
 		l.session = network.Session(s)
 		if h := sessionHash(l.session); !slices.Contains(l.hashes, h) {
 			l.hashes = append(l.hashes, h)
@@ -987,24 +952,4 @@ func (l *LinkedIn) idleNow() bool {
 
 // changed tells Pllum there is something to re-read: at once, or when 500 ms
 // have passed since the last time.
-func (l *LinkedIn) changed() {
-	l.cmu.Lock()
-	defer l.cmu.Unlock()
-	if l.cPending {
-		return
-	}
-	now := l.clock.Now()
-	if wait := l.cLast.Add(changedEvery).Sub(now); wait > 0 && !l.cLast.IsZero() {
-		l.cPending = true
-		l.clock.AfterFunc(wait, func() {
-			l.cmu.Lock()
-			l.cPending = false
-			l.cLast = l.clock.Now()
-			l.cmu.Unlock()
-			l.emit(map[string]any{"event": "changed"})
-		})
-		return
-	}
-	l.cLast = now
-	l.emit(map[string]any{"event": "changed"})
-}
+func (l *LinkedIn) changed() { l.changes.Tell(l.clock, l.emit) }

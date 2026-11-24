@@ -192,7 +192,7 @@ func (m *Messenger) RestoreHistory(ctx context.Context, pin []byte) error {
 		return errBadRequest
 	}
 	m.mu.Lock()
-	gen, cli, fbid := m.gen, m.cli, m.fbid
+	gen, cli, fbid := m.runs.Gen, m.cli, m.fbid
 	m.mu.Unlock()
 	m.dmu.Lock()
 	dev := m.dev
@@ -297,8 +297,8 @@ func (m *Messenger) RestoreHistory(ctx context.Context, pin []byte) error {
 	// context, not this request's. The read waits for the first sign-in's
 	// own backfill, which starts it itself when it ends after this.
 	m.mu.Lock()
-	runCtx := m.runCtx
-	if m.stopped || gen != m.gen || runCtx == nil {
+	runCtx := m.runs.Ctx()
+	if m.stopped || gen != m.runs.Gen || runCtx == nil {
 		m.mu.Unlock()
 		return nil
 	}
@@ -387,7 +387,7 @@ func (m *Messenger) sample(ctx context.Context, gen int, cli msgrClient, fbid in
 	threadID := strconv.FormatInt(thread, 10)
 	var page *securehistory.MessageRange
 	err := m.request(ctx, gen, func(ctx context.Context) (err error) {
-		page, err = h.FetchMessages(ctx, device, threadID, true, m.now().Add(time.Minute).UnixMilli(), samplePage)
+		page, err = h.FetchMessages(ctx, device, threadID, true, m.clock.Now().Add(time.Minute).UnixMilli(), samplePage)
 		return err
 	})
 	if err != nil || page == nil {
@@ -498,13 +498,13 @@ func (m *Messenger) encStall(chat string) {
 	n, _ := strconv.Atoi(m.value("estallN." + chat))
 	n++
 	_ = m.keep("estallN."+chat, strconv.Itoa(n))
-	_ = m.keep("estalled."+chat, strconv.FormatInt(m.now().Add(holdLadder(n)).UnixMilli(), 10))
+	_ = m.keep("estalled."+chat, strconv.FormatInt(m.clock.Now().Add(holdLadder(n)).UnixMilli(), 10))
 }
 
 // encHeld reports whether a chat's backup is held.
 func (m *Messenger) encHeld(chat string) bool {
 	until, err := strconv.ParseInt(m.value("estalled."+chat), 10, 64)
-	return err == nil && m.now().UnixMilli() < until
+	return err == nil && m.clock.Now().UnixMilli() < until
 }
 
 // encMoved records a page of a chat's backup that reached back: its holds
@@ -535,7 +535,7 @@ func (m *Messenger) encFailed() {
 	n, _ := strconv.Atoi(m.value("epauseN"))
 	n++
 	_ = m.keep("epauseN", strconv.Itoa(n))
-	_ = m.keep("epause", strconv.FormatInt(m.now().Add(holdLadder(n)).UnixMilli(), 10))
+	_ = m.keep("epause", strconv.FormatInt(m.clock.Now().Add(holdLadder(n)).UnixMilli(), 10))
 }
 
 // encAnswered records a request of the backup that Meta answered: the run
@@ -550,7 +550,7 @@ func (m *Messenger) encAnswered() {
 // encPaused reports whether the whole backup is paused after failures.
 func (m *Messenger) encPaused() bool {
 	until, err := strconv.ParseInt(m.value("epause"), 10, 64)
-	return err == nil && m.now().UnixMilli() < until
+	return err == nil && m.clock.Now().UnixMilli() < until
 }
 
 // The answers of the library's FetchMessages that say something lasting,
@@ -612,7 +612,7 @@ func (m *Messenger) giveOnDemand() {
 // onDemandDay is the day the on-demand pages are counted in (it starts at
 // the first of them) and how many it has had. m.odmu is held.
 func (m *Messenger) onDemandDay() (start int64, n int) {
-	now := m.now().UnixMilli()
+	now := m.clock.Now().UnixMilli()
 	s, c, ok := strings.Cut(m.value("eod"), "\n")
 	start, err1 := strconv.ParseInt(s, 10, 64)
 	n, err2 := strconv.Atoi(c)
@@ -639,7 +639,7 @@ func (m *Messenger) fetchEncPage(ctx context.Context, gen int, cli msgrClient, f
 		return 0, pageHeld, false, nil
 	}
 	thread, group := encThread(chat)
-	ref := m.now().Add(time.Minute).UnixMilli()
+	ref := m.clock.Now().Add(time.Minute).UnixMilli()
 	if v, err := strconv.ParseInt(m.value("ecursor."+chat), 10, 64); err == nil && v > 0 {
 		ref = v
 	}
@@ -965,6 +965,6 @@ func (m *Messenger) encryptedBackfill(ctx context.Context, gen int, cli msgrClie
 	if m.current(gen) && ctx.Err() == nil {
 		_ = m.keep("ebackfilled", "1")
 		// it read each active chat's newest page: that is today's catch-up (catchup.go)
-		_ = m.keep("ecatchup", strconv.FormatInt(m.now().UnixMilli(), 10))
+		_ = m.keep("ecatchup", strconv.FormatInt(m.clock.Now().UnixMilli(), 10))
 	}
 }

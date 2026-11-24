@@ -446,7 +446,7 @@ func (g *Instagram) Send(ctx context.Context, m network.Outgoing) (string, error
 		}
 		return "", err
 	}
-	g.enqueue(id)
+	g.outbox.Enqueue(id)
 	return id, nil
 }
 
@@ -485,22 +485,22 @@ func (g *Instagram) resume(o store.Outgoing) (string, error) {
 	if err := g.writeGate(); err != nil {
 		return "", err
 	}
-	g.smu.Lock()
+	g.rmu.Lock()
 	cur, ok, err := g.st.Outgoing(Name, o.ID)
 	if err != nil || !ok {
-		g.smu.Unlock()
+		g.rmu.Unlock()
 		return "", cmp.Or[error](err, errNotFound)
 	}
 	if cur.State != store.OutFailed {
-		g.smu.Unlock()
+		g.rmu.Unlock()
 		return cur.ID, nil // already going again
 	}
 	if err := g.st.SetOutgoingState(Name, cur.ID, store.OutSending, ""); err != nil {
-		g.smu.Unlock()
+		g.rmu.Unlock()
 		return "", err
 	}
-	g.smu.Unlock()
-	g.enqueue(cur.ID)
+	g.rmu.Unlock()
+	g.outbox.Enqueue(cur.ID)
 	return cur.ID, nil
 }
 
@@ -567,54 +567,18 @@ func fileKind(path string) (kind, mimetype string, err error) {
 	return "", "", errUnsupported
 }
 
-// enqueue puts a send in line; one goroutine sends them, in order.
-func (g *Instagram) enqueue(id string) {
-	g.busy.Add(1)
-	g.smu.Lock()
-	g.queue = append(g.queue, id)
-	if g.draining {
-		g.smu.Unlock()
-		return
-	}
-	g.draining = true
-	g.smu.Unlock()
+// beginSends starts the goroutine that sends what is in line (the
+// outbox's Begin): counted in the network's work, under the network's
+// context; false once it has begun stopping (each send in line is then
+// refused: it never went).
+func (g *Instagram) beginSends() (context.Context, bool) {
 	g.mu.Lock()
+	defer g.mu.Unlock()
 	ok := g.started && !g.stopped
 	if ok {
 		g.work.Add(1)
 	}
-	ctx := g.ctx
-	g.mu.Unlock()
-	if !ok {
-		g.drain(nil)
-		return
-	}
-	go func() {
-		defer g.work.Done()
-		g.drain(ctx)
-	}()
-}
-
-// drain sends what is in line until none is left. A send whose turn comes
-// after the helper began stopping never went: refused.
-func (g *Instagram) drain(ctx context.Context) {
-	for {
-		g.smu.Lock()
-		if len(g.queue) == 0 {
-			g.draining = false
-			g.smu.Unlock()
-			return
-		}
-		id := g.queue[0]
-		g.queue = g.queue[1:]
-		g.smu.Unlock()
-		if ctx == nil || ctx.Err() != nil {
-			g.fail(id, wire.Refused)
-		} else {
-			g.deliver(id)
-		}
-		g.busy.Add(-1)
-	}
+	return g.ctx, ok
 }
 
 // fail marks a write failed with kind.

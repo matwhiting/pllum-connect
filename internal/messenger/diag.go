@@ -59,7 +59,7 @@ func (m *Messenger) diagLine(line string) {
 		return
 	}
 	defer f.Close()
-	_, _ = fmt.Fprintf(f, "%s %s\n", m.now().UTC().Format(time.RFC3339), line)
+	_, _ = fmt.Fprintf(f, "%s %s\n", m.clock.Now().UTC().Format(time.RFC3339), line)
 }
 
 // diagLogger is the library's logger: its warnings and errors about
@@ -131,7 +131,7 @@ func (m *Messenger) icdcCheck(ctx context.Context, gen int) (ok bool) {
 func (m *Messenger) checkICDC(ctx context.Context, gen int) (missing bool) {
 	m.mu.Lock()
 	cli, fbid := m.cli, m.fbid
-	ok := gen == m.gen && !m.stopped && cli != nil
+	ok := gen == m.runs.Gen && !m.stopped && cli != nil
 	m.mu.Unlock()
 	m.dmu.Lock()
 	dev := m.dev
@@ -197,7 +197,7 @@ func (m *Messenger) checkDevice(ctx context.Context, gen int, cli *whatsmeow.Cli
 		return err
 	})
 	var theirs []int
-	if page, err := m.st.Chats(Name, m.now().Add(-7*24*time.Hour).UnixMilli(), "", 20); err == nil {
+	if page, err := m.st.Chats(Name, m.clock.Now().Add(-7*24*time.Hour).UnixMilli(), "", 20); err == nil {
 		for _, c := range page.Items {
 			if len(theirs) == 5 {
 				break
@@ -240,7 +240,7 @@ func (m *Messenger) askAgain(gen int, e e2eeClient) {
 	cli := wc.Client
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
-	since := m.now().Add(-24 * time.Hour).UnixMilli()
+	since := m.clock.Now().Add(-24 * time.Hour).UnixMilli()
 	page, err := m.st.Chats(Name, since, "", 20)
 	if err != nil {
 		return

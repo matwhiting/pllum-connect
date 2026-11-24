@@ -86,7 +86,7 @@ type GateCounts struct {
 
 // GateCounts is the gate's counts now.
 func (m *Messenger) GateCounts() any {
-	yearAgo := m.now().Add(-yearReach).UnixMilli()
+	yearAgo := m.clock.Now().Add(-yearReach).UnixMilli()
 	m.cmu.Lock()
 	c := m.counts
 	c.FolderStops = maps.Clone(m.counts.FolderStops)

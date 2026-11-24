@@ -50,7 +50,7 @@ func (r *rig) settled() {
 			return false
 		}
 		r.l.mu.Lock()
-		running := r.l.runCtx != nil
+		running := r.l.runs.Ctx() != nil
 		r.l.mu.Unlock()
 		return !running || r.l.woken.Load() == 0
 	})

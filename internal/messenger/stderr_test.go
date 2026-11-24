@@ -21,7 +21,6 @@ import (
 	"go.mau.fi/mautrix-meta/pkg/messagix/socket"
 	"go.mau.fi/mautrix-meta/pkg/messagix/table"
 
-	"github.com/matwhiting/pllum-connect/internal/meta"
 	"github.com/matwhiting/pllum-connect/internal/network"
 	"github.com/matwhiting/pllum-connect/internal/quiet"
 	"github.com/matwhiting/pllum-connect/internal/server"
@@ -98,9 +97,8 @@ func TestNothingReachesStderr(t *testing.T) {
 			m.newClient = f.newClient
 			m.newWriter = func(msgrClient, e2eeClient) msgrWriter { return fakeWriter{f} }
 			m.newDownloader = func(msgrClient) msgrDownloader { return fakeWriter{f} }
-			m.now = f.clock.Now
+			m.clock = f.clock
 			m.pageWait = time.Second
-			m.pace = &meta.Pace{Now: f.clock.Now, Sleep: f.clock.Sleep}
 			return []network.Network{m}
 		},
 		Now:  f.clock.Now,

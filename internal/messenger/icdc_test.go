@@ -381,7 +381,7 @@ func TestAReRegistrationOfARetiredRunArmsNothing(t *testing.T) {
 	h.signIn(t)
 	h.settle()
 	h.m.mu.Lock()
-	gen := h.m.gen
+	gen := h.m.runs.Gen
 	h.m.mu.Unlock()
 	h.m.testReregister = func() {
 		h.m.mu.Lock()
@@ -413,7 +413,7 @@ func TestAnUnreadableMarkerCountsAsSet(t *testing.T) {
 	h.signIn(t)
 	h.settle()
 	h.m.mu.Lock()
-	gen := h.m.gen
+	gen := h.m.runs.Gen
 	h.m.mu.Unlock()
 	h.m.values.Drop(reregisteredKey)
 	h.st.Close() // every read of the store fails now

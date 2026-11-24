@@ -1355,7 +1355,7 @@ func TestASendStoppedInLineAfterItsTextIsUnclear(t *testing.T) {
 		t.Fatal(err)
 	}
 	h.m.Stop()
-	h.m.enqueue(id)
+	h.m.outbox.Enqueue(id)
 	if st := h.m.SendState(id); st.State != network.SendFailed || st.Kind != wire.Unclear {
 		t.Errorf("the send is %+v, want failed unclear", st)
 	}

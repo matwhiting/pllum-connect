@@ -21,14 +21,11 @@ package instagram
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"maps"
 	"slices"
 	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -38,7 +35,6 @@ import (
 	"go.mau.fi/mautrix-meta/pkg/instameow/slidetypes"
 	"go.mau.fi/mautrix-meta/pkg/messagix/cookies"
 	"go.mau.fi/mautrix-meta/pkg/messagix/dgw"
-	"go.mau.fi/mautrix-meta/pkg/messagix/httpclient"
 	"go.mau.fi/mautrix-meta/pkg/messagix/types"
 
 	"github.com/matwhiting/pllum-connect/internal/mediacache"
@@ -58,8 +54,6 @@ const (
 	// maxDrops is how many socket failures in a row, without it subscribing
 	// in between, the library may dial again after; the next stops it.
 	maxDrops = 5
-	// changedEvery is the least time between two changed events.
-	changedEvery = 500 * time.Millisecond
 )
 
 var (
@@ -92,31 +86,6 @@ type igClient interface {
 
 var _ igClient = (*instameow.Client)(nil)
 
-// clock is the time the adapter's timers and its pace run on; tests move a
-// fake one.
-type clock interface {
-	Now() time.Time
-	AfterFunc(d time.Duration, f func()) (stop func() bool)
-	Sleep(ctx context.Context, d time.Duration) error
-}
-
-type realClock struct{}
-
-func (realClock) Now() time.Time { return time.Now() }
-
-func (realClock) AfterFunc(d time.Duration, f func()) func() bool { return time.AfterFunc(d, f).Stop }
-
-func (realClock) Sleep(ctx context.Context, d time.Duration) error {
-	t := time.NewTimer(d)
-	defer t.Stop()
-	select {
-	case <-t.C:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-}
-
 // Instagram is the instagram network. Its methods are safe from any
 // goroutine.
 type Instagram struct {
@@ -128,8 +97,9 @@ type Instagram struct {
 	newClient     func(p instameow.ClientParams) igClient
 	newWriter     func(c igClient) igWriter     // the client's writes (writes.go)
 	newDownloader func(c igClient) igDownloader // the client's media downloads (media.go)
-	clock         clock
+	clock         network.Clock
 	pace          *meta.Pace
+	sess          *meta.Session // the pace, and the block and rate limit kept in the store
 	diff          *meta.SessionDiff
 
 	mu          sync.Mutex
@@ -144,28 +114,22 @@ type Instagram struct {
 	drops       int             // socket failures in a row since it last subscribed
 	redials     int             // redials since the socket last subscribed: the next waits meta.Backoff(redials)
 	redialDue   bool            // the socket is stopped and a redial is waiting: a nudge runs it now
-	gen         int             // counts runs: events and results of an older one are dropped
+	runs        network.Run     // the run in force (its number and context)
 	cli         igClient
-	runCtx      context.Context // the current run's: ended when it is replaced
-	runCancel   context.CancelFunc
 	state       network.State
 	kind        wire.Kind
 	stopCatchUp func() bool
 	work        sync.WaitGroup
 	busy        atomic.Int32 // sign-ins, inbox reloads and sends still running
+	changes     network.Changed
 
 	values *network.Values // the network's own store values, as read or written
 
 	lmu   sync.Mutex
 	locks map[string]*sync.Mutex // one history fetch per chat at a time
 
-	cmu      sync.Mutex
-	cLast    time.Time
-	cPending bool
-
-	smu      sync.Mutex
-	queue    []string // sends waiting their turn, oldest first
-	draining bool     // a goroutine is sending them
+	outbox network.Outbox // the sends in line, sent one at a time (writes.go)
+	rmu    sync.Mutex     // one resume of a failed send at a time (writes.go)
 
 	media *mediacache.Cache // the media folder every network shares (media.go)
 }
@@ -184,7 +148,7 @@ func New(st *store.Store, dir string, key [32]byte, emit network.Emit) *Instagra
 		dir:    dir,
 		key:    key,
 		emit:   emit,
-		clock:  realClock{},
+		clock:  network.RealClock{},
 		diff:   meta.NewSessionDiff(meta.InstagramPage),
 		state:  network.NotConnected,
 		values: network.NewValues(st, Name),
@@ -201,6 +165,9 @@ func New(st *store.Store, dir string, key [32]byte, emit network.Emit) *Instagra
 		Now:   func() time.Time { return g.clock.Now() },
 		Sleep: func(ctx context.Context, d time.Duration) error { return g.clock.Sleep(ctx, d) },
 	}
+	g.sess = &meta.Session{Page: meta.InstagramPage, Pace: g.pace, Values: g.values, KindOf: kindOf, Terminal: terminal}
+	g.outbox = network.Outbox{Begin: g.beginSends, End: g.work.Done, Deliver: func(_ context.Context, id string) { g.deliver(id) },
+		Stopped: func(id string) { g.fail(id, wire.Refused) }, Busy: func(d int) { g.busy.Add(int32(d)) }}
 	return g
 }
 
@@ -232,7 +199,7 @@ func (g *Instagram) Start(ctx context.Context) error {
 	g.forgetCutOff()
 	// A rate limit from an earlier run runs to its end, and the next one
 	// doubles from where it got to.
-	if until, step, ok := g.keptRateLimit(); ok {
+	if until, step, ok := g.sess.KeptRateLimit(); ok {
 		g.pace.RestoreRateLimit(until, step)
 	}
 	// A session Meta stopped in an earlier run stays stopped: its state is
@@ -351,7 +318,7 @@ func (g *Instagram) Nudge() {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if g.redialDue {
-		g.redial(g.gen)
+		g.redial(g.runs.Gen)
 		return
 	}
 	if g.retry {
@@ -382,7 +349,7 @@ func (g *Instagram) again() {
 // may be nudged, and a rate limit tries again by itself when its block
 // ends. g.mu is held.
 func (g *Instagram) failed(gen int, s network.State, kind wire.Kind) {
-	if gen != g.gen || g.stopped {
+	if gen != g.runs.Gen || g.stopped {
 		return
 	}
 	g.retire()
@@ -396,11 +363,11 @@ func (g *Instagram) failed(gen int, s network.State, kind wire.Kind) {
 		return
 	}
 	until, _ := g.pace.RateLimit()
-	gen = g.gen
+	gen = g.runs.Gen
 	g.stopRetry = g.clock.AfterFunc(until.Sub(g.clock.Now()), func() {
 		g.mu.Lock()
 		defer g.mu.Unlock()
-		if gen == g.gen {
+		if gen == g.runs.Gen {
 			g.again()
 		}
 	})
@@ -439,18 +406,13 @@ func (g *Instagram) Stop() {
 // and (by moving gen on) any event or result still to come from it. g.mu is
 // held.
 func (g *Instagram) retire() {
-	g.gen++
+	g.runs.Retire()
 	g.retry = false
 	g.drops, g.redials, g.redialDue = 0, 0, false
 	if g.stopRetry != nil {
 		g.stopRetry()
 		g.stopRetry = nil
 	}
-	if g.runCancel != nil {
-		g.runCancel()
-		g.runCancel = nil
-	}
-	g.runCtx = nil
 	if g.stopCatchUp != nil {
 		g.stopCatchUp()
 		g.stopCatchUp = nil
@@ -470,9 +432,8 @@ func (g *Instagram) retire() {
 // startRun signs in with g.session in the background, as run gen. g.mu is
 // held.
 func (g *Instagram) startRun() {
-	ctx, cancel := context.WithCancel(g.ctx)
-	g.runCtx, g.runCancel = ctx, cancel
-	gen, session := g.gen, g.session
+	ctx, gen := g.runs.Begin(g.ctx)
+	session := g.session
 	g.work.Add(1)
 	g.busy.Add(1)
 	go func() {
@@ -486,7 +447,7 @@ func (g *Instagram) startRun() {
 func (g *Instagram) current(gen int) bool {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	return gen == g.gen && !g.stopped
+	return gen == g.runs.Gen && !g.stopped
 }
 
 // running is the current run: its number, client and context; cli is nil
@@ -494,7 +455,7 @@ func (g *Instagram) current(gen int) bool {
 func (g *Instagram) running() (gen int, cli igClient, ctx context.Context) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	return g.gen, g.cli, g.runCtx
+	return g.runs.Gen, g.cli, g.runs.Ctx()
 }
 
 // run makes a client for the session and connects it. With the client's
@@ -525,7 +486,7 @@ func (g *Instagram) run(ctx context.Context, gen int, session network.Session) {
 		SeqIDTS:       seqTS,
 	})
 	g.mu.Lock()
-	if gen != g.gen || g.stopped {
+	if gen != g.runs.Gen || g.stopped {
 		g.mu.Unlock()
 		return
 	}
@@ -582,92 +543,23 @@ func (g *Instagram) signInFailed(gen int, kind wire.Kind) {
 	g.failed(gen, network.NotConnected, kind)
 }
 
-// request makes one request to Meta through the pace: none while a block is
-// in force, then a 2 to 4 s gap after the last. A success may carry rotated
-// cookies to Pllum; Meta pushing back blocks the pace and, for a
-// checkpoint, an ended session or a suspension, ends the run.
+// request makes one request to Meta through the pace (meta.Session): none
+// while a block is in force, then a 2 to 4 s gap after the last. A success
+// may carry rotated cookies to Pllum; Meta pushing back blocks the pace
+// and, for a checkpoint, an ended session or a suspension, ends the run.
 func (g *Instagram) request(ctx context.Context, gen int, fn func(ctx context.Context) error) error {
-	if err := g.gate(); err != nil {
-		return err
-	}
-	if err := g.pace.Wait(ctx); err != nil {
-		return &wire.Error{Kind: wire.Timeout}
-	}
-	if err := g.gate(); err != nil {
-		return err
-	}
-	if !g.current(gen) {
-		return errNotConnected
-	}
-	err := fn(ctx)
-	if err == nil {
-		g.pace.Succeed()
-		g.keepRateLimit()
-		g.checkSession(gen)
-		return nil
-	}
-	kind := kindOf(err)
-	g.pace.Fail(kind)
-	g.keepRateLimit()
-	g.pushedBack(gen, kind)
-	return &wire.Error{Kind: errorKind(kind)}
+	return g.sess.Request(ctx, func() bool { return g.current(gen) }, fn,
+		func() { g.checkSession(gen) }, func(kind wire.Kind) { g.pushedBack(gen, kind) })
 }
 
 // gate is the error for a request now, when the pace forbids one.
-func (g *Instagram) gate() error {
-	if kind, blocked := g.pace.Blocked(); blocked {
-		return &wire.Error{Kind: errorKind(kind)}
-	}
-	return nil
-}
+func (g *Instagram) gate() error { return g.sess.Gate() }
 
-// kindOf is the kind of a client error. A checkpoint, challenge or consent
-// page is checkpoint; a session Meta has ended is reconnectNeeded; a
-// suspended account is banned (these two are Pace's, not wire kinds).
-func kindOf(err error) wire.Kind {
-	switch {
-	case errors.Is(err, httpclient.ErrChallengeRequired),
-		errors.Is(err, httpclient.ErrCheckpointRequired),
-		errors.Is(err, httpclient.ErrConsentRequired):
-		return wire.Checkpoint
-	case errors.Is(err, httpclient.ErrTokenInvalidated),
-		// Both mean the session no longer works: Meta's GraphQL error
-		// 1357053 (igconnector's bad credentials), and the redirect loop
-		// the library counts as permanent.
-		errors.Is(err, httpclient.ErrTooManyRedirects),
-		isMetaError(err, 1357053):
-		return meta.ReconnectNeeded
-	case errors.Is(err, httpclient.ErrAccountSuspended):
-		return meta.Banned
-	case errors.Is(err, httpclient.ErrRateLimited):
-		return wire.RateLimited
-	case errors.Is(err, context.DeadlineExceeded):
-		return wire.Timeout
-	case errors.Is(err, httpclient.ErrRequestFailed):
-		return wire.Offline
-	}
-	var e *wire.Error
-	if errors.As(err, &e) {
-		return e.Kind
-	}
-	return wire.Internal
-}
+// kindOf is the kind of a client error (meta.KindOf).
+func kindOf(err error) wire.Kind { return meta.KindOf(err, meta.KindRules{}) }
 
-// isMetaError reports whether err is Meta's error response with code.
-func isMetaError(err error, code int) bool {
-	var e *types.ErrorResponse
-	return errors.As(err, &e) && e != nil && e.ErrorCode == code
-}
-
-// errorKind is the wire kind to return for kind: reconnectNeeded and banned
-// are states, so a request refused for them is notConnected.
-func errorKind(kind wire.Kind) wire.Kind {
-	switch kind {
-	case meta.ReconnectNeeded, meta.Banned:
-		return wire.NotConnected
-	}
-	return kind
-}
+// errorKind is the wire kind to return for kind (meta.ErrorKind).
+func errorKind(kind wire.Kind) wire.Kind { return meta.ErrorKind(kind) }
 
 // stateFor is the state Meta pushing back with kind leaves: ok is false for
 // a kind that does not end the run.
@@ -693,7 +585,7 @@ func (g *Instagram) pushedBack(gen int, kind wire.Kind) {
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	if gen != g.gen || g.stopped {
+	if gen != g.runs.Gen || g.stopped {
 		return
 	}
 	g.retire()
@@ -704,61 +596,24 @@ func (g *Instagram) pushedBack(gen int, kind wire.Kind) {
 	if len(hashes) == 0 {
 		hashes = []string{sessionHash(g.session)}
 	}
-	_ = g.keep("block", string(kind)+"\n"+strings.Join(hashes, ","))
+	g.sess.KeepBlock(kind, hashes)
 }
 
-// sessionHash is a SHA-256 of a session's required cookies: what tells the
-// session Meta stopped from a new sign-in, with no cookie value kept.
-// Optional cookies (rur rotates) do not count.
-func sessionHash(s network.Session) string {
-	h := sha256.New()
-	for _, name := range meta.InstagramPage.Required {
-		h.Write([]byte(name + "=" + s[name] + "\x00"))
-	}
-	return hex.EncodeToString(h.Sum(nil))
+// terminal reports whether kind stops the session until a new login.
+func terminal(kind wire.Kind) bool {
+	_, _, ok := stateFor(kind)
+	return ok
 }
+
+// sessionHash is a SHA-256 of a session's required cookies
+// (meta.SessionHash): what tells the session Meta stopped from a new
+// sign-in, with no cookie value kept.
+func sessionHash(s network.Session) string { return meta.SessionHash(meta.InstagramPage, s) }
 
 // keptBlock is the kind that stopped a session in this or an earlier run,
 // and the hashes of every version of that session; ok is false when none
 // is kept.
-func (g *Instagram) keptBlock() (kind wire.Kind, hashes []string, ok bool) {
-	k, list, ok := strings.Cut(g.value("block"), "\n")
-	if !ok || list == "" {
-		return "", nil, false
-	}
-	if _, _, terminal := stateFor(wire.Kind(k)); !terminal {
-		return "", nil, false
-	}
-	return wire.Kind(k), strings.Split(list, ","), true
-}
-
-// keepRateLimit keeps the pace's rate limit (its end and its count) so a
-// restart carries it on; nothing when there is none.
-func (g *Instagram) keepRateLimit() {
-	until, step := g.pace.RateLimit()
-	v := ""
-	if step > 0 || !until.IsZero() {
-		v = strconv.FormatInt(until.UnixMilli(), 10) + "\n" + strconv.Itoa(step)
-	}
-	_ = g.keep("rate", v)
-}
-
-// keptRateLimit is the rate limit an earlier run kept.
-func (g *Instagram) keptRateLimit() (until time.Time, step int, ok bool) {
-	ms, n, ok := strings.Cut(g.value("rate"), "\n")
-	if !ok {
-		return time.Time{}, 0, false
-	}
-	untilMs, err1 := strconv.ParseInt(ms, 10, 64)
-	step, err2 := strconv.Atoi(n)
-	if err1 != nil || err2 != nil {
-		return time.Time{}, 0, false
-	}
-	if untilMs > 0 {
-		until = time.UnixMilli(untilMs)
-	}
-	return until, step, true
-}
+func (g *Instagram) keptBlock() (wire.Kind, []string, bool) { return g.sess.KeptBlock() }
 
 // holdBlock reports a kept block's state again and blocks the pace on it
 // (never Clear: only a new session lifts it). g.mu is held.
@@ -774,7 +629,7 @@ func (g *Instagram) holdBlock(kind wire.Kind) {
 func (g *Instagram) checkSession(gen int) {
 	g.mu.Lock()
 	cli := g.cli
-	ok := gen == g.gen && cli != nil
+	ok := gen == g.runs.Gen && cli != nil
 	g.mu.Unlock()
 	if !ok {
 		return
@@ -786,7 +641,7 @@ func (g *Instagram) checkSession(gen int) {
 	// The rotated set is the session now: Pllum keeps it, a nudge signs in
 	// with it, and a block names it as well as the versions before.
 	g.mu.Lock()
-	if gen == g.gen {
+	if gen == g.runs.Gen {
 		g.session = network.Session(maps.Clone(s))
 		hash := sessionHash(g.session)
 		if !slices.Contains(g.hashes, hash) {
@@ -859,7 +714,7 @@ func (g *Instagram) handlerFor(gen int) instameow.EventHandler {
 func (g *Instagram) connected(gen int) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	if gen != g.gen || g.stopped {
+	if gen != g.runs.Gen || g.stopped {
 		return
 	}
 	if g.stopCatchUp != nil {
@@ -873,7 +728,7 @@ func (g *Instagram) connected(gen int) {
 func (g *Instagram) caughtUp(gen int) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	if gen != g.gen || g.stopped {
+	if gen != g.runs.Gen || g.stopped {
 		return
 	}
 	if g.stopCatchUp != nil {
@@ -902,7 +757,7 @@ func (g *Instagram) disconnected(gen int, err error) error {
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	if gen != g.gen || g.stopped {
+	if gen != g.runs.Gen || g.stopped {
 		return nil
 	}
 	if g.stopCatchUp != nil {
@@ -945,7 +800,7 @@ func (g *Instagram) scheduleRedial(gen int) {
 // request's does; any other failure waits for the next redial, twice as
 // long. g.mu is held.
 func (g *Instagram) redial(gen int) {
-	if gen != g.gen || g.stopped || !g.redialDue || g.cli == nil || g.runCtx == nil {
+	if gen != g.runs.Gen || g.stopped || !g.redialDue || g.cli == nil || g.runs.Ctx() == nil {
 		return
 	}
 	g.redialDue = false
@@ -954,7 +809,7 @@ func (g *Instagram) redial(gen int) {
 		g.stopRetry = nil
 	}
 	g.redials++
-	cli, ctx := g.cli, g.runCtx
+	cli, ctx := g.cli, g.runs.Ctx()
 	g.work.Add(1)
 	g.busy.Add(1)
 	go func() {
@@ -966,7 +821,7 @@ func (g *Instagram) redial(gen int) {
 		}
 		g.mu.Lock()
 		defer g.mu.Unlock()
-		if gen != g.gen || g.stopped {
+		if gen != g.runs.Gen || g.stopped {
 			return // Meta stopped the session: pushedBack has ended the run
 		}
 		kind := kindOf(err)
@@ -1080,24 +935,4 @@ func (g *Instagram) reload(ctx context.Context, gen int, cli igClient) error {
 
 // changed tells Pllum there is something to re-read: at once, or when 500 ms
 // have passed since the last time.
-func (g *Instagram) changed() {
-	g.cmu.Lock()
-	defer g.cmu.Unlock()
-	if g.cPending {
-		return
-	}
-	now := g.clock.Now()
-	if wait := g.cLast.Add(changedEvery).Sub(now); wait > 0 && !g.cLast.IsZero() {
-		g.cPending = true
-		g.clock.AfterFunc(wait, func() {
-			g.cmu.Lock()
-			g.cPending = false
-			g.cLast = g.clock.Now()
-			g.cmu.Unlock()
-			g.emit(map[string]any{"event": "changed"})
-		})
-		return
-	}
-	g.cLast = now
-	g.emit(map[string]any{"event": "changed"})
-}
+func (g *Instagram) changed() { g.changes.Tell(g.clock, g.emit) }

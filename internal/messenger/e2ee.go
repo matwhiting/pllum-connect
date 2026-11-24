@@ -144,9 +144,9 @@ func (m *Messenger) device(ctx context.Context, gen int, cli msgrClient, fbid in
 				// RegisterE2EE makes one (kept with the device after)
 				dev.FacebookUUID = cli.SessionDeviceID()
 			}
-			began := m.now()
+			began := m.clock.Now()
 			err := cli.RegisterE2EE(ctx, fbid)
-			registerMs = m.now().Sub(began).Milliseconds()
+			registerMs = m.clock.Now().Sub(began).Milliseconds()
 			return err
 		})
 		switch {
@@ -208,12 +208,12 @@ func (m *Messenger) reregister(ctx context.Context, gen int) (began bool, err er
 	}
 	m.mu.Lock()
 	cli, fbid := m.cli, m.fbid
-	ok := gen == m.gen && !m.stopped && cli != nil
+	ok := gen == m.runs.Gen && !m.stopped && cli != nil
 	m.mu.Unlock()
 	if !ok {
 		return false, nil
 	}
-	if err := m.keep(reregisteredKey, m.now().UTC().Format(time.DateOnly)); err != nil {
+	if err := m.keep(reregisteredKey, m.clock.Now().UTC().Format(time.DateOnly)); err != nil {
 		m.diagLine("re-registration: not attempted, its marker could not be kept")
 		return false, nil
 	}
@@ -221,7 +221,7 @@ func (m *Messenger) reregister(ctx context.Context, gen int) (began bool, err er
 		m.testReregister()
 	}
 	m.mu.Lock()
-	if gen != m.gen || m.stopped {
+	if gen != m.runs.Gen || m.stopped {
 		m.mu.Unlock()
 		m.diagLine("re-registration: not attempted, its sign-in had ended")
 		return false, nil
@@ -272,7 +272,7 @@ func (m *Messenger) reregister(ctx context.Context, gen int) (began bool, err er
 func (m *Messenger) e2eeSetupFailed(gen int, err error) {
 	if wire.KindOf(err) == wire.RegistrationUnclear {
 		m.mu.Lock()
-		if gen == m.gen {
+		if gen == m.runs.Gen {
 			m.e2eeFailed = true
 		}
 		m.mu.Unlock()
@@ -282,7 +282,7 @@ func (m *Messenger) e2eeSetupFailed(gen int, err error) {
 	}
 	if k := wire.KindOf(err); k == wire.Unclear || k == wire.Internal {
 		m.mu.Lock()
-		if gen == m.gen {
+		if gen == m.runs.Gen {
 			m.e2eeFailed = true
 		}
 		m.mu.Unlock()
@@ -316,7 +316,7 @@ func (m *Messenger) connectE2EE(ctx context.Context, gen int, cli msgrClient, fb
 	quiet.SignalTo(func(line string) { m.diag("signal: " + line) })
 	e.AddEventHandlerWithSuccessStatus(m.e2eeHandler(gen, e))
 	m.mu.Lock()
-	if gen != m.gen || m.stopped {
+	if gen != m.runs.Gen || m.stopped {
 		m.mu.Unlock()
 		return errNotConnected
 	}
@@ -451,7 +451,7 @@ func (m *Messenger) e2eeEnded(gen int) {
 	m.counts.E2EEFailed = true
 	m.cmu.Unlock()
 	m.mu.Lock()
-	if gen == m.gen && !m.stopped {
+	if gen == m.runs.Gen && !m.stopped {
 		m.e2eeFailed = true
 	}
 	m.mu.Unlock()

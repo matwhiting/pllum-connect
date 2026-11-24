@@ -40,15 +40,9 @@ package messenger
 
 import (
 	"context"
-	"crypto/sha256"
 	"database/sql"
-	"encoding/hex"
-	"errors"
 	"maps"
-	"net"
 	"slices"
-	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -57,7 +51,6 @@ import (
 	"github.com/rs/zerolog"
 	"go.mau.fi/mautrix-meta/pkg/messagix"
 	"go.mau.fi/mautrix-meta/pkg/messagix/cookies"
-	"go.mau.fi/mautrix-meta/pkg/messagix/httpclient"
 	"go.mau.fi/mautrix-meta/pkg/messagix/securehistory"
 	"go.mau.fi/mautrix-meta/pkg/messagix/socket"
 	"go.mau.fi/mautrix-meta/pkg/messagix/table"
@@ -160,13 +153,13 @@ type Messenger struct {
 	newClient     func(ck *cookies.Cookies) msgrClient
 	newWriter     func(cli msgrClient, e e2eeClient) msgrWriter // nil when the clients can't write
 	newDownloader func(cli msgrClient) msgrDownloader
+	clock         network.Clock // the network's timers and its pace; tests move a fake one
 	pace          *meta.Pace
+	sess          *meta.Session // the pace, and the block and rate limit kept in the store
 	diff          *meta.SessionDiff
-	now           func() time.Time
-	afterFunc     func(d time.Duration, f func()) (stop func() bool) // the network's timers
-	gate          bool                                               // started with --gate: every sign-in lists every folder, and one page of restored history is sampled
-	pageWait      time.Duration                                      // how long a page of history may take to come back on the socket
-	writeWait     time.Duration                                      // how long one write's request may wait for its turn and its answer
+	gate          bool          // started with --gate: every sign-in lists every folder, and one page of restored history is sampled
+	pageWait      time.Duration // how long a page of history may take to come back on the socket
+	writeWait     time.Duration // how long one write's request may wait for its turn and its answer
 
 	mu        sync.Mutex
 	started   bool
@@ -175,10 +168,8 @@ type Messenger struct {
 	cancel    context.CancelFunc
 	session   network.Session // the cookies held now; never written anywhere
 	hashes    []string        // sessionHash of every version of the session held since the login
-	gen       int             // counts runs: events and results of an older one are dropped
+	runs      network.Run     // the run in force: its number (events and results of an older one are dropped) and context
 	cli       msgrClient
-	runCtx    context.Context
-	runCancel context.CancelFunc
 	fbid      int64
 	e2ee      e2eeClient
 	e2eeBegun bool // this run has started setting up the encrypted side
@@ -262,15 +253,12 @@ type Messenger struct {
 	lkmu  sync.Mutex
 	locks map[string]*sync.Mutex // one history fetch per chat at a time
 
-	chmu      sync.Mutex
-	chPending bool
-	chLast    time.Time
+	changes network.Changed // the changed events (backfill.go)
 
 	// the sends waiting their turn (writes.go)
-	smu      sync.Mutex
-	queue    []string
-	draining bool
-	busy     atomic.Int64 // sends in line or going
+	outbox network.Outbox
+	rmu    sync.Mutex   // one resume of a failed send at a time
+	busy   atomic.Int64 // sends in line or going
 
 	// the media folder every network shares (media.go)
 	media *mediacache.Cache
@@ -297,7 +285,7 @@ var (
 // New makes the messenger network over st; emit must be emit.For("messenger").
 // Nothing is asked of Meta, and nothing is written, until a `login`.
 func New(st *store.Store, dir string, key [32]byte, emit network.Emit) *Messenger {
-	return &Messenger{
+	m := &Messenger{
 		st:            st,
 		dir:           dir,
 		key:           key,
@@ -305,10 +293,8 @@ func New(st *store.Store, dir string, key [32]byte, emit network.Emit) *Messenge
 		newClient:     newRealClient,
 		newWriter:     writerFor,
 		newDownloader: downloaderFor,
-		pace:          &meta.Pace{},
+		clock:         network.RealClock{},
 		diff:          meta.NewSessionDiff(meta.FacebookPage),
-		now:           time.Now,
-		afterFunc:     func(d time.Duration, f func()) func() bool { return time.AfterFunc(d, f).Stop },
 		pageWait:      pageWaitDefault,
 		writeWait:     writeWait,
 		state:         network.NotConnected,
@@ -319,6 +305,16 @@ func New(st *store.Store, dir string, key [32]byte, emit network.Emit) *Messenge
 		locks:         map[string]*sync.Mutex{},
 		media:         mediacache.New(dir, key),
 	}
+	// The pace reads the network's clock when it runs, so a test's clock,
+	// set after New, is the one it uses.
+	m.pace = &meta.Pace{
+		Now:   func() time.Time { return m.clock.Now() },
+		Sleep: func(ctx context.Context, d time.Duration) error { return m.clock.Sleep(ctx, d) },
+	}
+	m.sess = &meta.Session{Page: meta.FacebookPage, Pace: m.pace, Values: m.values, KindOf: kindOf, Terminal: terminal}
+	m.outbox = network.Outbox{Begin: m.beginSends, End: m.work.Done, Deliver: func(_ context.Context, id string) { m.deliver(id) },
+		Stopped: m.failStopped, Busy: func(d int) { m.busy.Add(int64(d)) }}
+	return m
 }
 
 // WithGate turns on what only the gate needs: every sign-in lists every
@@ -357,7 +353,7 @@ func (m *Messenger) Start(ctx context.Context) error {
 	}
 	m.ctx, m.cancel = context.WithCancel(context.WithoutCancel(ctx))
 	m.started = true
-	if until, step, ok := m.keptRateLimit(); ok {
+	if until, step, ok := m.sess.KeptRateLimit(); ok {
 		m.pace.RestoreRateLimit(until, step)
 	}
 	if kind, _, ok := m.keptBlock(); ok {
@@ -526,7 +522,7 @@ func (m *Messenger) calm() {
 func (m *Messenger) disconnected(gen int) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if gen != m.gen || m.stopped {
+	if gen != m.runs.Gen || m.stopped {
 		return
 	}
 	m.drops++
@@ -544,7 +540,7 @@ func (m *Messenger) disconnected(gen int) {
 func (m *Messenger) connected(gen int) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if gen == m.gen {
+	if gen == m.runs.Gen {
 		m.drops, m.redials, m.redialing = 0, 0, false
 	}
 }
@@ -557,11 +553,11 @@ func (m *Messenger) scheduleRedial() {
 		m.stopRetry()
 	}
 	m.redialDue = true
-	gen := m.gen
-	m.stopRetry = m.afterFunc(meta.Backoff(m.redials), func() {
+	gen := m.runs.Gen
+	m.stopRetry = m.clock.AfterFunc(meta.Backoff(m.redials), func() {
 		m.mu.Lock()
 		defer m.mu.Unlock()
-		if gen == m.gen {
+		if gen == m.runs.Gen {
 			m.redial()
 		}
 	})
@@ -634,12 +630,7 @@ func (m *Messenger) Stop() {
 // and (by moving gen on) any event or result still to come from it. m.mu is
 // held.
 func (m *Messenger) retire() {
-	m.gen++
-	if m.runCancel != nil {
-		m.runCancel()
-		m.runCancel = nil
-	}
-	m.runCtx = nil
+	m.runs.Retire()
 	m.e2eeBegun = false
 	if old := m.cli; old != nil {
 		m.cli = nil
@@ -670,10 +661,9 @@ func (m *Messenger) retire() {
 // startRun signs in with m.session in the background, as run gen. m.mu is
 // held.
 func (m *Messenger) startRun() {
-	ctx, cancel := context.WithCancel(m.ctx)
-	m.runCtx, m.runCancel = ctx, cancel
+	ctx, gen := m.runs.Begin(m.ctx)
 	m.e2eeEverUp, m.e2eeFailed = false, false
-	gen, session := m.gen, m.session
+	session := m.session
 	m.work.Add(1)
 	go func() {
 		defer m.work.Done()
@@ -685,7 +675,7 @@ func (m *Messenger) startRun() {
 func (m *Messenger) current(gen int) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return gen == m.gen && !m.stopped
+	return gen == m.runs.Gen && !m.stopped
 }
 
 // run makes a client for the session, loads the messages page (which signs
@@ -701,7 +691,7 @@ func (m *Messenger) run(ctx context.Context, gen int, session network.Session) {
 	ck.UpdateValues(values)
 	cli := m.newClient(ck)
 	m.mu.Lock()
-	if gen != m.gen || m.stopped {
+	if gen != m.runs.Gen || m.stopped {
 		m.mu.Unlock()
 		return
 	}
@@ -724,7 +714,7 @@ func (m *Messenger) run(ctx context.Context, gen int, session network.Session) {
 	}
 	fbid := user.GetFBID()
 	m.mu.Lock()
-	if gen != m.gen || m.stopped {
+	if gen != m.runs.Gen || m.stopped {
 		m.mu.Unlock()
 		return
 	}
@@ -773,8 +763,8 @@ func (m *Messenger) mainHandler(gen int, cli msgrClient, fbid int64) messagix.Ev
 // it through the pace, in one goroutine.
 func (m *Messenger) beginE2EE(gen int, cli msgrClient, fbid int64) {
 	m.mu.Lock()
-	ctx := m.runCtx
-	if gen != m.gen || m.stopped || m.e2eeBegun || ctx == nil {
+	ctx := m.runs.Ctx()
+	if gen != m.runs.Gen || m.stopped || m.e2eeBegun || ctx == nil {
 		m.mu.Unlock()
 		return
 	}
@@ -824,7 +814,7 @@ func (m *Messenger) beginE2EE(gen int, cli msgrClient, fbid int64) {
 func (m *Messenger) socketUp(gen int, encrypted, up bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if gen != m.gen || m.stopped {
+	if gen != m.runs.Gen || m.stopped {
 		return
 	}
 	m.cmu.Lock()
@@ -856,7 +846,7 @@ func (m *Messenger) socketUp(gen int, encrypted, up bool) {
 func (m *Messenger) failed(gen int, kind wire.Kind) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if gen != m.gen || m.stopped {
+	if gen != m.runs.Gen || m.stopped {
 		return
 	}
 	m.retire()
@@ -874,102 +864,30 @@ func (m *Messenger) failed(gen int, kind wire.Kind) {
 	m.retry = passing(kind)
 }
 
-// request makes one request to Meta through the pace: none while a block is
-// in force, then a 2 to 4 s gap after the last. A success may carry rotated
-// cookies to Pllum; Meta pushing back blocks the pace and, for a checkpoint,
-// an ended session or a suspension, ends the run. A caller that expects an
-// answer Meta gives as an error (no backup, a wrong PIN) catches it inside
-// fn and returns nil: Meta answered.
+// request makes one request to Meta through the pace (meta.Session): none
+// while a block is in force, then a 2 to 4 s gap after the last. A success
+// may carry rotated cookies to Pllum; Meta pushing back blocks the pace
+// and, for a checkpoint, an ended session or a suspension, ends the run. A
+// caller that expects an answer Meta gives as an error (no backup, a wrong
+// PIN) catches it inside fn and returns nil: Meta answered.
 func (m *Messenger) request(ctx context.Context, gen int, fn func(ctx context.Context) error) error {
-	if err := m.blocked(); err != nil {
-		return err
-	}
-	if err := m.pace.Wait(ctx); err != nil {
-		return &wire.Error{Kind: wire.Timeout}
-	}
-	if err := m.blocked(); err != nil {
-		return err
-	}
-	if !m.current(gen) {
-		return errNotConnected
-	}
-	err := fn(ctx)
-	if err == nil {
-		m.pace.Succeed()
-		m.keepRateLimit()
-		m.checkSession(gen)
-		return nil
-	}
-	kind := kindOf(err)
-	m.pace.Fail(kind)
-	m.keepRateLimit()
-	m.pushedBack(gen, kind)
-	return &wire.Error{Kind: errorKind(kind)}
+	return m.sess.Request(ctx, func() bool { return m.current(gen) }, fn,
+		func() { m.checkSession(gen) }, func(kind wire.Kind) { m.pushedBack(gen, kind) })
 }
 
 // blocked is the error for a request now, when the pace forbids one.
-func (m *Messenger) blocked() error {
-	if kind, blocked := m.pace.Blocked(); blocked {
-		return &wire.Error{Kind: errorKind(kind)}
-	}
-	return nil
-}
+func (m *Messenger) blocked() error { return m.sess.Gate() }
 
-// kindOf is the kind of a client error, as Instagram's: a checkpoint,
-// challenge or consent page is checkpoint; a session Meta has ended is
-// reconnectNeeded; a suspended account is banned (these two are Pace's, not
-// wire kinds).
+// kindOf is the kind of a client error, as Instagram's (meta.KindOf), and
+// also: messagix's "please log in" is an ended session, and a connection
+// that failed at the network (the encrypted socket's dial, say) is no
+// connection, or a timeout.
 func kindOf(err error) wire.Kind {
-	switch {
-	case errors.Is(err, httpclient.ErrChallengeRequired),
-		errors.Is(err, httpclient.ErrCheckpointRequired),
-		errors.Is(err, httpclient.ErrConsentRequired):
-		return wire.Checkpoint
-	case errors.Is(err, httpclient.ErrTokenInvalidated),
-		errors.Is(err, types.ErrPleaseLogIn),
-		errors.Is(err, httpclient.ErrTooManyRedirects),
-		isMetaError(err, 1357053):
-		return meta.ReconnectNeeded
-	case errors.Is(err, httpclient.ErrAccountSuspended):
-		return meta.Banned
-	case errors.Is(err, httpclient.ErrRateLimited):
-		return wire.RateLimited
-	case errors.Is(err, context.DeadlineExceeded):
-		return wire.Timeout
-	case errors.Is(err, httpclient.ErrRequestFailed):
-		return wire.Offline
-	}
-	// A connection that failed at the network (the encrypted socket's dial,
-	// say): no connection, or a timeout.
-	var ne net.Error
-	if errors.As(err, &ne) {
-		if ne.Timeout() {
-			return wire.Timeout
-		}
-		return wire.Offline
-	}
-	var e *wire.Error
-	if errors.As(err, &e) {
-		return e.Kind
-	}
-	return wire.Internal
+	return meta.KindOf(err, meta.KindRules{Ended: []error{types.ErrPleaseLogIn}, Net: true})
 }
 
-// isMetaError reports whether err is Meta's error response with code.
-func isMetaError(err error, code int) bool {
-	var e *types.ErrorResponse
-	return errors.As(err, &e) && e != nil && e.ErrorCode == code
-}
-
-// errorKind is the wire kind to return for kind: reconnectNeeded and banned
-// are states, so a request refused for them is notConnected.
-func errorKind(kind wire.Kind) wire.Kind {
-	switch kind {
-	case meta.ReconnectNeeded, meta.Banned:
-		return wire.NotConnected
-	}
-	return kind
-}
+// errorKind is the wire kind to return for kind (meta.ErrorKind).
+func errorKind(kind wire.Kind) wire.Kind { return meta.ErrorKind(kind) }
 
 // stateFor is the state Meta pushing back with kind leaves: ok is false for
 // a kind that does not end the run.
@@ -1006,7 +924,7 @@ func (m *Messenger) pushedBack(gen int, kind wire.Kind) {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if gen != m.gen || m.stopped {
+	if gen != m.runs.Gen || m.stopped {
 		return
 	}
 	m.retire()
@@ -1018,32 +936,24 @@ func (m *Messenger) pushedBack(gen int, kind wire.Kind) {
 	if len(hashes) == 0 {
 		hashes = []string{sessionHash(m.session)}
 	}
-	_ = m.keep("block", string(kind)+"\n"+strings.Join(hashes, ","))
+	m.sess.KeepBlock(kind, hashes)
 }
 
-// sessionHash is a SHA-256 of a session's required cookies: what tells the
-// session Meta stopped from a new sign-in, with no cookie value kept.
-func sessionHash(s network.Session) string {
-	h := sha256.New()
-	for _, name := range meta.FacebookPage.Required {
-		h.Write([]byte(name + "=" + s[name] + "\x00"))
-	}
-	return hex.EncodeToString(h.Sum(nil))
+// terminal reports whether kind stops the session until a new login.
+func terminal(kind wire.Kind) bool {
+	_, _, ok := stateFor(kind)
+	return ok
 }
+
+// sessionHash is a SHA-256 of a session's required cookies
+// (meta.SessionHash): what tells the session Meta stopped from a new
+// sign-in, with no cookie value kept.
+func sessionHash(s network.Session) string { return meta.SessionHash(meta.FacebookPage, s) }
 
 // keptBlock is the kind that stopped a session in this or an earlier run,
 // and the hashes of every version of that session; ok is false when none
 // is kept.
-func (m *Messenger) keptBlock() (kind wire.Kind, hashes []string, ok bool) {
-	k, list, ok := strings.Cut(m.value("block"), "\n")
-	if !ok || list == "" {
-		return "", nil, false
-	}
-	if _, _, terminal := stateFor(wire.Kind(k)); !terminal {
-		return "", nil, false
-	}
-	return wire.Kind(k), strings.Split(list, ","), true
-}
+func (m *Messenger) keptBlock() (wire.Kind, []string, bool) { return m.sess.KeptBlock() }
 
 // holdBlock reports a kept block's state again and blocks the pace on it
 // (never Clear: only a new session lifts it). m.mu is held.
@@ -1053,53 +963,25 @@ func (m *Messenger) holdBlock(kind wire.Kind) {
 	m.setState(st, k)
 }
 
-// keepRateLimit keeps the pace's rate limit (its end and its count) so a
-// restart carries it on; nothing when there is none.
-func (m *Messenger) keepRateLimit() {
-	until, step := m.pace.RateLimit()
-	v := ""
-	if step > 0 || !until.IsZero() {
-		v = strconv.FormatInt(until.UnixMilli(), 10) + "\n" + strconv.Itoa(step)
-	}
-	_ = m.keep("rate", v)
-}
-
-// keptRateLimit is the rate limit an earlier run kept.
-func (m *Messenger) keptRateLimit() (until time.Time, step int, ok bool) {
-	ms, n, ok := strings.Cut(m.value("rate"), "\n")
-	if !ok {
-		return time.Time{}, 0, false
-	}
-	untilMs, err1 := strconv.ParseInt(ms, 10, 64)
-	step, err2 := strconv.Atoi(n)
-	if err1 != nil || err2 != nil {
-		return time.Time{}, 0, false
-	}
-	if untilMs > 0 {
-		until = time.UnixMilli(untilMs)
-	}
-	return until, step, true
-}
-
 // checkSession sends the session event when the client's cookies have
 // changed (Meta rotates some as it answers): Pllum keeps the copy it signs
 // in again from.
 func (m *Messenger) checkSession(gen int) {
 	m.mu.Lock()
 	cli := m.cli
-	ok := gen == m.gen && cli != nil
+	ok := gen == m.runs.Gen && cli != nil
 	m.mu.Unlock()
 	if !ok {
 		return
 	}
-	s, changed := m.diff.Changed(cli.GetCookies(), m.now())
+	s, changed := m.diff.Changed(cli.GetCookies(), m.clock.Now())
 	if !changed {
 		return
 	}
 	// The rotated set is the session now: a block names it as well as the
 	// versions before.
 	m.mu.Lock()
-	if gen == m.gen {
+	if gen == m.runs.Gen {
 		m.session = network.Session(maps.Clone(s))
 		if hash := sessionHash(m.session); !slices.Contains(m.hashes, hash) {
 			m.hashes = append(m.hashes, hash)

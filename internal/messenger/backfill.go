@@ -234,7 +234,7 @@ func (m *Messenger) listFolder(ctx context.Context, gen int, cli msgrClient, f f
 		}
 		ref = r
 	}
-	yearAgo := m.now().Add(-yearReach).UnixMilli()
+	yearAgo := m.clock.Now().Add(-yearReach).UnixMilli()
 	for page := 0; page < folderPages; page++ {
 		if *total >= listPages {
 			return stopCapped, nil
@@ -383,7 +383,7 @@ func (m *Messenger) backfill(ctx context.Context, gen int, cli msgrClient) {
 // is false when the store could not list them.
 func (m *Messenger) activeChats() (chats []string, ok bool) {
 	cursor := ""
-	since := m.now().Add(-activeWithin).UnixMilli()
+	since := m.clock.Now().Add(-activeWithin).UnixMilli()
 	for {
 		page, err := m.st.Chats(Name, since, cursor, 200)
 		if err != nil {
@@ -550,13 +550,13 @@ func (m *Messenger) safeIngest(tbl *table.LSTable) (ok bool) {
 // stall holds a chat whose page did not move: nothing is asked for it for
 // stallHold, across restarts.
 func (m *Messenger) stall(chat string) {
-	_ = m.keep("stalled."+chat, strconv.FormatInt(m.now().Add(stallHold).UnixMilli(), 10))
+	_ = m.keep("stalled."+chat, strconv.FormatInt(m.clock.Now().Add(stallHold).UnixMilli(), 10))
 }
 
 // held reports whether a chat is held after a page that did not move.
 func (m *Messenger) held(chat string) bool {
 	until, err := strconv.ParseInt(m.value("stalled."+chat), 10, 64)
-	return err == nil && m.now().UnixMilli() < until
+	return err == nil && m.clock.Now().UnixMilli() < until
 }
 
 // rangeNote is what a table said of one thread's history: the lines it
@@ -633,32 +633,9 @@ func (m *Messenger) chatLock(chat string) *sync.Mutex {
 func (m *Messenger) running() (gen int, cli msgrClient, ctx context.Context) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.gen, m.cli, m.runCtx
+	return m.runs.Gen, m.cli, m.runs.Ctx()
 }
-
-// changedEvery is the least time between two changed events.
-const changedEvery = 500 * time.Millisecond
 
 // changed tells Pllum there is something to re-read: at once, or when 500
 // ms have passed since the last time.
-func (m *Messenger) changed() {
-	m.chmu.Lock()
-	defer m.chmu.Unlock()
-	if m.chPending {
-		return
-	}
-	now := m.now()
-	if wait := m.chLast.Add(changedEvery).Sub(now); wait > 0 && !m.chLast.IsZero() {
-		m.chPending = true
-		m.afterFunc(wait, func() {
-			m.chmu.Lock()
-			m.chPending = false
-			m.chLast = m.now()
-			m.chmu.Unlock()
-			m.emit(map[string]any{"event": "changed"})
-		})
-		return
-	}
-	m.chLast = now
-	m.emit(map[string]any{"event": "changed"})
-}
+func (m *Messenger) changed() { m.changes.Tell(m.clock, m.emit) }

@@ -802,10 +802,8 @@ func newHarnessOver(t *testing.T, dir string, f *fakeMeta) *harness {
 	h.m.newClient = h.f.newClient
 	h.m.newWriter = func(msgrClient, e2eeClient) msgrWriter { return fakeWriter{f} }
 	h.m.newDownloader = func(msgrClient) msgrDownloader { return fakeWriter{f} }
-	h.m.now = f.clock.Now
-	h.m.afterFunc = f.clock.AfterFunc
+	h.m.clock = f.clock
 	h.m.pageWait = 2 * time.Second
-	h.m.pace = &meta.Pace{Now: f.clock.Now, Sleep: f.clock.Sleep}
 	st.SetClock(f.clock.Now)
 	if err := h.m.Start(context.Background()); err != nil {
 		t.Fatal(err)
