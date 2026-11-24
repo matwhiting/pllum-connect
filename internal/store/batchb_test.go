@@ -546,3 +546,62 @@ func TestBatchRollsBackOnErrorAndPanic(t *testing.T) {
 		t.Fatal("the store took no line after a rolled-back batch")
 	}
 }
+
+// A store write called from inside a batch's function (or any write's)
+// would wait for ever on the batch's own lock. It is caught instead: under
+// test it panics, naming the mistake, and the store stays writable.
+func TestAWriteInsideABatchIsCaughtNotHung(t *testing.T) {
+	s := openTest(t)
+	for name, inner := range map[string]func() error{
+		"PutNetworkValue": func() error { return s.PutNetworkValue(net, "invented", "1") },
+		"Batch":           func() error { return s.Batch(net, func(*Batch) error { return nil }) },
+		"PutMessage": func() error {
+			_, err := s.PutMessage(net, text(phoneChat, "3EB0W0001", base, "inner"))
+			return err
+		},
+	} {
+		done := make(chan any, 1)
+		go func() {
+			defer func() { done <- recover() }()
+			_ = s.Batch(net, func(b *Batch) error {
+				if _, err := b.PutMessage(text(phoneChat, "3EB0W0002", base+1, "outer")); err != nil {
+					return err
+				}
+				return inner()
+			})
+		}()
+		select {
+		case got := <-done:
+			if got == nil || !strings.Contains(fmt.Sprint(got), "inside a write") {
+				t.Fatalf("%s inside a batch: recovered %v; want the store to name the mistake", name, got)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatalf("%s inside a batch hung", name)
+		}
+	}
+	if _, ok := s.LineState(net, phoneChat, "3EB0W0002"); ok {
+		t.Fatal("a batch that was caught writing inside itself kept its line")
+	}
+	if !put(t, s, text(phoneChat, "3EB0W0003", base+2, "after")) {
+		t.Fatal("the store took no write after a caught batch")
+	}
+	// Writers on other goroutines still just wait their turn.
+	var wg sync.WaitGroup
+	err := s.Batch(net, func(b *Batch) error {
+		wg.Go(func() {
+			if err := s.PutNetworkValue(net, "invented", "2"); err != nil {
+				t.Errorf("a concurrent write: %v", err)
+			}
+		})
+		time.Sleep(50 * time.Millisecond)
+		_, err := b.PutMessage(text(phoneChat, "3EB0W0004", base+3, "beside"))
+		return err
+	})
+	wg.Wait()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v, _, _ := s.NetworkValue(net, "invented"); v != "2" {
+		t.Fatalf("the concurrent write kept %q", v)
+	}
+}

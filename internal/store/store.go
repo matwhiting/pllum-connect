@@ -12,10 +12,13 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"testing"
 	"time"
 
 	"github.com/ncruces/go-sqlite3"
@@ -407,7 +410,15 @@ func (s *Store) write(fn func(tx *sql.Tx) error) error {
 	if s == nil || s.db == nil {
 		return errInternal
 	}
-	s.wmu.Lock()
+	if !s.wmu.TryLock() {
+		// Held: by another goroutine's write, which this one waits out, or
+		// by a write this very call runs inside (a network calling a Store
+		// write from a Batch's function), which would never end.
+		if insideWrite() {
+			return writeInsideWrite()
+		}
+		s.wmu.Lock()
+	}
 	defer s.wmu.Unlock()
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -421,11 +432,56 @@ func (s *Store) write(fn func(tx *sql.Tx) error) error {
 			tx.Rollback()
 		}
 	}()
-	if err := fn(tx); err != nil {
+	if err := writing(tx, fn); err != nil {
 		return dbErr(err)
 	}
 	committed = true
 	return dbErr(tx.Commit())
+}
+
+// writing runs a write's function. It is a named function so a write called
+// from inside one can be told by its own stack (insideWrite).
+//
+//go:noinline
+func writing(tx *sql.Tx, fn func(tx *sql.Tx) error) error {
+	return fn(tx)
+}
+
+// writingFunc is writing's name as the runtime reports it.
+var writingFunc = func() string {
+	pc := reflect.ValueOf(writing).Pointer()
+	return runtime.FuncForPC(pc).Name()
+}()
+
+// insideWrite reports whether this goroutine is running a write's function:
+// whether writing is on its stack. It is asked only when the write lock is
+// held, so an uncontended write never pays for it.
+func insideWrite() bool {
+	pcs := make([]uintptr, 512)
+	n := runtime.Callers(3, pcs)
+	frames := runtime.CallersFrames(pcs[:n])
+	for {
+		f, more := frames.Next()
+		if f.Function == writingFunc {
+			return true
+		}
+		if !more {
+			return false
+		}
+	}
+}
+
+// writeInsideWrite answers a Store write called from inside another write's
+// function (a Batch's, most likely), which would otherwise wait for ever on
+// the lock its own caller holds. The write is refused (internal); under test
+// it panics, so the mistake fails the test that made it rather than hanging
+// it.
+func writeInsideWrite() error {
+	if testing.Testing() {
+		panic("store: a write called inside a write (a Batch's function?) would wait for ever; " +
+			"use the Batch's own methods, or write after the batch")
+	}
+	return errInternal
 }
 
 // ready reports whether the store can be read.
