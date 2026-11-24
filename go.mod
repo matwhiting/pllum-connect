@@ -7,7 +7,7 @@ toolchain go1.27.4
 require (
 	github.com/google/go-querystring v1.2.0
 	github.com/google/uuid v1.6.0
-	github.com/ncruces/go-sqlite3 v0.35.6
+	github.com/ncruces/go-sqlite3 v0.38.0
 	github.com/rs/zerolog v1.35.1
 	go.mau.fi/libsignal v0.2.3
 	go.mau.fi/mautrix-linkedin v0.2609.1-0.20261103213510-3127fea810c0
@@ -40,7 +40,7 @@ require (
 	github.com/kr/text v0.2.0 // indirect
 	github.com/mattn/go-colorable v0.1.15 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
-	github.com/ncruces/go-sqlite3-wasm/v6 v6.3.35304 // indirect
+	github.com/ncruces/go-sqlite3-wasm/v6 v6.7.35401 // indirect
 	github.com/ncruces/julianday v1.0.0 // indirect
 	github.com/petermattis/goid v0.0.0-20261109124353-7cfa343ad0ab // indirect
 	github.com/quic-go/qpack v0.6.0 // indirect
