@@ -596,7 +596,10 @@ func (l *LinkedIn) catchUpChat(ctx context.Context, gen int, cli liClient, conv 
 	if err != nil {
 		return err
 	}
-	reached := l.storeMessages(page.Elements, store.SourceSync)
+	reached, err := l.storeMessages(page.Elements, store.SourceSync)
+	if err != nil {
+		return err // nothing kept: the mark stays, and the chat is asked again
+	}
 	l.changed()
 	if !had {
 		if l.value("cursor."+chat) == "" {
@@ -616,7 +619,9 @@ func (l *LinkedIn) catchUpChat(ctx context.Context, gen int, cli liClient, conv 
 		if err != nil {
 			return err
 		}
-		reached = l.storeMessages(page.Elements, store.SourceSync)
+		if reached, err = l.storeMessages(page.Elements, store.SourceSync); err != nil {
+			return err
+		}
 		l.changed()
 	}
 	return nil
@@ -662,7 +667,13 @@ func (l *LinkedIn) historyStep(ctx context.Context, gen int, cli liClient) (did 
 		return true, err
 	}
 	l.answered(chat)
-	l.storeMessages(page.Elements, store.SourceSync)
+	if _, err := l.storeMessages(page.Elements, store.SourceSync); err != nil {
+		// The store lost the page: its cursor is not kept, so the same page
+		// is asked again, after the chat's turn aside, as for a passing
+		// failure.
+		l.pass(gen, chat)
+		return true, err
+	}
 	l.changed()
 	l.historyPaged(chat, cursor, page)
 	return true, nil
@@ -845,7 +856,7 @@ func (l *LinkedIn) onEvent(gen int, e *linkedingo.DecoratedEvent) {
 			if c := m.Conversation; !c.EntityURN.IsEmpty() && len(c.ConversationParticipants) > 0 {
 				l.storeConversation(c)
 			}
-			l.storeMessages([]linkedingo.Message{m}, store.SourceLive)
+			_, _ = l.storeMessages([]linkedingo.Message{m}, store.SourceLive) // the stream has no page to hold back
 			l.changed()
 		}
 	case linkedingo.RealtimeEventTopicMessageReactionSummaries:

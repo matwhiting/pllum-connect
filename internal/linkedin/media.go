@@ -170,7 +170,7 @@ func (l *LinkedIn) refreshPhoto(ctx context.Context, gen int, cli liClient, chat
 		if m.Conversation.EntityURN.IsEmpty() && m.ConversationURN.IsEmpty() {
 			m.ConversationURN = linkedingo.NewURN(chat)
 		}
-		l.storeMessages([]linkedingo.Message{m}, store.SourceSync)
+		_, _ = l.storeMessages([]linkedingo.Message{m}, store.SourceSync) // the URL is answered either way
 		return url, nil
 	}
 	return "", errMediaGone

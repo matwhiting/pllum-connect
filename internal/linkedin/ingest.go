@@ -157,12 +157,14 @@ func chatOfMessageBy(m linkedingo.Message, chatOfLine func(id string) (string, b
 // storeMessages writes messages as lines, in one batch (review C1), and
 // reports whether any was a line the store already held (so a page reached
 // what was stored). The same URN is always the same row, from a page or the
-// stream. A line the store refuses is passed over, as it always was.
-func (l *LinkedIn) storeMessages(msgs []linkedingo.Message, source string) (heldAny bool) {
+// stream. A line the store refuses is passed over, as it always was; err is
+// a batch the store lost, none of whose lines are kept, so whoever pages
+// must not move past it.
+func (l *LinkedIn) storeMessages(msgs []linkedingo.Message, source string) (heldAny bool, err error) {
 	if len(msgs) == 0 {
-		return false
+		return false, nil
 	}
-	_ = l.st.Batch(Name, func(b *store.Batch) error {
+	err = l.st.Batch(Name, func(b *store.Batch) error {
 		for _, m := range msgs {
 			id := urnString(m.EntityURN)
 			chat := chatOfMessageBy(m, b.ChatOfLine)
@@ -176,7 +178,10 @@ func (l *LinkedIn) storeMessages(msgs []linkedingo.Message, source string) (held
 		}
 		return nil
 	})
-	return heldAny
+	if err != nil {
+		return false, err
+	}
+	return heldAny, nil
 }
 
 // storeMessage writes one message in a batch of its own (storeMessageIn).
