@@ -838,6 +838,7 @@ func (h *harness) signIn(t *testing.T) {
 		c := h.m.GateCounts().(GateCounts)
 		return c.Registered && c.E2EEConnected && c.HistoryState != ""
 	})
+	h.settle() // and what the sign-in goes on to ask (the listing)
 }
 
 func eventually(t *testing.T, what string, ok func() bool) {
