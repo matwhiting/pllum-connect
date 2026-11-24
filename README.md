@@ -1,6 +1,6 @@
 # Pllum Connect
 
-Pllum Connect is Pllum's network helper. Pllum, a macOS inbox, starts it as a child process and talks to it in JSON lines over its standard input and output. The helper keeps an encrypted message store on the Mac and connects to the messaging networks Pllum reads and sends through. It writes nothing anywhere else: no logs, and nothing on standard error.
+Pllum Connect is Pllum's network helper. Pllum, a macOS inbox, starts it as a child process and talks to it in JSON lines over its standard input and output. The helper keeps an encrypted message store on the Mac, seals the media it downloads (PROTOCOL.md, Media at rest), and connects to the messaging networks Pllum reads and sends through. It writes nothing anywhere else: no logs, and nothing on standard error.
 
 The protocol is in [PROTOCOL.md](PROTOCOL.md).
 

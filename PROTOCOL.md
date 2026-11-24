@@ -40,7 +40,7 @@ The contract between Pllum and this helper. Pllum refuses any other protocol ver
 | `markRead` | `chatID`, `through`? (a message ID; null = newest incoming) | `{}` |
 | `markUnread` | `chatID` | `{}` |
 | `setMuted` | `chatID`, `muted` | `{}` |
-| `media` | `chatID`, `messageID` | `path` (a file under `connect/media/`) |
+| `media` | `chatID`, `messageID` | `path` (a file under `connect/media/`, sealed: see Media at rest) |
 | `import` | `beeperChatID`, `chatID`\|null, `chat: {kind, title?, phone?}`, `messages: [ImportMessage]`, `replaces`? | `added`, `matched`, `skipped` |
 | `beeperChats` | — | `map: {beeperChatID: chatID}` |
 | `lineIDs` | `beeperIDs: [String]` (≤1000) | `map: {beeperID: lineID}` |
@@ -49,6 +49,8 @@ The contract between Pllum and this helper. Pllum refuses any other protocol ver
 | `chatByParticipant` | `participantID` | `chat: Chat`\|null: the one-to-one with that person (never a group, never an unplaced chat; the most recently active if several). For Instagram it also accepts the person's FBID (Beeper's form), translated through the people the helper has seen |
 | `encryptedHistory` | — | `state`: `noBackup`\|`needsPIN`\|`restored`\|`skipped`; `unsupported` for a network with none |
 | `restoreHistory` | `pin` (a string; `""` skips; missing is `badRequest`) | `{}`; errors `pinWrong` (with `attemptsRemaining`?), `pinLimit`; `unsupported` for a network with none |
+
+**Media at rest** (added 2026-11-24). Every file the helper writes to `connect/media/` (a photo, sticker, video thumbnail or file it fetched, or one he sent, kept so it opens without a download) is sealed in Pllum's own file format: the 9 bytes `PLLUMENC\x01`, then an AES-256-GCM box laid out as CryptoKit's `SealedBox.combined` (a random 12-byte nonce, the ciphertext, the 16-byte tag), under the files key: HKDF-SHA256 of the 32-byte `storeKey` hello carries, no salt, info `pllum-files-v1`, 32 bytes (Pllum's `FileSeal` key). Each is written whole to a hidden `.part-*` file (0600) and renamed into place. A file without the magic is one from before and is read as it is; at hello, once the key has opened the store and before any network starts, every plain regular file in the folder is sealed once (a sealed file, a hidden one and a link are left alone; each keeps its modification time, which the 500 MB trim goes by; one that fails stays as it was and is tried again at the next start). A file's name is the SHA-256 of `network|chat|message`, never of its bytes, so sealing changes no name. `media` still answers with the path; Pllum opens the file with the same key and never hands the sealed path to anything else.
 
 `counts.nearMisses` is a measure, a count only: per network, the Beeper-only lines (`source` beeper) in placed chats that have a direct line on the same side (`fromMe`) within 2000 ms, none of which has the same content as the Beeper line under the matcher's `MatchKey` rules. It reads text to compare and returns a number, never text, IDs or JIDs, and changes nothing about matching. A helper that does not send it is read as 0.
 
