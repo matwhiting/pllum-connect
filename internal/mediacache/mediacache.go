@@ -151,15 +151,17 @@ func (c *Cache) Keep(network, chat, msgID string, data []byte) {
 	_ = c.Write(path, data)
 }
 
-// Forget deletes every kept file: on his Disconnect his photos do not stay
-// behind as plain files.
+// Forget deletes every kept file of every network (the folder is shared, as it
+// always was): on his Disconnect his photos do not stay behind. The size is
+// counted afresh at the next write, so a write racing the delete can't leave
+// the count wrong.
 func (c *Cache) Forget() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.tmu.Lock()
 	defer c.tmu.Unlock()
 	_ = os.RemoveAll(c.dir)
-	c.total, c.known = 0, true
+	c.total, c.known = 0, false
 }
 
 type file struct {
