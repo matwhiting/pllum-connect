@@ -220,7 +220,6 @@ func (g *Instagram) lineOf(chat string, m *slidetypes.Message, source string) st
 		Source:   source,
 	}
 	if s := m.Sender; s != nil && !fromMe {
-		g.learnUser(&s.UserDict)
 		line.SenderName = cmp.Or(s.Name, nameOf(&s.UserDict))
 		if m.SenderFBID == 0 {
 			line.SenderID = cmp.Or(s.UserDict.ID, s.IGID)
@@ -240,6 +239,7 @@ func (g *Instagram) lineOf(chat string, m *slidetypes.Message, source string) st
 // storeMessage writes one message, its edit and its reactions, in one
 // batch. A message Meta shows as edited is written whole, then as the edit.
 func (g *Instagram) storeMessage(chat string, m *slidetypes.Message, source string, asNotice bool) (added bool, err error) {
+	g.learnSenders(m)
 	var after []func()
 	var refused error
 	err = g.st.Batch(Name, func(b *store.Batch) error {
@@ -255,8 +255,25 @@ func (g *Instagram) storeMessage(chat string, m *slidetypes.Message, source stri
 	return added, refused
 }
 
+// learnSenders keeps the IGID each message's sender (not him) comes with,
+// before the messages' batch: keeping it is a store write of its own, which
+// inside the batch would wait for the batch for ever (quality review C-1).
+// Learned first, every line and reaction of the page from that sender,
+// its first line included, carries the IGID.
+func (g *Instagram) learnSenders(msgs ...*slidetypes.Message) {
+	for _, m := range msgs {
+		if m == nil || m.Sender == nil {
+			continue
+		}
+		if _, me := g.personOf(m.SenderFBID); !me {
+			g.learnUser(&m.Sender.UserDict)
+		}
+	}
+}
+
 // storeMessageIn writes one message, its edit and its reactions into a
-// batch. What it does beyond the store (settling his send, keeping which
+// batch. It writes nothing outside the batch: what a message teaches of its
+// sender is kept before (learnSenders). What it does beyond the store (settling his send, keeping which
 // reaction message made a reaction) it adds to after, to run once the batch
 // is kept: those are writes of their own, which would wait for the batch.
 func (g *Instagram) storeMessageIn(b *store.Batch, chat string, m *slidetypes.Message, source string, asNotice bool, after *[]func()) (added bool, err error) {
@@ -301,6 +318,11 @@ func (g *Instagram) storeMessages(chat string, edges []slidetypes.Node[*slidetyp
 	if len(edges) == 0 {
 		return 0, nil
 	}
+	msgs := make([]*slidetypes.Message, len(edges))
+	for i, e := range edges {
+		msgs[i] = e.Node
+	}
+	g.learnSenders(msgs...)
 	n := 0
 	var after []func()
 	var refused error
