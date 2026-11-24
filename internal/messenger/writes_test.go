@@ -1273,11 +1273,11 @@ func TestAskingIsKeptOnlyOnceTheRequestLeaves(t *testing.T) {
 func TestEachRequestOfASendHasItsOwnBudget(t *testing.T) {
 	h := newHarness(t)
 	h.signIn(t)
-	h.m.writeWait = time.Second
+	h.m.writeWait = 400 * time.Millisecond
 	h.f.mu.Lock()
 	h.f.hook = func(name string) {
 		if name == "Upload" || name == "SendMessageTask" {
-			time.Sleep(600 * time.Millisecond) // a slow answer, inside its request
+			time.Sleep(250 * time.Millisecond) // a slow answer, inside its request (real time: the budget is a context deadline)
 		}
 	}
 	h.f.mu.Unlock()

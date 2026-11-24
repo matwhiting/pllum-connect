@@ -23,17 +23,7 @@ import (
 // one chat whatever order its tables come in.
 
 // changedEvents counts the changed events so far.
-func (h *harness) changedEvents() int {
-	h.emu.Lock()
-	defer h.emu.Unlock()
-	n := 0
-	for _, e := range h.events {
-		if e["event"] == "changed" {
-			n++
-		}
-	}
-	return n
-}
+func (h *harness) changedEvents() int { return h.log.Count("changed") }
 
 // messageAsks is how many history pages were asked for a thread.
 func (f *fakeMeta) messageAsks(key int64) int {
@@ -67,9 +57,7 @@ func TestAnExistingRangeWithLinesIsAskedOnce(t *testing.T) {
 		}
 	}
 	h.signIn(t)
-	h.settle()
-	time.Sleep(600 * time.Millisecond) // past the changed events' throttle
-	changed := h.changedEvents()
+	changed := h.quiet() // past the changed events' throttle
 
 	key := fmt.Sprint(groupOne)
 	for i := 0; i < 3; i++ {
@@ -80,8 +68,7 @@ func TestAnExistingRangeWithLinesIsAskedOnce(t *testing.T) {
 	if n := h.f.messageAsks(groupOne); n != 1 {
 		t.Errorf("%d history requests for a page that did not move, want 1", n)
 	}
-	time.Sleep(600 * time.Millisecond)
-	if got := h.changedEvents(); got != changed {
+	if got := h.quiet(); got != changed {
 		t.Errorf("%d changed events for a page that added nothing", got-changed)
 	}
 	if h.chat(t, key).HistoryComplete {
@@ -116,6 +103,7 @@ func TestAStalledPageIsNotAskedAgain(t *testing.T) {
 			tc.setup(f, at)
 			h.signIn(t)
 			h.settle()
+			h.m.pageWait = 100 * time.Millisecond // no range is coming: wait no longer than this
 			key := fmt.Sprint(groupOne)
 			if _, err := h.m.FetchOlder(context.Background(), key); (err != nil) != tc.err {
 				t.Fatalf("FetchOlder = %v", err)
@@ -317,7 +305,6 @@ func TestAFolderThatFailsIsPassedOver(t *testing.T) {
 		defer f.e2ee.mu.Unlock()
 		return f.e2ee.connects == 2
 	})
-	time.Sleep(300 * time.Millisecond)
 	next.settle()
 	if got := countThreadTasks(f.requests()); got != before {
 		t.Errorf("the next launch asked %d thread pages, want none", got-before)
@@ -454,7 +441,6 @@ func TestAPageThatPanicsFailsItsFolder(t *testing.T) {
 		defer f.e2ee.mu.Unlock()
 		return f.e2ee.connects == 2
 	})
-	time.Sleep(300 * time.Millisecond)
 	next.settle()
 	if got := countThreadTasks(f.requests()); got != before {
 		t.Errorf("the next launch asked %d thread pages, want none", got-before)

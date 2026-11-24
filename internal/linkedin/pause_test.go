@@ -271,7 +271,7 @@ func TestATransientDisconnectIsOfflineUntilItConnects(t *testing.T) {
 	// A realtime connect LinkedIn pushed back on is a pause.
 	c.dispatch(transient{err: statusErr(429)})
 	r.waitState(network.Offline, wire.RateLimited)
-	if got := r.ev.states(); !slices.Contains(got, "offline/rateLimited") {
+	if got := r.ev.States(); !slices.Contains(got, "offline/rateLimited") {
 		t.Fatalf("states = %v", got)
 	}
 }

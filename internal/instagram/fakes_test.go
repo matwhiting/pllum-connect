@@ -20,6 +20,7 @@ import (
 
 	"github.com/matwhiting/pllum-connect/internal/network"
 	"github.com/matwhiting/pllum-connect/internal/store"
+	"github.com/matwhiting/pllum-connect/internal/testkit"
 )
 
 // Every name, ID, cookie and text in these tests is invented.
@@ -62,70 +63,9 @@ func validSession() network.Session {
 }
 
 // fakeClock moves only when something sleeps on it or a test advances it.
-type fakeClock struct {
-	mu     sync.Mutex
-	now    time.Time
-	timers []*fakeTimer
-}
+type fakeClock = testkit.Clock
 
-type fakeTimer struct {
-	at      time.Time
-	f       func()
-	stopped bool
-}
-
-func newFakeClock() *fakeClock { return &fakeClock{now: start} }
-
-func (c *fakeClock) Now() time.Time {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.now
-}
-
-func (c *fakeClock) AfterFunc(d time.Duration, f func()) func() bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	t := &fakeTimer{at: c.now.Add(d), f: f}
-	c.timers = append(c.timers, t)
-	return func() bool {
-		c.mu.Lock()
-		defer c.mu.Unlock()
-		was := !t.stopped
-		t.stopped = true
-		return was
-	}
-}
-
-func (c *fakeClock) Sleep(ctx context.Context, d time.Duration) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	c.Advance(d)
-	return ctx.Err()
-}
-
-// Advance moves the clock and runs every timer now due.
-func (c *fakeClock) Advance(d time.Duration) {
-	c.mu.Lock()
-	c.now = c.now.Add(d)
-	var due []*fakeTimer
-	kept := c.timers[:0]
-	for _, t := range c.timers {
-		switch {
-		case t.stopped:
-		case !t.at.After(c.now):
-			t.stopped = true
-			due = append(due, t)
-		default:
-			kept = append(kept, t)
-		}
-	}
-	c.timers = kept
-	c.mu.Unlock()
-	for _, t := range due {
-		t.f()
-	}
-}
+func newFakeClock() *fakeClock { return testkit.NewClock(start) }
 
 // call is one request a fake client was asked to make.
 type call struct {
@@ -528,9 +468,7 @@ type harness struct {
 	g     *Instagram
 	m     *fakeMeta
 	clock *fakeClock
-
-	emu    sync.Mutex
-	events []map[string]any
+	log   *testkit.Events
 }
 
 func newHarness(t *testing.T) *harness {
@@ -545,14 +483,14 @@ func openHarness(t *testing.T, dir string, m *fakeMeta) *harness {
 	if err != nil {
 		t.Fatal(err)
 	}
-	h := &harness{t: t, dir: dir, st: st, clock: newFakeClock()}
+	h := &harness{t: t, dir: dir, st: st, clock: newFakeClock(), log: &testkit.Events{}}
 	if m == nil {
 		m = newFakeMeta(h.clock)
 	} else {
 		m.clock = h.clock
 	}
 	h.m = m
-	h.g = New(st, dir, testKey, network.Emit(h.collect).For(Name))
+	h.g = New(st, dir, testKey, network.Emit(h.log.Emit).For(Name))
 	h.g.clock = h.clock
 	h.g.newClient = m.newClient
 	if err := h.g.Start(context.Background()); err != nil {
@@ -567,37 +505,11 @@ func (h *harness) close() {
 	h.st.Close()
 }
 
-func (h *harness) collect(evt map[string]any) {
-	h.emu.Lock()
-	defer h.emu.Unlock()
-	h.events = append(h.events, evt)
-}
-
 // named are the events called name.
-func (h *harness) named(name string) []map[string]any {
-	h.emu.Lock()
-	defer h.emu.Unlock()
-	var out []map[string]any
-	for _, e := range h.events {
-		if e["event"] == name {
-			out = append(out, e)
-		}
-	}
-	return out
-}
+func (h *harness) named(name string) []map[string]any { return h.log.Named(name) }
 
 // states are the state events, as "state" or "state/kind".
-func (h *harness) states() []string {
-	var out []string
-	for _, e := range h.named("state") {
-		s := fmt.Sprint(e["state"])
-		if k, ok := e["kind"]; ok {
-			s += "/" + fmt.Sprint(k)
-		}
-		out = append(out, s)
-	}
-	return out
-}
+func (h *harness) states() []string { return h.log.States() }
 
 func (h *harness) lastState() string {
 	s := h.states()
@@ -651,13 +563,7 @@ func (h *harness) lines(chat string) map[string]store.Message {
 
 func eventually(t *testing.T, what string, cond func() bool) {
 	t.Helper()
-	deadline := time.Now().Add(10 * time.Second)
-	for !cond() {
-		if time.Now().After(deadline) {
-			t.Fatalf("timed out waiting for %s", what)
-		}
-		time.Sleep(2 * time.Millisecond)
-	}
+	testkit.Eventually(t, what, cond)
 }
 
 // Builders of Meta's shapes, with invented values.

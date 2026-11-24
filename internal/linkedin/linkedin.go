@@ -195,9 +195,10 @@ type LinkedIn struct {
 	prevState   network.State // the state before the sign-in began, for a refusal to go back to
 	prevKind    wire.Kind
 
-	wake chan struct{}
-	work sync.WaitGroup
-	busy atomic.Int32 // runs at work and stream stops still running
+	wake  chan struct{}
+	woken atomic.Int32 // wakes in wake not yet taken up (tests settle on it)
+	work  sync.WaitGroup
+	busy  atomic.Int32 // runs at work and stream stops still running
 
 	vmu    sync.Mutex
 	values map[string]string

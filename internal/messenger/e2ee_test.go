@@ -366,11 +366,9 @@ func TestAnUnreadableReactionEditOrUnsendSentAgainIsSettled(t *testing.T) {
 	}
 
 	// the same unsend again settles nothing more
-	time.Sleep(700 * time.Millisecond)
-	events := h.changedEvents()
+	events := h.quiet()
 	h.deliver(t, fbMessage(oneToOne(aliceFBID), person(aliceFBID), "WAINVENTED98-revoke", t0.Add(5*time.Minute), revokeContent("WAINVENTED98"), ""))
-	time.Sleep(700 * time.Millisecond)
-	if n := h.changedEvents() - events; n != 0 {
+	if n := h.quiet() - events; n != 0 {
 		t.Errorf("the same unsend again sent %d changed events, want 0", n)
 	}
 	settled(t, h, alice, "WAINVENTED98-revoke", "unavailable")
@@ -581,8 +579,7 @@ func TestAMessageThatCannotBeStoredIsNotLostForever(t *testing.T) {
 	// Nothing written, nothing to re-read: a poll vote, a signal, a line
 	// already held sent again.
 	h.deliver(t, fbMessage(oneToOne(aliceFBID), person(aliceFBID), "WAINVENTED61", at, textContent("y"), ""))
-	time.Sleep(700 * time.Millisecond)
-	before := h.changedEvents()
+	before := h.quiet()
 	vote := content(&waConsumerApplication.ConsumerApplication_Content{Content: &waConsumerApplication.ConsumerApplication_Content_PollUpdateMessage{
 		PollUpdateMessage: &waConsumerApplication.ConsumerApplication_PollUpdateMessage{}}})
 	h.deliver(t, fbMessage(oneToOne(aliceFBID), person(aliceFBID), "WAINVENTED62", at, vote, ""))
@@ -590,8 +587,7 @@ func TestAMessageThatCannotBeStoredIsNotLostForever(t *testing.T) {
 		Payload: &waConsumerApplication.ConsumerApplication_Payload_Signal{Signal: &waConsumerApplication.ConsumerApplication_Signal{}}}}
 	h.deliver(t, fbMessage(oneToOne(aliceFBID), person(aliceFBID), "WAINVENTED63", at, signal, ""))
 	h.deliver(t, fbMessage(oneToOne(aliceFBID), person(aliceFBID), "WAINVENTED61", at, textContent("y"), ""))
-	time.Sleep(700 * time.Millisecond)
-	if n := h.changedEvents() - before; n != 0 {
+	if n := h.quiet() - before; n != 0 {
 		t.Errorf("messages that wrote nothing sent %d changed events", n)
 	}
 }
@@ -608,10 +604,7 @@ func TestATakenOverRowTellsPllum(t *testing.T) {
 	h.f.history.script(fmt.Sprint(aliceFBID), fakePage{msgs: []*securehistory.DecryptedMessage{
 		archived("WAINVENTED72", aliceFBID, at.Add(-time.Hour), textContent(canary+" restored over a notice"))}})
 	h.signIn(t)
-	quiet := func() int {
-		time.Sleep(700 * time.Millisecond)
-		return h.changedEvents()
-	}
+	quiet := h.quiet
 	info := func(id string) watypes.MessageInfo {
 		return watypes.MessageInfo{MessageSource: watypes.MessageSource{Chat: oneToOne(aliceFBID), Sender: person(aliceFBID)}, ID: id, Timestamp: at}
 	}

@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -32,6 +33,7 @@ import (
 	"github.com/matwhiting/pllum-connect/internal/meta"
 	"github.com/matwhiting/pllum-connect/internal/network"
 	"github.com/matwhiting/pllum-connect/internal/store"
+	"github.com/matwhiting/pllum-connect/internal/testkit"
 )
 
 // Every name, ID, cookie, PIN and text in these tests is invented.
@@ -152,6 +154,7 @@ func (u fakeUser) GetFBID() int64       { return u.fbid }
 // secure-history service. It never touches the network.
 type fakeMeta struct {
 	mu        sync.Mutex
+	inflight  *atomic.Int32 // events the fakes are still handing over on goroutines of their own
 	table     *table.LSTable
 	loadErr   error
 	loads     int
@@ -241,7 +244,8 @@ type call struct {
 }
 
 func newFakeMeta() *fakeMeta {
-	f := &fakeMeta{table: inbox(), e2ee: &fakeE2EE{}, history: &fakeHistory{},
+	inflight := &atomic.Int32{}
+	f := &fakeMeta{inflight: inflight, table: inbox(), e2ee: &fakeE2EE{inflight: inflight}, history: &fakeHistory{},
 		folders: map[folderKey][]*table.LSTable{}, older: map[int64][]*table.LSTable{}, clock: newFakeClock(),
 		writeErrs: map[string]error{}, files: map[string][]byte{},
 		icdc: [][32]byte{inventedIdentity(0x11)}, icdcSeq: 3}
@@ -267,74 +271,10 @@ func (f *fakeMeta) requests() []call {
 
 // fakeClock is the time the pace and the network's timers run on: Sleep
 // moves it on at once, and a timer runs when the clock reaches it.
-type fakeClock struct {
-	mu     sync.Mutex
-	now    time.Time
-	timers []*fakeTimer
-}
-
-type fakeTimer struct {
-	at      time.Time
-	f       func()
-	stopped bool
-}
-
-// AfterFunc runs f once the clock has moved d on.
-func (c *fakeClock) AfterFunc(d time.Duration, f func()) func() bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	t := &fakeTimer{at: c.now.Add(d), f: f}
-	c.timers = append(c.timers, t)
-	return func() bool {
-		c.mu.Lock()
-		defer c.mu.Unlock()
-		was := !t.stopped
-		t.stopped = true
-		return was
-	}
-}
+type fakeClock = testkit.Clock
 
 func newFakeClock() *fakeClock {
-	return &fakeClock{now: time.Date(2026, 3, 2, 9, 0, 0, 0, time.UTC)}
-}
-
-func (c *fakeClock) Now() time.Time {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.now
-}
-
-func (c *fakeClock) Sleep(ctx context.Context, d time.Duration) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	c.Advance(d)
-	return nil
-}
-
-// Advance moves the clock on and runs every timer now due.
-func (c *fakeClock) Advance(d time.Duration) {
-	c.mu.Lock()
-	if d > 0 {
-		c.now = c.now.Add(d)
-	}
-	var due []*fakeTimer
-	kept := c.timers[:0]
-	for _, t := range c.timers {
-		switch {
-		case t.stopped:
-		case !t.at.After(c.now):
-			t.stopped = true
-			due = append(due, t)
-		default:
-			kept = append(kept, t)
-		}
-	}
-	c.timers = kept
-	c.mu.Unlock()
-	for _, t := range due {
-		t.f()
-	}
+	return testkit.NewClock(time.Date(2026, 3, 2, 9, 0, 0, 0, time.UTC))
 }
 
 // gaps fails unless every request went at least 2 s after the one before.
@@ -381,7 +321,7 @@ func (c *fakeClient) Connect(ctx context.Context) error {
 	hold := c.f.holdConnect
 	c.f.mu.Unlock()
 	if !hold {
-		go c.dispatch(&messagix.ConnectedEvent{})
+		goDispatch(c.f.inflight, func() { c.dispatch(&messagix.ConnectedEvent{}) })
 	}
 	return nil
 }
@@ -477,7 +417,7 @@ func (c *fakeClient) ExecuteTasks(ctx context.Context, tasks ...socket.Task) (*t
 		case inResponse:
 			return tbl, nil
 		}
-		go c.dispatch(tbl)
+		goDispatch(c.f.inflight, func() { c.dispatch(tbl) })
 		return &table.LSTable{}, nil
 	}
 	c.f.mu.Unlock()
@@ -572,6 +512,9 @@ func (c *fakeClient) PrepareE2EE() (e2eeClient, error) {
 	defer c.f.mu.Unlock()
 	if len(c.f.e2eeNext) > 0 {
 		c.f.e2ee, c.f.e2eeNext = c.f.e2eeNext[0], c.f.e2eeNext[1:]
+		if c.f.e2ee.inflight == nil {
+			c.f.e2ee.inflight = c.f.inflight
+		}
 	}
 	return c.f.e2ee, nil
 }
@@ -589,9 +532,20 @@ func inventedIdentity(b byte) (k [32]byte) {
 
 func (c *fakeClient) History() historyClient { return c.f.history }
 
+// goDispatch hands an event over on a goroutine of its own, as the real
+// sockets do, counted in inflight until it has been handled.
+func goDispatch(inflight *atomic.Int32, dispatch func()) {
+	inflight.Add(1)
+	go func() {
+		defer inflight.Add(-1)
+		dispatch()
+	}()
+}
+
 // fakeE2EE is the encrypted socket: Connect says connected (unless the
 // test holds it), and a test delivers events through it.
 type fakeE2EE struct {
+	inflight    *atomic.Int32
 	mu          sync.Mutex
 	handlers    []func(evt any) bool
 	connects    int
@@ -617,7 +571,7 @@ func (e *fakeE2EE) Connect() error {
 	}
 	e.mu.Unlock()
 	if !hold {
-		go e.dispatch(&events.Connected{})
+		goDispatch(e.inflight, func() { e.dispatch(&events.Connected{}) })
 	}
 	return nil
 }
@@ -825,9 +779,7 @@ type harness struct {
 	f   *fakeMeta
 	st  *store.Store
 	dir string
-
-	emu    sync.Mutex
-	events []map[string]any
+	log *testkit.Events
 }
 
 func newHarness(t *testing.T) *harness {
@@ -839,17 +791,13 @@ func newHarness(t *testing.T) *harness {
 // an existing folder, on the given fakes.
 func newHarnessOver(t *testing.T, dir string, f *fakeMeta) *harness {
 	t.Helper()
-	h := &harness{f: f, dir: dir}
+	h := &harness{f: f, dir: dir, log: &testkit.Events{}}
 	st, err := store.Open(h.dir, testKey)
 	if err != nil {
 		t.Fatal(err)
 	}
 	h.st = st
-	emit := network.Emit(func(e map[string]any) {
-		h.emu.Lock()
-		defer h.emu.Unlock()
-		h.events = append(h.events, e)
-	})
+	emit := network.Emit(h.log.Emit)
 	h.m = New(st, h.dir, testKey, emit.For(Name)).WithGate()
 	h.m.newClient = h.f.newClient
 	h.m.newWriter = func(msgrClient, e2eeClient) msgrWriter { return fakeWriter{f} }
@@ -874,13 +822,9 @@ func (h *harness) close() {
 
 // state is the network's state and kind now.
 func (h *harness) state() (network.State, string) {
-	h.emu.Lock()
-	defer h.emu.Unlock()
-	for i := len(h.events) - 1; i >= 0; i-- {
-		if h.events[i]["event"] == "state" {
-			k, _ := h.events[i]["kind"].(string)
-			return h.events[i]["state"].(network.State), k
-		}
+	if e := h.log.LastState(); e != nil {
+		k, _ := e["kind"].(string)
+		return e["state"].(network.State), k
 	}
 	return network.NotConnected, ""
 }
@@ -900,13 +844,7 @@ func (h *harness) signIn(t *testing.T) {
 
 func eventually(t *testing.T, what string, ok func() bool) {
 	t.Helper()
-	deadline := time.Now().Add(60 * time.Second) // only a failure waits this long; the race detector under load is slow
-	for !ok() {
-		if time.Now().After(deadline) {
-			t.Fatalf("timed out waiting for %s", what)
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
+	testkit.Eventually(t, what, ok)
 }
 
 // fbSend is one encrypted send as SendFBMessage was asked it.

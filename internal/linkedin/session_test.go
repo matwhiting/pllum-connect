@@ -65,7 +65,7 @@ func TestASessionWithoutLiAtIsBadRequest(t *testing.T) {
 		if wire.KindOf(err) != wire.BadRequest {
 			t.Errorf("without %s: Login = %v, want badRequest", missing, err)
 		}
-		if got := r.ev.states(); !slices.Equal(got, []string{"notConnected/badRequest"}) {
+		if got := r.ev.States(); !slices.Equal(got, []string{"notConnected/badRequest"}) {
 			t.Errorf("without %s: states = %v", missing, got)
 		}
 		if n := len(r.f.callsNow()); n != 0 {
@@ -149,7 +149,7 @@ func TestRefreshedCookiesEmitASessionEventAtMostOncePerMinute(t *testing.T) {
 		})
 	}
 	r.live()
-	sessions := r.ev.named("session")
+	sessions := r.ev.Named("session")
 	if len(sessions) != 1 {
 		t.Fatalf("%d session events during sign-in and catch-up (many requests within a minute), want 1", len(sessions))
 	}
@@ -168,14 +168,14 @@ func TestRefreshedCookiesEmitASessionEventAtMostOncePerMinute(t *testing.T) {
 	c := r.f.last()
 	c.dispatch(convDeleteless())
 	r.idle()
-	if n := len(r.ev.named("session")); n != 1 {
+	if n := len(r.ev.Named("session")); n != 1 {
 		t.Fatalf("%d session events within a minute, want 1", n)
 	}
 	// A minute on, the next request's change goes out.
 	r.clock.Advance(time.Minute)
 	c.dispatch(convDeleteless())
 	r.idle()
-	if n := len(r.ev.named("session")); n != 2 {
+	if n := len(r.ev.Named("session")); n != 2 {
 		t.Fatalf("%d session events a minute on, want 2", n)
 	}
 }
@@ -281,7 +281,7 @@ func TestAnotherAccountLeavesALiveSessionRunning(t *testing.T) {
 	if err := r.login(otherSession()); err != nil {
 		t.Fatal(err)
 	}
-	eventually(t, "the refusal", func() bool { return slices.Contains(r.ev.states(), "notConnected/refused") })
+	eventually(t, "the refusal", func() bool { return slices.Contains(r.ev.States(), "notConnected/refused") })
 	r.waitState(network.Live, "")
 	r.idle()
 	if n := r.f.count("RealtimeDisconnect"); n != 0 {
@@ -307,33 +307,33 @@ func TestALoginAlwaysSaysItsOutcome(t *testing.T) {
 	r.waitState(network.ReconnectNeeded, "")
 	r.idle()
 	r.restart()
-	if got := r.ev.states(); !slices.Equal(got, []string{"reconnectNeeded"}) {
+	if got := r.ev.States(); !slices.Equal(got, []string{"reconnectNeeded"}) {
 		t.Fatalf("states at the start = %v, want reconnectNeeded", got)
 	}
 	if err := r.login(validSession()); err != nil {
 		t.Fatalf("Login: %v", err)
 	}
-	if got := r.ev.states(); !slices.Equal(got, []string{"reconnectNeeded", "reconnectNeeded"}) {
+	if got := r.ev.States(); !slices.Equal(got, []string{"reconnectNeeded", "reconnectNeeded"}) {
 		t.Errorf("states after the saved session's login = %v, want reconnectNeeded said again", got)
 	}
 
 	// The same for a login during a pause, and a badRequest twice.
 	r2, _ := pauseAfterLive(t, 429)
-	k := len(r2.ev.states())
+	k := len(r2.ev.States())
 	if err := r2.login(validSession()); err != nil {
 		t.Fatal(err)
 	}
 	if err := r2.login(validSession()); err != nil {
 		t.Fatal(err)
 	}
-	if got := r2.ev.states()[k:]; !slices.Equal(got, []string{"offline/rateLimited", "offline/rateLimited"}) {
+	if got := r2.ev.States()[k:]; !slices.Equal(got, []string{"offline/rateLimited", "offline/rateLimited"}) {
 		t.Errorf("states for two logins during a pause = %v, want offline/rateLimited said each time", got)
 	}
 	r3 := newRig(t)
 	bad := network.Session{"li_at": "li-at-invented-1"}
 	_ = r3.login(bad)
 	_ = r3.login(bad)
-	if got := r3.ev.states(); !slices.Equal(got, []string{"notConnected/badRequest", "notConnected/badRequest"}) {
+	if got := r3.ev.States(); !slices.Equal(got, []string{"notConnected/badRequest", "notConnected/badRequest"}) {
 		t.Errorf("states for two bad sessions = %v, want notConnected/badRequest said each time", got)
 	}
 }
@@ -404,8 +404,8 @@ func TestDisconnectForgetsTheAccount(t *testing.T) {
 	}
 	r.waitState(network.Live, "")
 	r.idle()
-	if slices.Contains(r.ev.states(), "notConnected/refused") {
-		t.Fatalf("another account was refused after Disconnect: %v", r.ev.states())
+	if slices.Contains(r.ev.States(), "notConnected/refused") {
+		t.Fatalf("another account was refused after Disconnect: %v", r.ev.States())
 	}
 	if got := r.value("self"); got != otherID {
 		t.Errorf("self = %q, want the new account's", got)
@@ -499,15 +499,15 @@ func TestASignInThatChangesNothingSaysWhy(t *testing.T) {
 			r := newRig(t)
 			r.live()
 			r.f.setErr("GetCurrentUserProfile", tc.err)
-			k := len(r.ev.states())
+			k := len(r.ev.States())
 			fresh := validSession()
 			fresh["li_at"] = "li-at-invented-2"
 			if err := r.login(fresh); err != nil {
 				t.Fatal(err)
 			}
-			eventually(t, "the run's state back", func() bool { return len(r.ev.states()) >= k+3 })
+			eventually(t, "the run's state back", func() bool { return len(r.ev.States()) >= k+3 })
 			r.waitState(network.Live, "")
-			if got := r.ev.states()[k:]; !slices.Equal(got, []string{"connecting", tc.want, "live"}) {
+			if got := r.ev.States()[k:]; !slices.Equal(got, []string{"connecting", tc.want, "live"}) {
 				t.Errorf("states = %v, want connecting, %s, then live", got, tc.want)
 			}
 			if n := r.f.count("RealtimeDisconnect"); n != 0 {

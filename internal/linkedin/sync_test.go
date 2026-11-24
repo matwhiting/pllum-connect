@@ -80,7 +80,7 @@ func TestCatchUpFollowsTheSyncTokenThenGoesLive(t *testing.T) {
 	if slices.Contains(names, "GetConversationsWithNextCursor") || slices.Contains(names, "GetConversationsUpdatedBefore") {
 		t.Errorf("a catch-up with a token listed the inbox: %v", names)
 	}
-	states := r.ev.states()
+	states := r.ev.States()
 	want := []string{"connecting", "catchingUp", "live"}
 	if !slices.Equal(states[:min(3, len(states))], want) {
 		t.Errorf("states = %v, want %v", states, want)

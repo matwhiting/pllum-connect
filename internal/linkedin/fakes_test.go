@@ -18,6 +18,7 @@ import (
 
 	"github.com/matwhiting/pllum-connect/internal/network"
 	"github.com/matwhiting/pllum-connect/internal/store"
+	"github.com/matwhiting/pllum-connect/internal/testkit"
 	"github.com/matwhiting/pllum-connect/internal/wire"
 )
 
@@ -72,72 +73,9 @@ func validSession() network.Session {
 }
 
 // fakeClock moves only when something sleeps on it or a test advances it.
-type fakeClock struct {
-	mu     sync.Mutex
-	now    time.Time
-	timers []*fakeTimer
-}
+type fakeClock = testkit.Clock
 
-type fakeTimer struct {
-	at      time.Time
-	f       func()
-	stopped bool
-}
-
-func newFakeClock() *fakeClock { return &fakeClock{now: start} }
-
-func (c *fakeClock) Now() time.Time {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.now
-}
-
-func (c *fakeClock) AfterFunc(d time.Duration, f func()) func() bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	t := &fakeTimer{at: c.now.Add(d), f: f}
-	c.timers = append(c.timers, t)
-	return func() bool {
-		c.mu.Lock()
-		defer c.mu.Unlock()
-		was := !t.stopped
-		t.stopped = true
-		return was
-	}
-}
-
-func (c *fakeClock) Sleep(ctx context.Context, d time.Duration) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	if d > 0 {
-		c.Advance(d)
-	}
-	return ctx.Err()
-}
-
-// Advance moves the clock and runs every timer now due.
-func (c *fakeClock) Advance(d time.Duration) {
-	c.mu.Lock()
-	c.now = c.now.Add(d)
-	var due []*fakeTimer
-	kept := c.timers[:0]
-	for _, t := range c.timers {
-		switch {
-		case t.stopped:
-		case !t.at.After(c.now):
-			t.stopped = true
-			due = append(due, t)
-		default:
-			kept = append(kept, t)
-		}
-	}
-	c.timers = kept
-	c.mu.Unlock()
-	for _, t := range due {
-		t.f()
-	}
-}
+func newFakeClock() *fakeClock { return testkit.NewClock(start) }
 
 // call is one call a fake client was asked to make.
 type call struct {
@@ -620,41 +558,7 @@ type badCredentials struct{ err error }
 func statusErr(code int) error { return &linkedingo.ResponseError{StatusCode: code} }
 
 // events records what the network emitted.
-type events struct {
-	mu  sync.Mutex
-	all []map[string]any
-}
-
-func (e *events) emit(ev map[string]any) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	e.all = append(e.all, ev)
-}
-
-func (e *events) named(name string) []map[string]any {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	var out []map[string]any
-	for _, ev := range e.all {
-		if ev["event"] == name {
-			out = append(out, ev)
-		}
-	}
-	return out
-}
-
-// states lists the state events as "state" or "state/kind".
-func (e *events) states() []string {
-	var out []string
-	for _, ev := range e.named("state") {
-		s := fmt.Sprint(ev["state"])
-		if k, ok := ev["kind"]; ok {
-			s += "/" + fmt.Sprint(k)
-		}
-		out = append(out, s)
-	}
-	return out
-}
+type events = testkit.Events
 
 // rig is one network over a fresh store, a fake clock and a fake LinkedIn.
 type rig struct {
@@ -689,7 +593,7 @@ func (r *rig) restart() {
 		r.l.Stop()
 	}
 	r.ev = &events{}
-	r.l = New(r.st, r.dir, testKey, r.ev.emit, Options{NewClient: r.f.newClient, Clock: r.clock})
+	r.l = New(r.st, r.dir, testKey, r.ev.Emit, Options{NewClient: r.f.newClient, Clock: r.clock})
 	if err := r.l.Start(context.Background()); err != nil {
 		r.t.Fatalf("Start: %v", err)
 	}
@@ -736,7 +640,7 @@ func (r *rig) live() *fakeClient {
 // waitState waits until the network's state is s with kind.
 func (r *rig) waitState(s network.State, kind wire.Kind) {
 	r.t.Helper()
-	eventually(r.t, fmt.Sprintf("state %s/%s (have %v)", s, kind, r.ev.states()), func() bool {
+	eventually(r.t, fmt.Sprintf("state %s/%s (have %v)", s, kind, r.ev.States()), func() bool {
 		st, k := r.l.stateNow()
 		return st == s && k == kind
 	})
@@ -775,28 +679,16 @@ func (r *rig) lines(chat string) []store.Message {
 	return out
 }
 
-// eventually polls cond in real time for up to 15 s.
+// eventually waits for cond (testkit.Eventually).
 func eventually(t *testing.T, what string, cond func() bool) {
 	t.Helper()
-	deadline := time.Now().Add(15 * time.Second)
-	for !cond() {
-		if time.Now().After(deadline) {
-			t.Fatalf("timed out waiting for %s", what)
-		}
-		time.Sleep(2 * time.Millisecond)
-	}
+	testkit.Eventually(t, what, cond)
 }
 
 // never checks cond stays false for a short real time.
 func never(t *testing.T, what string, cond func() bool) {
 	t.Helper()
-	deadline := time.Now().Add(100 * time.Millisecond)
-	for time.Now().Before(deadline) {
-		if cond() {
-			t.Fatalf("%s", what)
-		}
-		time.Sleep(2 * time.Millisecond)
-	}
+	testkit.Never(t, what, cond)
 }
 
 // Builders of LinkedIn's shapes.

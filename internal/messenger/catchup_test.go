@@ -9,6 +9,8 @@ import (
 	"go.mau.fi/mautrix-meta/pkg/messagix/securehistory"
 	watypes "go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
+
+	"github.com/matwhiting/pllum-connect/internal/testkit"
 )
 
 // restored signs in, restores his history from a backup with nothing in it
@@ -27,12 +29,11 @@ func restored(t *testing.T, h *harness) {
 // waitLine waits for a chat's line to read as want, or fails.
 func waitLine(t *testing.T, h *harness, chat, id, want string) {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		if l, ok := h.line(t, chat, id); ok && l.Text == want && l.Kind == "text" {
-			return
-		}
-		time.Sleep(20 * time.Millisecond)
+	if testkit.Wait(func() bool {
+		l, ok := h.line(t, chat, id)
+		return ok && l.Text == want && l.Kind == "text"
+	}) {
+		return
 	}
 	l, ok := h.line(t, chat, id)
 	t.Fatalf("line %s reads %+v (ok %v), want %q", id, l, ok, want)
@@ -85,7 +86,6 @@ func TestUnreadableMessagesInOneChatFillOnce(t *testing.T) {
 	}
 	h.f.clock.Advance(2 * time.Minute)
 	h.settle()
-	time.Sleep(200 * time.Millisecond)
 	if n := len(h.f.history.asked(fmt.Sprint(aliceFBID))) - asked; n != 1 {
 		t.Errorf("the backup was asked %d times for the chat, want 1", n)
 	}
@@ -274,8 +274,6 @@ func advanceTo(h *harness, at time.Time) {
 		h.f.clock.Advance(d)
 	}
 	h.settle()
-	time.Sleep(100 * time.Millisecond)
-	h.settle()
 }
 
 // filledAt waits for the chat's newest page due now to be read.
@@ -410,7 +408,7 @@ func TestAStoppedNetworkAsksNothingAtTheHour(t *testing.T) {
 	filledAt(t, h, alice, asked+1)
 	h.m.Stop()
 	h.f.clock.Advance(2 * refillDelay)
-	time.Sleep(200 * time.Millisecond)
+	h.settle()
 	if n := pagesAsked(h) - asked; n != 1 {
 		t.Errorf("%d pages were asked, want the two minutes' one alone", n)
 	}

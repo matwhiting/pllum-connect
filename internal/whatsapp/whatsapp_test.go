@@ -45,7 +45,7 @@ func TestALiveTextIsStoredUnderItsOwnID(t *testing.T) {
 	if c.LastMessageID != "3EB0A1000000000000002" || c.Unread != 1 || c.Kind != "single" {
 		t.Errorf("the chat is %+v", c)
 	}
-	if len(r.log.named("changed")) == 0 {
+	if len(r.log.Named("changed")) == 0 {
 		t.Errorf("no changed event after new lines")
 	}
 }
@@ -94,8 +94,8 @@ func TestAHistoryNotificationIsKeptBeforeTheAckAndProcessedAfterARestart(t *test
 	if _, _, downloads := r.client().counts(); downloads != 1 {
 		t.Fatalf("the restarted run downloaded %d times, want once", downloads)
 	}
-	eventually(t, "a history event", func() bool { return len(r.log.named("history")) > 0 })
-	h := r.log.named("history")
+	eventually(t, "a history event", func() bool { return len(r.log.Named("history")) > 0 })
+	h := r.log.Named("history")
 	if last := h[len(h)-1]; last["chats"] != 1 || last["messages"] != 2 || last["done"] != false {
 		t.Errorf("the history event is %v", last)
 	}
@@ -589,7 +589,7 @@ func TestStatesFollowTheConnection(t *testing.T) {
 			if st := r.w.Status().State; st != c.want {
 				t.Fatalf("after %T the state is %q, want %q", c.evt, st, c.want)
 			}
-			if last := r.log.lastState(); last == nil || last["state"] != c.want || last["network"] != "whatsapp" {
+			if last := r.log.LastState(); last == nil || last["state"] != c.want || last["network"] != "whatsapp" {
 				t.Fatalf("the last state event is %v, want %q", last, c.want)
 			}
 		})
@@ -804,8 +804,8 @@ func TestQRCodesBecomeEventsAndAPasskeyRequestStopsTheLogin(t *testing.T) {
 	now := r.clock.Now().UnixMilli()
 	fc.qr <- whatsmeow.QRChannelItem{Event: whatsmeow.QRChannelEventCode, Code: "invented-qr-1", Timeout: 60 * time.Second}
 	fc.qr <- whatsmeow.QRChannelItem{Event: whatsmeow.QRChannelEventCode, Code: "invented-qr-2", Timeout: 20 * time.Second}
-	eventually(t, "two qr events", func() bool { return len(r.log.named("qr")) == 2 })
-	qr := r.log.named("qr")
+	eventually(t, "two qr events", func() bool { return len(r.log.Named("qr")) == 2 })
+	qr := r.log.Named("qr")
 	if qr[0]["code"] != "invented-qr-1" || qr[0]["expiresMs"] != now+60000 || qr[0]["network"] != "whatsapp" {
 		t.Fatalf("the first qr event is %v", qr[0])
 	}
@@ -815,7 +815,7 @@ func TestQRCodesBecomeEventsAndAPasskeyRequestStopsTheLogin(t *testing.T) {
 
 	fc.qr <- whatsmeow.QRChannelItem{Event: whatsmeow.QRChannelEventPasskeyRequest, PasskeyRequest: &events.PairPasskeyRequest{}}
 	eventually(t, "the login to stop", func() bool { return r.w.Status().State == network.NotConnected })
-	if last := r.log.lastState(); last["kind"] != "unsupported" {
+	if last := r.log.LastState(); last["kind"] != "unsupported" {
 		t.Fatalf("a passkey request ended the login with %v", last)
 	}
 	if _, d, _ := fc.counts(); d == 0 || fc.qrCtx.Err() == nil {
@@ -842,10 +842,10 @@ func TestQRCodesBecomeEventsAndAPasskeyRequestStopsTheLogin(t *testing.T) {
 			fc := r.client()
 			fc.qr <- f.item
 			eventually(t, "the login's end", func() bool {
-				last := r.log.lastState()
+				last := r.log.LastState()
 				return last != nil && last["state"] == f.state
 			})
-			if last := r.log.lastState(); last["kind"] != f.kind {
+			if last := r.log.LastState(); last["kind"] != f.kind {
 				t.Fatalf("%s ended as %v, want kind %v", f.item.Event, last, f.kind)
 			}
 		})
@@ -881,12 +881,12 @@ func TestATimedMuteLapsesAndPllumIsToldToReRead(t *testing.T) {
 	if !r.chat(aliceJID.String()).Muted {
 		t.Fatalf("the mute lapsed early")
 	}
-	before := len(r.log.named("changed"))
+	before := len(r.log.Named("changed"))
 	r.clock.Advance(time.Second)
 	if r.chat(aliceJID.String()).Muted {
 		t.Fatalf("the mute still read muted after eight hours")
 	}
-	if n := len(r.log.named("changed")); n <= before {
+	if n := len(r.log.Named("changed")); n <= before {
 		t.Fatalf("no changed event when the mute lapsed (%d before, %d after)", before, n)
 	}
 }
@@ -905,9 +905,9 @@ func TestAMuteForEverNeverLapsesAndAnUnmuteStopsTheTimer(t *testing.T) {
 	r.send(&events.Mute{JID: aliceJID, Action: &waSyncAction.MuteAction{Muted: proto.Bool(true), MuteEndTimestamp: proto.Int64(until)}})
 	r.send(&events.Mute{JID: aliceJID, Action: &waSyncAction.MuteAction{Muted: proto.Bool(false)}})
 	r.clock.Advance(time.Hour) // runs any changed left pending by the events above
-	before := len(r.log.named("changed"))
+	before := len(r.log.Named("changed"))
 	r.clock.Advance(8 * time.Hour)
-	if n := len(r.log.named("changed")); n != before {
+	if n := len(r.log.Named("changed")); n != before {
 		t.Fatalf("a lapse was announced for a mute he had undone (%d before, %d after)", before, n)
 	}
 }
@@ -936,9 +936,9 @@ func TestATimedMuteFromHistoryAndAcrossARestartLapses(t *testing.T) {
 		t.Fatalf("a timed mute in history did not mute the chat")
 	}
 	r.clock.Advance(time.Hour) // let the history's changed events go
-	before := len(r.log.named("changed"))
+	before := len(r.log.Named("changed"))
 	r.clock.Advance(7*time.Hour + time.Second)
-	if r.chat(aliceJID.String()).Muted || len(r.log.named("changed")) <= before {
+	if r.chat(aliceJID.String()).Muted || len(r.log.Named("changed")) <= before {
 		t.Fatalf("the history's mute did not lapse with a changed event")
 	}
 
@@ -951,9 +951,9 @@ func TestATimedMuteFromHistoryAndAcrossARestartLapses(t *testing.T) {
 	// The restart's clock starts again at the rig's first moment; the mute's end
 	// is read against it, so move it to the mute's own time first.
 	r.clock.Advance(time.Duration(until-r.clock.Now().UnixMilli()-int64(time.Hour/time.Millisecond)) * time.Millisecond)
-	before = len(r.log.named("changed"))
+	before = len(r.log.Named("changed"))
 	r.clock.Advance(time.Hour)
-	if r.chat(aliceJID.String()).Muted || len(r.log.named("changed")) <= before {
+	if r.chat(aliceJID.String()).Muted || len(r.log.Named("changed")) <= before {
 		t.Fatalf("a mute running across a restart did not lapse with a changed event")
 	}
 }
@@ -1027,7 +1027,7 @@ func TestHistoryStoresNamesUnreadMuteAndCompletes(t *testing.T) {
 	c.history["/v/full"] = full
 	r.send(historyNotif("3EB0N1000000000000012", "/v/full", base+9500))
 	eventually(t, "the full sync's done", func() bool {
-		h := r.log.named("history")
+		h := r.log.Named("history")
 		return len(h) > 0 && h[len(h)-1]["done"] == true
 	})
 	a = r.chat(aliceJID.String())
@@ -1037,7 +1037,7 @@ func TestHistoryStoresNamesUnreadMuteAndCompletes(t *testing.T) {
 	if g := r.chat(groupJID.String()); g.HistoryComplete {
 		t.Errorf("a chat the full sync did not hold was marked complete")
 	}
-	h := r.log.named("history")
+	h := r.log.Named("history")
 	if last := h[len(h)-1]; last["chats"] != 2 || last["messages"] != 5 {
 		t.Errorf("the last history event is %v", last)
 	}
@@ -1053,13 +1053,13 @@ func TestHistoryIsDoneAfter120SecondsWithNoBatch(t *testing.T) {
 		}}},
 	}
 	r.send(historyNotif("3EB0N1000000000000021", "/v/boot", base+9000))
-	eventually(t, "a history event", func() bool { return len(r.log.named("history")) == 1 })
+	eventually(t, "a history event", func() bool { return len(r.log.Named("history")) == 1 })
 	r.clock.Advance(119 * time.Second)
-	if n := len(r.log.named("history")); n != 1 {
+	if n := len(r.log.Named("history")); n != 1 {
 		t.Fatalf("%d history events after 119 s, want 1", n)
 	}
 	r.clock.Advance(time.Second)
-	h := r.log.named("history")
+	h := r.log.Named("history")
 	if len(h) != 2 || h[1]["done"] != true || h[1]["chats"] != 1 || h[1]["messages"] != 1 {
 		t.Fatalf("after 120 s with no batch the history events are %v", h)
 	}
@@ -1296,7 +1296,7 @@ func TestALoginThatLosesItsConnectionIsOffline(t *testing.T) {
 	fc.dispatch(&events.Disconnected{})
 	fc.qr <- whatsmeow.QRChannelTimeout
 	eventually(t, "the login's end", func() bool { return r.w.Status().State == network.NotConnected })
-	if last := r.log.lastState(); last["kind"] != "offline" {
+	if last := r.log.LastState(); last["kind"] != "offline" {
 		t.Fatalf("a login that lost its connection ended as %v, want kind offline", last)
 	}
 }
@@ -1328,7 +1328,7 @@ func TestARelinkThatStopsStillNeedsReconnecting(t *testing.T) {
 	}
 	r.client().qr <- whatsmeow.QRChannelTimeout
 	eventually(t, "the relink's end", func() bool { return r.w.Status().State != network.Linking })
-	last := r.log.lastState()
+	last := r.log.LastState()
 	if last["state"] != network.ReconnectNeeded || last["kind"] != "timeout" {
 		t.Fatalf("a timed-out relink ended as %v, want reconnectNeeded with kind timeout", last)
 	}
@@ -1349,11 +1349,11 @@ func TestHistoryIsDoneAfter120SecondsWhenThePhoneSendsNothing(t *testing.T) {
 	fc.qr <- whatsmeow.QRChannelSuccess
 	eventually(t, "connecting after the scan", func() bool { return r.w.Status().State == network.Connecting })
 	r.clock.Advance(119 * time.Second)
-	if h := r.log.named("history"); len(h) != 0 {
+	if h := r.log.Named("history"); len(h) != 0 {
 		t.Fatalf("history events before 120 s: %v", h)
 	}
 	r.clock.Advance(time.Second)
-	h := r.log.named("history")
+	h := r.log.Named("history")
 	if len(h) != 1 || h[0]["done"] != true || h[0]["chats"] != 0 || h[0]["messages"] != 0 {
 		t.Fatalf("120 s after a link with no history the events are %v, want one done with no counts", h)
 	}
@@ -1431,7 +1431,7 @@ func TestALoginSuccessThatNoLongerCountsStartsNoHistoryTimer(t *testing.T) {
 	r.w.CancelLogin()
 	r.w.loginSucceeded(fc) // the success that raced the cancel
 	r.clock.Advance(3 * historyQuiet)
-	if h := r.log.named("history"); len(h) != 0 {
+	if h := r.log.Named("history"); len(h) != 0 {
 		t.Fatalf("a cancelled login's success sent history events %v", h)
 	}
 	if st := r.w.Status().State; st != network.NotConnected {
@@ -1459,16 +1459,16 @@ func TestHistoryWaitingToDownloadHoldsTheDoneTimer(t *testing.T) {
 	// A notification arrives before the connection is caught up enough to download.
 	r.send(historyNotif("3EB0N1000000000000111", "/v/held", base+9000))
 	r.clock.Advance(10 * historyQuiet)
-	if h := r.log.named("history"); len(h) != 0 {
+	if h := r.log.Named("history"); len(h) != 0 {
 		t.Fatalf("the sync was called done while a notification waited: %v", h)
 	}
 	r.send(&events.Connected{})
-	eventually(t, "the batch's history event", func() bool { return len(r.log.named("history")) == 1 })
-	if h := r.log.named("history"); h[0]["done"] != false || h[0]["messages"] != 1 {
+	eventually(t, "the batch's history event", func() bool { return len(r.log.Named("history")) == 1 })
+	if h := r.log.Named("history"); h[0]["done"] != false || h[0]["messages"] != 1 {
 		t.Fatalf("the batch's history event is %v", h[0])
 	}
 	r.clock.Advance(historyQuiet)
-	h := r.log.named("history")
+	h := r.log.Named("history")
 	if len(h) != 2 || h[1]["done"] != true {
 		t.Fatalf("120 s after the batch the history events are %v", h)
 	}

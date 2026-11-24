@@ -201,7 +201,10 @@ type Messenger struct {
 	redialing bool
 	retry     bool
 	stopRetry func() bool
-	work      sync.WaitGroup
+	work      network.Work
+	// side counts the goroutines outside work still running (the
+	// self-check, which Stop does not wait for); tests settle on it.
+	side atomic.Int32
 
 	// the whatsmeow device store (e2ee.go)
 	dmu       sync.Mutex

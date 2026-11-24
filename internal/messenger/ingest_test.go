@@ -17,6 +17,7 @@ import (
 	"github.com/matwhiting/pllum-connect/internal/meta"
 	"github.com/matwhiting/pllum-connect/internal/network"
 	"github.com/matwhiting/pllum-connect/internal/store"
+	"github.com/matwhiting/pllum-connect/internal/testkit"
 	"github.com/matwhiting/pllum-connect/internal/wire"
 )
 
@@ -32,22 +33,7 @@ func kindErr(err error) wire.Kind {
 }
 
 // states is every state event so far, as "state" or "state/kind".
-func (h *harness) states() []string {
-	h.emu.Lock()
-	defer h.emu.Unlock()
-	var out []string
-	for _, e := range h.events {
-		if e["event"] != "state" {
-			continue
-		}
-		s := string(e["state"].(network.State))
-		if k, _ := e["kind"].(string); k != "" {
-			s += "/" + k
-		}
-		out = append(out, s)
-	}
-	return out
-}
+func (h *harness) states() []string { return h.log.States() }
 
 func (h *harness) lastState() string {
 	s := h.states()
@@ -66,20 +52,25 @@ func (h *harness) login(t *testing.T, s network.Session) {
 	h.settle()
 }
 
-// settle waits until no request has been made for a moment.
-func (h *harness) settle() {
-	last := -1
-	for i := 0; i < 400; i++ {
-		n := len(h.f.requests())
-		if n == last {
-			time.Sleep(20 * time.Millisecond)
-			if len(h.f.requests()) == n {
-				return
-			}
-		}
-		last = n
-		time.Sleep(10 * time.Millisecond)
-	}
+// settle waits until the network's work has ended: every goroutine it
+// started, every send, and every event the fakes are still handing over.
+// The clock does not move: a timer still to fire is the test's to reach.
+func (h *harness) settle() { settleOn(h.m, h.f) }
+
+// settleOn is settle for a network made outside a harness.
+func settleOn(m *Messenger, f *fakeMeta) {
+	testkit.Wait(func() bool {
+		return m.work.Running() == 0 && m.busy.Load() == 0 && m.side.Load() == 0 && f.inflight.Load() == 0
+	})
+}
+
+// quiet lets a changed event the throttle holds go out (the clock moves on
+// past it, and what that starts settles), and is how many have come.
+func (h *harness) quiet() int {
+	h.settle()
+	h.f.clock.Advance(changedEvery)
+	h.settle()
+	return h.changedEvents()
 }
 
 // lines are a chat's lines by ID.
@@ -508,7 +499,6 @@ func TestBackfillIsPaced(t *testing.T) {
 		defer h2.f.e2ee.mu.Unlock()
 		return h2.f.e2ee.connects == 2
 	})
-	time.Sleep(300 * time.Millisecond)
 	h2.settle()
 	for _, c := range h2.f.requests()[before:] {
 		if c.name == "FetchThreadsTask" || c.name == "FetchMessagesTask" {
@@ -583,6 +573,7 @@ func TestOlderPagesFetchesTheOlderThread(t *testing.T) {
 	h.f.mu.Lock()
 	h.f.silent = true
 	h.f.mu.Unlock()
+	h.m.pageWait = 100 * time.Millisecond // no page is coming: wait no longer than this
 	alice := fmt.Sprint(aliceFBID) + "@msgr"
 	if _, err := h.m.FetchOlder(context.Background(), alice); kindErr(err) != wire.Timeout {
 		t.Errorf("an unanswered page = %v, want timeout", err)
@@ -603,10 +594,7 @@ func TestAMetaLineOverItsEarlyRowTellsPllum(t *testing.T) {
 	h := newHarness(t)
 	h.signIn(t)
 	at := time.Date(2026, 3, 1, 8, 0, 0, 0, time.UTC)
-	quiet := func() int {
-		time.Sleep(700 * time.Millisecond)
-		return h.changedEvents()
-	}
+	quiet := h.quiet
 	h.f.last().dispatch(&table.LSTable{LSDeleteMessage: []*table.LSDeleteMessage{{ThreadKey: groupOne, MessageId: "mid.$invented-r1"}}})
 	before := quiet()
 	newLine := func() *table.LSTable {

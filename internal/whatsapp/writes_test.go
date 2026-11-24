@@ -126,7 +126,7 @@ func TestTheSentLineHasTheSameID(t *testing.T) {
 	if n := len(c.sentMessages()); n != 1 {
 		t.Fatalf("%d sends, want 1", n)
 	}
-	if len(r.log.named("changed")) == 0 {
+	if len(r.log.Named("changed")) == 0 {
 		t.Errorf("no changed event after the sent line was stored")
 	}
 }

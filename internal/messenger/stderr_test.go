@@ -167,7 +167,7 @@ func TestNothingReachesStderr(t *testing.T) {
 	net := m
 	mmu.Unlock()
 	eventually(t, "the listing", func() bool { return net.GateCounts().(GateCounts).ListComplete })
-	time.Sleep(100 * time.Millisecond)
+	settleOn(net, f)
 
 	// Meta rotates the cookie, and the socket brings news.
 	cli := f.last()
@@ -232,7 +232,7 @@ func TestNothingReachesStderr(t *testing.T) {
 	f.taskErr = func(socket.Task) error { return httpclient.ErrCheckpointRequired }
 	f.mu.Unlock()
 	request("login", map[string]any{"method": "session", "session": map[string]any{"xs": canaryCookie + "-2", "c_user": "2000001", "datr": "datr-invented-1"}})
-	time.Sleep(300 * time.Millisecond)
+	settleOn(net, f) // the run the login starts meets the checkpoint
 	request("logout", map[string]any{})
 
 	inW.Close()

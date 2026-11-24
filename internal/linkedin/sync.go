@@ -164,11 +164,15 @@ func (l *LinkedIn) takeJob(gen int) (j job, ok bool) {
 // waitForJob waits, idle, until something asks for work or the run ends.
 func (l *LinkedIn) waitForJob(ctx context.Context) bool {
 	l.busy.Add(-1)
-	defer l.busy.Add(1)
 	select {
 	case <-l.wake:
+		// busy before woken, so the two never both read idle while a wake
+		// is being taken up
+		l.busy.Add(1)
+		l.woken.Add(-1)
 		return true
 	case <-ctx.Done():
+		l.busy.Add(1)
 		return false
 	}
 }
@@ -186,9 +190,11 @@ func (l *LinkedIn) queue(pages bool) {
 
 // signal wakes the run's background work.
 func (l *LinkedIn) signal() {
+	l.woken.Add(1)
 	select {
 	case l.wake <- struct{}{}:
 	default:
+		l.woken.Add(-1) // one is already waiting to be taken up
 	}
 }
 

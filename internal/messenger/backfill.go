@@ -647,13 +647,13 @@ func (m *Messenger) changed() {
 	if m.chPending {
 		return
 	}
-	now := time.Now()
+	now := m.now()
 	if wait := m.chLast.Add(changedEvery).Sub(now); wait > 0 && !m.chLast.IsZero() {
 		m.chPending = true
-		time.AfterFunc(wait, func() {
+		m.afterFunc(wait, func() {
 			m.chmu.Lock()
 			m.chPending = false
-			m.chLast = time.Now()
+			m.chLast = m.now()
 			m.chmu.Unlock()
 			m.emit(map[string]any{"event": "changed"})
 		})

@@ -45,12 +45,15 @@ func runFor(r *rig, d time.Duration) {
 // a timer's wake still in the channel is work not yet begun.
 func (r *rig) settled() {
 	r.t.Helper()
-	r.idle()
-	for i := 0; i < 200 && len(r.l.wake) > 0; i++ {
-		time.Sleep(time.Millisecond)
-	}
-	time.Sleep(time.Millisecond)
-	r.idle()
+	eventually(r.t, "the background work to settle", func() bool {
+		if !r.l.idleNow() {
+			return false
+		}
+		r.l.mu.Lock()
+		running := r.l.runCtx != nil
+		r.l.mu.Unlock()
+		return !running || r.l.woken.Load() == 0
+	})
 }
 
 // gapsOf are the times between consecutive calls.

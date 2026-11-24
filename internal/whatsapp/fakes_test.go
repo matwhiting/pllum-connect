@@ -26,6 +26,7 @@ import (
 
 	"github.com/matwhiting/pllum-connect/internal/network"
 	"github.com/matwhiting/pllum-connect/internal/store"
+	"github.com/matwhiting/pllum-connect/internal/testkit"
 )
 
 // Every name, number, JID, ID and text in these tests is invented.
@@ -426,102 +427,13 @@ func (f *fakeClient) counts() (connects, disconnects, downloads int) {
 	return f.connects, f.disconnects, f.downloads
 }
 
-// fakeClock runs timers only when the test moves it on.
-type fakeClock struct {
-	mu     sync.Mutex
-	now    time.Time
-	timers []*fakeTimer
-}
+// fakeClock runs timers only when the test moves it on, in order.
+type fakeClock = testkit.Clock
 
-type fakeTimer struct {
-	at      time.Time
-	f       func()
-	stopped bool
-}
-
-func newFakeClock() *fakeClock { return &fakeClock{now: time.UnixMilli(base + 86_400_000)} }
-
-func (c *fakeClock) Now() time.Time {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.now
-}
-
-func (c *fakeClock) AfterFunc(d time.Duration, f func()) func() bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	t := &fakeTimer{at: c.now.Add(d), f: f}
-	c.timers = append(c.timers, t)
-	return func() bool {
-		c.mu.Lock()
-		defer c.mu.Unlock()
-		was := !t.stopped
-		t.stopped = true
-		return was
-	}
-}
-
-// Advance moves the clock on by d, running each timer that falls due, in
-// order, outside the clock's lock.
-func (c *fakeClock) Advance(d time.Duration) {
-	c.mu.Lock()
-	end := c.now.Add(d)
-	c.mu.Unlock()
-	for {
-		c.mu.Lock()
-		sort.SliceStable(c.timers, func(i, j int) bool { return c.timers[i].at.Before(c.timers[j].at) })
-		var due *fakeTimer
-		for _, t := range c.timers {
-			if !t.stopped && !t.at.After(end) {
-				due = t
-				break
-			}
-		}
-		if due == nil {
-			c.now = end
-			c.mu.Unlock()
-			return
-		}
-		due.stopped = true
-		if due.at.After(c.now) {
-			c.now = due.at
-		}
-		c.mu.Unlock()
-		due.f()
-	}
-}
+func newFakeClock() *fakeClock { return testkit.NewOrderedClock(time.UnixMilli(base + 86_400_000)) }
 
 // eventLog keeps every event the adapter emits.
-type eventLog struct {
-	mu  sync.Mutex
-	all []map[string]any
-}
-
-func (l *eventLog) emit(ev map[string]any) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	l.all = append(l.all, ev)
-}
-
-func (l *eventLog) named(name string) []map[string]any {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	var out []map[string]any
-	for _, ev := range l.all {
-		if ev["event"] == name {
-			out = append(out, ev)
-		}
-	}
-	return out
-}
-
-func (l *eventLog) lastState() map[string]any {
-	s := l.named("state")
-	if len(s) == 0 {
-		return nil
-	}
-	return s[len(s)-1]
-}
+type eventLog = testkit.Events
 
 // rig is one adapter over a temporary store, with fake clients and a fake
 // clock.
@@ -559,7 +471,7 @@ func newRig(t *testing.T, paired bool) *rig {
 func (r *rig) fresh() {
 	r.clock = newFakeClock()
 	r.log = &eventLog{}
-	w := New(r.st, r.dir, testKey, network.Emit(r.log.emit).For("whatsapp"))
+	w := New(r.st, r.dir, testKey, network.Emit(r.log.Emit).For("whatsapp"))
 	w.clock = r.clock
 	w.newClient = func(dev *wastore.Device) waClient {
 		fc := newFakeClient(dev)
@@ -702,16 +614,10 @@ func linkDevice(t *testing.T, dev *wastore.Device) {
 	}
 }
 
-// eventually waits up to five seconds for cond.
+// eventually waits for cond (testkit.Eventually).
 func eventually(t *testing.T, what string, cond func() bool) {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
-	for !cond() {
-		if time.Now().After(deadline) {
-			t.Fatalf("timed out waiting for %s", what)
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
+	testkit.Eventually(t, what, cond)
 }
 
 // msg builds a message event as whatsmeow dispatches it.

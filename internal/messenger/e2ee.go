@@ -375,7 +375,9 @@ func (m *Messenger) e2eeHandler(gen int, self e2eeClient) func(evt any) bool {
 			client := m.e2ee
 			m.mu.Unlock()
 			if client != nil && m.checked.CompareAndSwap(false, true) {
+				m.side.Add(1)
 				go func() {
+					defer m.side.Add(-1)
 					// a socket replaced under it must not end the helper
 					defer func() { _ = recover() }()
 					m.selfCheck(gen, client)
