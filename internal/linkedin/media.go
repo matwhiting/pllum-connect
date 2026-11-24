@@ -15,13 +15,14 @@ import (
 
 	"go.mau.fi/mautrix-linkedin/pkg/linkedingo"
 
+	"github.com/matwhiting/pllum-connect/internal/sealed"
 	"github.com/matwhiting/pllum-connect/internal/store"
 	"github.com/matwhiting/pllum-connect/internal/wire"
 )
 
 // A photo is fetched once, when he first asks for it: its largest artifact
 // (GetLargestArtifactURL; an external image's own URL) through DownloadHTTP,
-// to connect/media/<sha256 of network|chat|message>, 0600 in a 0700 folder,
+// to connect/media/<sha256 of network|chat|message>, sealed, 0600 in a 0700 folder,
 // as every network's are (the folder is shared and kept under 500 MB, the
 // least recently used files going first). It is a request he asked for, so
 // it is not paced; it never goes during a pause, and the CDN refusing it
@@ -213,24 +214,10 @@ func (l *LinkedIn) keepMedia(chat, msgID string, data []byte) {
 	_ = l.writeMedia(path, data)
 }
 
-// writeMedia writes a file whole (never half), 0600, then trims the folder.
+// writeMedia writes a file sealed under the files key (package sealed),
+// whole (never half), 0600, then trims the folder.
 func (l *LinkedIn) writeMedia(path string, data []byte) error {
-	dir := l.mediaDir()
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return errInternal
-	}
-	if err := os.Chmod(dir, 0o700); err != nil {
-		return errInternal
-	}
-	f, err := os.CreateTemp(dir, ".part-*")
-	if err != nil {
-		return errInternal
-	}
-	tmp := f.Name()
-	_, werr := f.Write(data)
-	cerr := f.Close()
-	if werr != nil || cerr != nil || os.Chmod(tmp, 0o600) != nil || os.Rename(tmp, path) != nil {
-		os.Remove(tmp)
+	if err := sealed.WriteFile(l.mediaDir(), path, sealed.Key(l.key), data); err != nil {
 		return errInternal
 	}
 	l.trimMedia(path)

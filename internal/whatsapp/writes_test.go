@@ -534,7 +534,7 @@ func TestAPhotoWithTextIsOneMessageWithACaption(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Media of his own photo: %v", err)
 	}
-	if got, _ := os.ReadFile(path); !bytes.Equal(got, c.uploadList()[0].data) {
+	if got, _ := openMedia(path); !bytes.Equal(got, c.uploadList()[0].data) {
 		t.Errorf("his own photo's file is not what he sent")
 	}
 	if len(c.fetches) != 0 {

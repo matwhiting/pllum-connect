@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/matwhiting/pllum-connect/internal/network"
+	"github.com/matwhiting/pllum-connect/internal/sealed"
 	"github.com/matwhiting/pllum-connect/internal/store"
 	"github.com/matwhiting/pllum-connect/internal/wire"
 )
@@ -280,6 +281,13 @@ func (s *server) open(key [32]byte) (nets []network.Network, err error) {
 		return nil, err
 	}
 	s.store = st
+	// Media kept in the clear before files were sealed is sealed now, once
+	// the key has opened the store (so a wrong key never touches it) and
+	// before any network can write there. A file that fails stays as it was
+	// and is tried again at the next start.
+	if s.deps.Dir != "" {
+		_, _ = sealed.SealLegacy(filepath.Join(s.deps.Dir, "media"), sealed.Key(key))
+	}
 	if s.deps.Networks == nil {
 		return nil, nil
 	}

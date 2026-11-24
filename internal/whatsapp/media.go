@@ -19,13 +19,15 @@ import (
 	"go.mau.fi/whatsmeow/types/events"
 	"google.golang.org/protobuf/proto"
 
+	"github.com/matwhiting/pllum-connect/internal/sealed"
 	"github.com/matwhiting/pllum-connect/internal/store"
 	"github.com/matwhiting/pllum-connect/internal/wire"
 )
 
 // A photo or sticker is downloaded once, and a video's thumbnail (carried in
 // the message) written once, to connect/media/<sha256 of network|chat|message>,
-// 0600 in a 0700 folder. Voice notes and documents have no file to show. A
+// sealed (package sealed), 0600 in a 0700 folder. Voice notes and documents
+// have no file to show. A
 // file gone from WhatsApp's servers (404 or 410) is asked of his phone once;
 // with no answer in 30 s it is mediaGone. The folder is kept under 500 MB,
 // the least recently used files going first.
@@ -270,24 +272,10 @@ func (w *WhatsApp) keepMedia(chat, msgID string, data []byte) {
 	_ = w.writeMedia(path, data)
 }
 
-// writeMedia writes a file whole (never half), 0600, then trims the folder.
+// writeMedia writes a file sealed under the files key (package sealed),
+// whole (never half), 0600, then trims the folder.
 func (w *WhatsApp) writeMedia(path string, data []byte) error {
-	dir := w.mediaDir()
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return errInternal
-	}
-	if err := os.Chmod(dir, 0o700); err != nil {
-		return errInternal
-	}
-	f, err := os.CreateTemp(dir, ".part-*")
-	if err != nil {
-		return errInternal
-	}
-	tmp := f.Name()
-	_, werr := f.Write(data)
-	cerr := f.Close()
-	if werr != nil || cerr != nil || os.Chmod(tmp, 0o600) != nil || os.Rename(tmp, path) != nil {
-		os.Remove(tmp)
+	if err := sealed.WriteFile(w.mediaDir(), path, sealed.Key(w.key), data); err != nil {
 		return errInternal
 	}
 	w.trimMedia(path)

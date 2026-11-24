@@ -537,7 +537,7 @@ func TestAnEncryptedPhotoDownloadsOnce(t *testing.T) {
 	if !slices.Equal(asked, []string{path}) {
 		t.Errorf("DownloadFB was asked %v, want the photo's path", asked)
 	}
-	data, err := os.ReadFile(first)
+	data, err := openMedia(first)
 	if err != nil || string(data) != string(photo) {
 		t.Errorf("the file holds %q, %v", data, err)
 	}
@@ -560,7 +560,7 @@ func TestAnEncryptedPhotoDownloadsOnce(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Media of the restored photo: %v", err)
 	}
-	if data, _ := os.ReadFile(p); string(data) != "invented restored bytes" {
+	if data, _ := openMedia(p); string(data) != "invented restored bytes" {
 		t.Errorf("the restored photo holds %q", data)
 	}
 	gaps(t, h.f.requests())
@@ -584,7 +584,7 @@ func TestAGroupPhotoDownloadsOnceFromTheCDN(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Media: %v", err)
 		}
-		if data, _ := os.ReadFile(p); string(data) != "invented cdn bytes" {
+		if data, _ := openMedia(p); string(data) != "invented cdn bytes" {
 			t.Errorf("the file holds %q", data)
 		}
 	}

@@ -67,7 +67,7 @@ func TestAnExpiredPhotoURLIsRefreshedOnce(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Media: %v", err)
 	}
-	if got, _ := os.ReadFile(path); string(got) != "invented-photo-bytes" {
+	if got, _ := openMedia(path); string(got) != "invented-photo-bytes" {
 		t.Errorf("the file holds %q, want the photo", got)
 	}
 	var downloads []string

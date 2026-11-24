@@ -69,7 +69,7 @@ func TestAPhotoDownloadsOnce(t *testing.T) {
 			if path != mediaFile(r, chat, tc.id) {
 				t.Fatalf("the file is at %s, want %s", path, mediaFile(r, chat, tc.id))
 			}
-			got, err := os.ReadFile(path)
+			got, err := openMedia(path)
 			if err != nil || string(got) != tc.want {
 				t.Fatalf("the file holds %q (%v), want %q", got, err, tc.want)
 			}
@@ -183,14 +183,15 @@ func TestAGonePhotoAsksThePhoneOnceThenIsMediaGone(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Media after the phone's answer: %v", err)
 	}
-	if got, _ := os.ReadFile(path); string(got) != "invented jpeg, uploaded again" {
+	if got, _ := openMedia(path); string(got) != "invented jpeg, uploaded again" {
 		t.Fatalf("the file holds %q", got)
 	}
 }
 
 func TestTheMediaFolderIsTrimmedOldestFirst(t *testing.T) {
 	r, c := withAlice(t)
-	r.w.mediaCap = 100
+	// a sealed file is 37 bytes over its contents (magic, nonce, tag)
+	r.w.mediaCap = 137
 	dir := filepath.Join(r.dir, "media")
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		t.Fatal(err)
@@ -213,7 +214,7 @@ func TestTheMediaFolderIsTrimmedOldestFirst(t *testing.T) {
 	for _, e := range entries {
 		left = append(left, e.Name())
 	}
-	// 40+40+40+30 = 150 > 100: the two oldest go, leaving 70.
+	// 40+40+40+(30+37) = 187 > 137: the two oldest go, leaving 107.
 	kept := map[string]bool{}
 	for _, n := range left {
 		kept[n] = true

@@ -275,7 +275,7 @@ func TestAPhotoIsUploadedThenSentWithItsText(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Media of his sent photo: %v", err)
 	}
-	if got, _ := os.ReadFile(path); string(got) != string(pngBytes) {
+	if got, _ := openMedia(path); string(got) != string(pngBytes) {
 		t.Errorf("his sent photo's file holds %d bytes, want the PNG", len(got))
 	}
 	if r.f.count("DownloadHTTP") != 0 {

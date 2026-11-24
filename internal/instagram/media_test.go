@@ -54,7 +54,7 @@ func TestAPhotoDownloadsOnce(t *testing.T) {
 	if n := h.m.count("Download"); n != 1 {
 		t.Errorf("Download was asked %d times, want 1", n)
 	}
-	if got, _ := os.ReadFile(first); !bytes.Equal(got, photoBytes) {
+	if got, _ := openMedia(first); !bytes.Equal(got, photoBytes) {
 		t.Errorf("the file holds %q", got)
 	}
 	if filepath.Dir(first) != filepath.Join(h.dir, "media") {
@@ -90,7 +90,7 @@ func TestAnExpiredPhotoIsRefreshedOnceThenGone(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Media = %v", err)
 		}
-		if got, _ := os.ReadFile(path); !bytes.Equal(got, photoBytes) {
+		if got, _ := openMedia(path); !bytes.Equal(got, photoBytes) {
 			t.Errorf("the file holds %q", got)
 		}
 		if n := h.m.count("PaginateMessages") - before; n != 1 {
