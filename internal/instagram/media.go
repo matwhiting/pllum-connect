@@ -3,45 +3,27 @@ package instagram
 import (
 	"cmp"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
-	"errors"
-	"fmt"
-	"io"
-	"net/http"
-	"os"
-	"path/filepath"
-	"sort"
-	"strconv"
 	"strings"
-	"sync"
-	"time"
 
 	"go.mau.fi/mautrix-meta/pkg/instameow"
 	"go.mau.fi/mautrix-meta/pkg/instameow/slidetypes"
-	"go.mau.fi/mautrix-meta/pkg/messagix/httpclient"
-	"go.mau.fi/mautrix-meta/pkg/messagix/useragent"
 
-	"github.com/matwhiting/pllum-connect/internal/sealed"
+	"github.com/matwhiting/pllum-connect/internal/meta"
 	"github.com/matwhiting/pllum-connect/internal/store"
 	"github.com/matwhiting/pllum-connect/internal/wire"
 )
 
 // A photo or sticker is fetched once, from the CDN address its message
 // carries, through the signed-in client's own HTTP client and the pace, to
-// connect/media/<sha256 of network|chat|message>, sealed, 0600 in a 0700 folder, as
-// WhatsApp's are (the folder is shared and kept under 500 MB, the least
-// recently used files going first). The CDN's addresses expire: one that
+// the media folder every network shares (package mediacache: sealed, kept
+// under 500 MB, the least recently used files going first). The CDN's addresses expire: one that
 // answers 403, 404 or 410 is refreshed with one PaginateMessages call (the
 // page of lines older than the next one, as igconnector refreshes a blob),
 // and fetched again; if that fails too it is mediaGone. Videos and voice
 // notes have no file to show.
 
 const (
-	mediaCap = 500 << 20
-	// mediaLimit is the largest file fetched.
-	mediaLimit = 32 << 20
 	// refreshPage is how many lines the refresh's page holds.
 	refreshPage = 20
 )
@@ -66,80 +48,13 @@ func downloaderFor(c igClient) igDownloader {
 	return nil
 }
 
-// statusError is a CDN's answer other than 200 (and 429, which is
-// httpclient.ErrRateLimited, so the pace backs off).
-type statusError int
-
-func (e statusError) Error() string { return "status " + strconv.Itoa(int(e)) }
-
-// Download fetches url with the client's HTTP client (no cookies: the CDN
-// address is signed), with the headers mautrix-meta's media downloads send
-// for an image (msgconv/mediadl).
+// Download fetches url with the client's HTTP client (meta.Download).
 func (m metaClient) Download(ctx context.Context, url string) ([]byte, error) {
 	h := m.c.GetHTTP()
 	if h == nil || h.HTTP == nil {
 		return nil, instameow.ErrClientIsNil
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return nil, errNotFound
-	}
-	req.Header.Set("Accept", "image/avif,image/webp,*/*")
-	req.Header.Set("Sec-Fetch-Dest", "image")
-	req.Header.Set("Sec-Fetch-Mode", "no-cors")
-	req.Header.Set("Sec-Fetch-Site", "cross-site")
-	req.Header.Set("User-Agent", useragent.UserAgent)
-	req.Header.Set("sec-ch-ua", useragent.SecCHUserAgent)
-	req.Header.Set("sec-ch-ua-platform", useragent.SecCHPlatform)
-	resp, err := h.HTTP.Do(req)
-	if err != nil {
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
-		}
-		return nil, fmt.Errorf("%w: %w", httpclient.ErrRequestFailed, err)
-	}
-	defer resp.Body.Close()
-	switch {
-	case resp.StatusCode == http.StatusTooManyRequests:
-		return nil, httpclient.ErrRateLimited
-	case resp.StatusCode != http.StatusOK:
-		return nil, statusError(resp.StatusCode)
-	}
-	data, err := io.ReadAll(io.LimitReader(resp.Body, mediaLimit+1))
-	if err != nil {
-		return nil, fmt.Errorf("%w: %w", httpclient.ErrResponseReadFailed, err)
-	}
-	if len(data) > mediaLimit {
-		return nil, errTooLarge
-	}
-	return data, nil
-}
-
-// expired reports whether a download failed because the CDN no longer
-// takes its address.
-func expired(err error) bool {
-	var s statusError
-	return errors.As(err, &s) && (s == 403 || s == 404 || s == 410)
-}
-
-func (g *Instagram) mediaDir() string { return filepath.Join(g.dir, "media") }
-
-// mediaPath is where a line's file is kept.
-func (g *Instagram) mediaPath(chat, msgID string) string {
-	sum := sha256.Sum256([]byte(Name + "|" + chat + "|" + msgID))
-	return filepath.Join(g.mediaDir(), hex.EncodeToString(sum[:]))
-}
-
-// mediaLock is the lock for one file, so it is fetched once at a time.
-func (g *Instagram) mediaLock(path string) *sync.Mutex {
-	g.mmu.Lock()
-	defer g.mmu.Unlock()
-	l, ok := g.mlocks[path]
-	if !ok {
-		l = &sync.Mutex{}
-		g.mlocks[path] = l
-	}
-	return l
+	return meta.Download(ctx, h.HTTP, url)
 }
 
 // Media is the path of a line's photo or sticker, fetched the first time
@@ -153,11 +68,10 @@ func (g *Instagram) Media(ctx context.Context, chatID, messageID string) (string
 	if held, ok := g.st.ChatFor(Name, chatID); ok {
 		chat = held
 	}
-	path := g.mediaPath(chat, messageID)
-	lock := g.mediaLock(path)
-	lock.Lock()
-	defer lock.Unlock()
-	if kept(path) {
+	path := g.media.Path(Name, chat, messageID)
+	unlock := g.media.Lock(path)
+	defer unlock()
+	if g.media.Kept(path) {
 		return path, nil
 	}
 	if err := g.writeGate(); err != nil {
@@ -188,20 +102,20 @@ func (g *Instagram) Media(ctx context.Context, chatID, messageID string) (string
 		return "", errNotConnected
 	}
 	data, raw, err := g.fetch(ctx, gen, d, url)
-	if err != nil && expired(raw) {
+	if err != nil && meta.Expired(raw) {
 		fresh, rerr := g.refresh(ctx, gen, cli, chat, l)
 		if rerr != nil {
 			return "", rerr
 		}
 		data, raw, err = g.fetch(ctx, gen, d, fresh)
-		if err != nil && expired(raw) {
+		if err != nil && meta.Expired(raw) {
 			return "", errMediaGone
 		}
 	}
 	if err != nil {
 		return "", mediaErr(raw, err)
 	}
-	return path, g.writeMedia(path, data)
+	return path, g.media.Write(path, data)
 }
 
 // fetch downloads url through the pace; raw is the download's own error,
@@ -221,8 +135,7 @@ func (g *Instagram) fetch(ctx context.Context, gen int, d igDownloader, url stri
 // is mediaGone; anything else keeps its kind (offline, timeout,
 // rateLimited, or why it was never asked).
 func mediaErr(raw, err error) error {
-	var s statusError
-	if raw != nil && errors.As(raw, &s) {
+	if raw != nil && meta.Answered(raw) {
 		return errMediaGone
 	}
 	return err
@@ -317,80 +230,4 @@ func fileURL(kind string, raw []byte) string {
 		}
 	}
 	return ""
-}
-
-// kept reports whether a file is kept, marking it just used.
-func kept(path string) bool {
-	if fi, err := os.Stat(path); err != nil || !fi.Mode().IsRegular() {
-		return false
-	}
-	now := time.Now()
-	_ = os.Chtimes(path, now, now)
-	return true
-}
-
-// keepMedia keeps a photo he sent, so it opens without a download.
-func (g *Instagram) keepMedia(chat, msgID string, data []byte) {
-	path := g.mediaPath(chat, msgID)
-	lock := g.mediaLock(path)
-	lock.Lock()
-	defer lock.Unlock()
-	_ = g.writeMedia(path, data)
-}
-
-// writeMedia writes a file sealed under the files key (package sealed),
-// whole (never half), 0600, then trims the folder.
-func (g *Instagram) writeMedia(path string, data []byte) error {
-	if err := sealed.WriteFile(g.mediaDir(), path, sealed.Key(g.key), data); err != nil {
-		return errInternal
-	}
-	g.trimMedia(path)
-	return nil
-}
-
-// trimMedia removes the least recently used files until the folder holds
-// at most g.mediaCap bytes; keep (the file just written) stays.
-func (g *Instagram) trimMedia(keep string) {
-	entries, err := os.ReadDir(g.mediaDir())
-	if err != nil {
-		return
-	}
-	type file struct {
-		path string
-		size int64
-		at   time.Time
-	}
-	var files []file
-	var total int64
-	for _, e := range entries {
-		if strings.HasPrefix(e.Name(), ".") || !e.Type().IsRegular() {
-			continue
-		}
-		fi, err := e.Info()
-		if err != nil {
-			continue
-		}
-		files = append(files, file{filepath.Join(g.mediaDir(), e.Name()), fi.Size(), fi.ModTime()})
-		total += fi.Size()
-	}
-	if total <= g.mediaCap {
-		return
-	}
-	sort.Slice(files, func(i, j int) bool {
-		if !files[i].at.Equal(files[j].at) {
-			return files[i].at.Before(files[j].at)
-		}
-		return files[i].path < files[j].path
-	})
-	for _, f := range files {
-		if total <= g.mediaCap {
-			return
-		}
-		if f.path == keep {
-			continue
-		}
-		if os.Remove(f.path) == nil {
-			total -= f.size
-		}
-	}
 }

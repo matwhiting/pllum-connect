@@ -32,6 +32,7 @@ import (
 	waLog "go.mau.fi/whatsmeow/util/log"
 	"google.golang.org/protobuf/proto"
 
+	"github.com/matwhiting/pllum-connect/internal/mediacache"
 	"github.com/matwhiting/pllum-connect/internal/network"
 	"github.com/matwhiting/pllum-connect/internal/store"
 	"github.com/matwhiting/pllum-connect/internal/wire"
@@ -148,13 +149,20 @@ type WhatsApp struct {
 	onlineGen atomic.Int64    // counts each time the state enters catchingUp or live
 	requeue   atomic.Bool     // every send still sending is due to go again
 
-	mediaCap int64 // the most the media folder holds, in bytes
-	mmu      sync.Mutex
-	mlocks   map[string]*sync.Mutex             // one fetch of a file at a time
-	mretry   map[string]chan *events.MediaRetry // media retries waiting for his phone
+	media  *mediacache.Cache // the media folder every network shares (media.go)
+	rmu    sync.Mutex
+	mretry map[string]chan *events.MediaRetry // media retries waiting for his phone
 }
 
 var _ network.Network = (*WhatsApp)(nil)
+
+// WithMedia makes the network keep its files in media, the folder every
+// network shares; main gives each network the same one. Call it before
+// Start.
+func (w *WhatsApp) WithMedia(media *mediacache.Cache) *WhatsApp {
+	w.media = media
+	return w
+}
 
 // New makes the whatsapp network over st. Its device database is
 // <dir>/whatsapp/device.db, encrypted under key; emit must be
@@ -175,8 +183,7 @@ func New(st *store.Store, dir string, key [32]byte, emit network.Emit) *WhatsApp
 		hFull:     map[string]bool{},
 		sendKick:  make(chan struct{}, 1),
 		inflight:  map[string]bool{},
-		mediaCap:  mediaCap,
-		mlocks:    map[string]*sync.Mutex{},
+		media:     mediacache.New(dir, key),
 		mretry:    map[string]chan *events.MediaRetry{},
 	}
 	// A timed mute reads against the adapter's own clock, which tests move.

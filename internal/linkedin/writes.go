@@ -559,7 +559,7 @@ func (l *LinkedIn) storeSent(chat string, resp *linkedingo.MessageSentResponse, 
 		l.storeMessage(m, chat, id, store.SourceLive, false)
 	}
 	if data != nil && isPhoto(req.ContentType) {
-		l.keepMedia(chat, id, data)
+		l.media.Keep(Name, chat, id, data)
 	}
 	return id
 }

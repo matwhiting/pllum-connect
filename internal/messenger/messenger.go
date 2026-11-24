@@ -66,6 +66,7 @@ import (
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types/events"
 
+	"github.com/matwhiting/pllum-connect/internal/mediacache"
 	"github.com/matwhiting/pllum-connect/internal/meta"
 	"github.com/matwhiting/pllum-connect/internal/network"
 	"github.com/matwhiting/pllum-connect/internal/store"
@@ -246,8 +247,7 @@ type Messenger struct {
 	liveEncryptedReceived atomic.Int64
 	liveUndecryptable     atomic.Int64
 
-	vmu    sync.Mutex
-	values map[string]string // the network's own store values, as read or written
+	values *network.Values // the network's own store values, as read or written
 
 	nmu   sync.Mutex
 	names map[int64]string // people's names from contact rows, this run only
@@ -272,10 +272,8 @@ type Messenger struct {
 	draining bool
 	busy     atomic.Int64 // sends in line or going
 
-	// the media files (media.go)
-	mmu      sync.Mutex
-	mlocks   map[string]*sync.Mutex
-	mediaCap int64
+	// the media folder every network shares (media.go)
+	media *mediacache.Cache
 
 	// testPrep, set only by tests, sees each encrypted message before it is
 	// worked out.
@@ -314,13 +312,12 @@ func New(st *store.Store, dir string, key [32]byte, emit network.Emit) *Messenge
 		pageWait:      pageWaitDefault,
 		writeWait:     writeWait,
 		state:         network.NotConnected,
-		values:        map[string]string{},
+		values:        network.NewValues(st, Name),
 		names:         map[int64]string{},
 		recent:        map[string]string{},
 		waiters:       map[int64]chan rangeNote{},
 		locks:         map[string]*sync.Mutex{},
-		mlocks:        map[string]*sync.Mutex{},
-		mediaCap:      mediaCap,
+		media:         mediacache.New(dir, key),
 	}
 }
 
@@ -331,6 +328,14 @@ func New(st *store.Store, dir string, key [32]byte, emit network.Emit) *Messenge
 // helper is started with --gate.
 func (m *Messenger) WithGate() *Messenger {
 	m.gate = true
+	return m
+}
+
+// WithMedia makes the network keep its files in media, the folder every
+// network shares; main gives each network the same one. Call it before
+// Start.
+func (m *Messenger) WithMedia(media *mediacache.Cache) *Messenger {
+	m.media = media
 	return m
 }
 

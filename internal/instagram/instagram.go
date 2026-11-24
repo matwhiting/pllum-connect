@@ -41,6 +41,7 @@ import (
 	"go.mau.fi/mautrix-meta/pkg/messagix/httpclient"
 	"go.mau.fi/mautrix-meta/pkg/messagix/types"
 
+	"github.com/matwhiting/pllum-connect/internal/mediacache"
 	"github.com/matwhiting/pllum-connect/internal/meta"
 	"github.com/matwhiting/pllum-connect/internal/network"
 	"github.com/matwhiting/pllum-connect/internal/store"
@@ -153,8 +154,7 @@ type Instagram struct {
 	work        sync.WaitGroup
 	busy        atomic.Int32 // sign-ins, inbox reloads and sends still running
 
-	vmu    sync.Mutex
-	values map[string]string // the network's own store values, as read or written
+	values *network.Values // the network's own store values, as read or written
 
 	lmu   sync.Mutex
 	locks map[string]*sync.Mutex // one history fetch per chat at a time
@@ -167,9 +167,7 @@ type Instagram struct {
 	queue    []string // sends waiting their turn, oldest first
 	draining bool     // a goroutine is sending them
 
-	mmu      sync.Mutex
-	mlocks   map[string]*sync.Mutex // one fetch per media file at a time
-	mediaCap int64
+	media *mediacache.Cache // the media folder every network shares (media.go)
 }
 
 var (
@@ -189,13 +187,12 @@ func New(st *store.Store, dir string, key [32]byte, emit network.Emit) *Instagra
 		clock:  realClock{},
 		diff:   meta.NewSessionDiff(meta.InstagramPage),
 		state:  network.NotConnected,
-		values: map[string]string{},
+		values: network.NewValues(st, Name),
 		locks:  map[string]*sync.Mutex{},
 
 		newWriter:     writerFor,
 		newDownloader: downloaderFor,
-		mlocks:        map[string]*sync.Mutex{},
-		mediaCap:      mediaCap,
+		media:         mediacache.New(dir, key),
 	}
 	g.newClient = func(p instameow.ClientParams) igClient { return instameow.NewClient(p) }
 	// The pace reads the adapter's clock when it runs, so a test's clock,
@@ -204,6 +201,14 @@ func New(st *store.Store, dir string, key [32]byte, emit network.Emit) *Instagra
 		Now:   func() time.Time { return g.clock.Now() },
 		Sleep: func(ctx context.Context, d time.Duration) error { return g.clock.Sleep(ctx, d) },
 	}
+	return g
+}
+
+// WithMedia makes the network keep its files in media, the folder every
+// network shares; main gives each network the same one. Call it before
+// Start.
+func (g *Instagram) WithMedia(media *mediacache.Cache) *Instagram {
+	g.media = media
 	return g
 }
 

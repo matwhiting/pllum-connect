@@ -33,37 +33,11 @@ import (
 func chatIDOf(threadKey int64) string { return strconv.FormatInt(threadKey, 10) }
 
 // value is the network's stored value called name, or "".
-func (g *Instagram) value(name string) string {
-	g.vmu.Lock()
-	v, ok := g.values[name]
-	g.vmu.Unlock()
-	if ok {
-		return v
-	}
-	v, _, err := g.st.NetworkValue(Name, name)
-	if err != nil {
-		return ""
-	}
-	g.vmu.Lock()
-	g.values[name] = v
-	g.vmu.Unlock()
-	return v
-}
+func (g *Instagram) value(name string) string { return g.values.Get(name) }
 
 // keep stores the network's value called name ("" removes it), writing
 // only when it changes.
-func (g *Instagram) keep(name, v string) error {
-	if g.value(name) == v {
-		return nil
-	}
-	if err := g.st.PutNetworkValue(Name, name, v); err != nil {
-		return err
-	}
-	g.vmu.Lock()
-	g.values[name] = v
-	g.vmu.Unlock()
-	return nil
-}
+func (g *Instagram) keep(name, v string) error { return g.values.Keep(name, v) }
 
 // viewer is his FBID, or 0 before he has signed in.
 func (g *Instagram) viewer() int64 {

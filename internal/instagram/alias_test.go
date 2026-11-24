@@ -32,10 +32,7 @@ func TestParticipantAliasReadsNothingForANonDigitID(t *testing.T) {
 		if got, ok := h.g.ParticipantAlias(id); ok || got != "" {
 			t.Errorf("ParticipantAlias(%q) = %q, %v, want nothing", id, got, ok)
 		}
-		h.g.vmu.Lock()
-		_, read := h.g.values["user."+id]
-		h.g.vmu.Unlock()
-		if read {
+		if h.g.values.Held("user." + id) {
 			t.Errorf("ParticipantAlias(%q) read a network value", id)
 		}
 	}

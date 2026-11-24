@@ -415,9 +415,7 @@ func TestAnUnreadableMarkerCountsAsSet(t *testing.T) {
 	h.m.mu.Lock()
 	gen := h.m.gen
 	h.m.mu.Unlock()
-	h.m.vmu.Lock()
-	delete(h.m.values, reregisteredKey)
-	h.m.vmu.Unlock()
+	h.m.values.Drop(reregisteredKey)
 	h.st.Close() // every read of the store fails now
 	if !h.m.reregistered() {
 		t.Fatalf("an unreadable marker reads as unset")

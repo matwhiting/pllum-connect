@@ -554,7 +554,7 @@ func (w *WhatsApp) sendOut(ctx context.Context, o store.Outgoing, resend bool) e
 		return errUnclear
 	}
 	if file != nil && req.Kind == "photo" {
-		w.keepMedia(o.ChatID, o.ID, file)
+		w.media.Keep(Name, o.ChatID, o.ID, file)
 	}
 	w.changed()
 	return nil
@@ -950,7 +950,7 @@ func (w *WhatsApp) Logout(ctx context.Context) error {
 		cli.Disconnect()
 	}
 	w.failWaiting()
-	w.forgetMedia()
+	w.media.Forget()
 	return nil
 }
 

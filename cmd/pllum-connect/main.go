@@ -19,6 +19,7 @@ import (
 
 	"github.com/matwhiting/pllum-connect/internal/instagram"
 	"github.com/matwhiting/pllum-connect/internal/linkedin"
+	"github.com/matwhiting/pllum-connect/internal/mediacache"
 	"github.com/matwhiting/pllum-connect/internal/messenger"
 	"github.com/matwhiting/pllum-connect/internal/network"
 	"github.com/matwhiting/pllum-connect/internal/quiet"
@@ -84,15 +85,17 @@ func run(args []string) int {
 			return store.Open(dir, key)
 		},
 		Networks: func(st *store.Store, dir string, key [32]byte, emit network.Emit) []network.Network {
-			m := messenger.New(st, dir, key, emit.For(messenger.Name))
+			// One media folder, counted once, for every network.
+			media := mediacache.New(dir, key)
+			m := messenger.New(st, dir, key, emit.For(messenger.Name)).WithMedia(media)
 			if *gate {
 				m.WithGate()
 			}
 			return []network.Network{
-				whatsapp.New(st, dir, key, emit.For(whatsapp.Name)),
-				instagram.New(st, dir, key, emit.For(instagram.Name)),
+				whatsapp.New(st, dir, key, emit.For(whatsapp.Name)).WithMedia(media),
+				instagram.New(st, dir, key, emit.For(instagram.Name)).WithMedia(media),
 				m,
-				linkedin.New(st, dir, key, emit.For(linkedin.Name), linkedin.Options{}),
+				linkedin.New(st, dir, key, emit.For(linkedin.Name), linkedin.Options{Media: media}),
 			}
 		},
 		Gate: *gate,

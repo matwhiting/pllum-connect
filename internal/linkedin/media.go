@@ -2,29 +2,21 @@ package linkedin
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"io"
-	"os"
-	"path/filepath"
-	"sort"
 	"strings"
-	"sync"
 	"time"
 
 	"go.mau.fi/mautrix-linkedin/pkg/linkedingo"
 
-	"github.com/matwhiting/pllum-connect/internal/sealed"
 	"github.com/matwhiting/pllum-connect/internal/store"
 	"github.com/matwhiting/pllum-connect/internal/wire"
 )
 
 // A photo is fetched once, when he first asks for it: its largest artifact
 // (GetLargestArtifactURL; an external image's own URL) through DownloadHTTP,
-// to connect/media/<sha256 of network|chat|message>, sealed, 0600 in a 0700 folder,
-// as every network's are (the folder is shared and kept under 500 MB, the
-// least recently used files going first). It is a request he asked for, so
+// to the media folder every network shares (package mediacache: sealed,
+// kept under 500 MB, the least recently used files going first). It is a request he asked for, so
 // it is not paced; it never goes during a pause, and the CDN refusing it
 // never pauses LinkedIn (download). The CDN's signed URLs expire: one that
 // answers 401, 403, 404 or 410 has its message read again
@@ -32,33 +24,10 @@ import (
 // that is fetched; if either fails it is mediaGone. Voice notes, videos and
 // files have no file to show (hasFile false), and are unsupported here.
 
-const (
-	mediaCap = 500 << 20
-	// mediaLimit is the largest file fetched.
-	mediaLimit = 32 << 20
-)
+// mediaLimit is the largest file fetched.
+const mediaLimit = 32 << 20
 
 var errMediaGone = &wire.Error{Kind: wire.MediaGone}
-
-func (l *LinkedIn) mediaDir() string { return filepath.Join(l.dir, "media") }
-
-// mediaPath is where a line's file is kept.
-func (l *LinkedIn) mediaPath(chat, msgID string) string {
-	sum := sha256.Sum256([]byte(Name + "|" + chat + "|" + msgID))
-	return filepath.Join(l.mediaDir(), hex.EncodeToString(sum[:]))
-}
-
-// mediaLock is the lock for one file, so it is fetched once at a time.
-func (l *LinkedIn) mediaLock(path string) *sync.Mutex {
-	l.mmu.Lock()
-	defer l.mmu.Unlock()
-	m, ok := l.mlocks[path]
-	if !ok {
-		m = &sync.Mutex{}
-		l.mlocks[path] = m
-	}
-	return m
-}
 
 // Media is the path of a line's photo, fetched the first time it is asked
 // for. A file already kept is given even while signed out or paused;
@@ -71,11 +40,10 @@ func (l *LinkedIn) Media(ctx context.Context, chatID, messageID string) (string,
 	if held, ok := l.st.ChatFor(Name, chatID); ok {
 		chat = held
 	}
-	path := l.mediaPath(chat, messageID)
-	lock := l.mediaLock(path)
-	lock.Lock()
-	defer lock.Unlock()
-	if kept(path) {
+	path := l.media.Path(Name, chat, messageID)
+	unlock := l.media.Lock(path)
+	defer unlock()
+	if l.media.Kept(path) {
 		return path, nil
 	}
 	line, ok, err := l.st.Line(Name, chat, messageID)
@@ -112,7 +80,7 @@ func (l *LinkedIn) Media(ctx context.Context, chatID, messageID string) (string,
 	if err != nil {
 		return "", err
 	}
-	return path, l.writeMedia(path, data)
+	return path, l.media.Write(path, data)
 }
 
 // fetchMedia downloads url. expired reports whether the CDN no longer takes
@@ -193,80 +161,4 @@ func photoURL(raw []byte) string {
 		}
 	}
 	return ""
-}
-
-// kept reports whether a file is kept, marking it just used.
-func kept(path string) bool {
-	if fi, err := os.Stat(path); err != nil || !fi.Mode().IsRegular() {
-		return false
-	}
-	now := time.Now()
-	_ = os.Chtimes(path, now, now)
-	return true
-}
-
-// keepMedia keeps a photo he sent, so it opens without a download.
-func (l *LinkedIn) keepMedia(chat, msgID string, data []byte) {
-	path := l.mediaPath(chat, msgID)
-	lock := l.mediaLock(path)
-	lock.Lock()
-	defer lock.Unlock()
-	_ = l.writeMedia(path, data)
-}
-
-// writeMedia writes a file sealed under the files key (package sealed),
-// whole (never half), 0600, then trims the folder.
-func (l *LinkedIn) writeMedia(path string, data []byte) error {
-	if err := sealed.WriteFile(l.mediaDir(), path, sealed.Key(l.key), data); err != nil {
-		return errInternal
-	}
-	l.trimMedia(path)
-	return nil
-}
-
-// trimMedia removes the least recently used files until the folder holds
-// at most l.mediaCap bytes; keep (the file just written) stays.
-func (l *LinkedIn) trimMedia(keep string) {
-	entries, err := os.ReadDir(l.mediaDir())
-	if err != nil {
-		return
-	}
-	type file struct {
-		path string
-		size int64
-		at   time.Time
-	}
-	var files []file
-	var total int64
-	for _, e := range entries {
-		if strings.HasPrefix(e.Name(), ".") || !e.Type().IsRegular() {
-			continue
-		}
-		fi, err := e.Info()
-		if err != nil {
-			continue
-		}
-		files = append(files, file{filepath.Join(l.mediaDir(), e.Name()), fi.Size(), fi.ModTime()})
-		total += fi.Size()
-	}
-	if total <= l.mediaCap {
-		return
-	}
-	sort.Slice(files, func(i, j int) bool {
-		if !files[i].at.Equal(files[j].at) {
-			return files[i].at.Before(files[j].at)
-		}
-		return files[i].path < files[j].path
-	})
-	for _, f := range files {
-		if total <= l.mediaCap {
-			return
-		}
-		if f.path == keep {
-			continue
-		}
-		if os.Remove(f.path) == nil {
-			total -= f.size
-		}
-	}
 }

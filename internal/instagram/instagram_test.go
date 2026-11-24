@@ -630,7 +630,7 @@ func TestBackfillIsPacedAndStopsAtItsLimits(t *testing.T) {
 	if err := h3.st.PutNetworkValue(Name, "state", ""); err != nil {
 		t.Fatal(err)
 	}
-	h3.g.values = map[string]string{}
+	h3.g.values.Drop()
 	before = len(h3.m.requests())
 	h3.login(validSession())
 	if got := h3.m.requests()[before:]; len(got) != 1 || got[0].name != "LoadIndex" {

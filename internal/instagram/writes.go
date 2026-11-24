@@ -821,7 +821,7 @@ func (g *Instagram) storeSent(chat string, msg slidetypes.SentMessage, text, kin
 		line.Media = []store.Media{{Kind: "video"}}
 	}
 	if _, err := g.st.PutMessage(Name, line); err == nil && kind == "photo" && photo != nil {
-		g.keepMedia(chat, lineID, photo)
+		g.media.Keep(Name, chat, lineID, photo)
 	}
 	return lineID
 }

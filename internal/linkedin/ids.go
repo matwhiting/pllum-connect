@@ -46,37 +46,11 @@ func profileID(u linkedingo.URN) string { return u.ID() }
 func isConversation(chatID string) bool { return strings.HasPrefix(chatID, conversationPrefix) }
 
 // value is the network's stored value called name, or "".
-func (l *LinkedIn) value(name string) string {
-	l.vmu.Lock()
-	v, ok := l.values[name]
-	l.vmu.Unlock()
-	if ok {
-		return v
-	}
-	v, _, err := l.st.NetworkValue(Name, name)
-	if err != nil {
-		return ""
-	}
-	l.vmu.Lock()
-	l.values[name] = v
-	l.vmu.Unlock()
-	return v
-}
+func (l *LinkedIn) value(name string) string { return l.values.Get(name) }
 
 // keep stores the network's value called name ("" removes it), writing only
 // when it changes.
-func (l *LinkedIn) keep(name, v string) error {
-	if l.value(name) == v {
-		return nil
-	}
-	if err := l.st.PutNetworkValue(Name, name, v); err != nil {
-		return err
-	}
-	l.vmu.Lock()
-	l.values[name] = v
-	l.vmu.Unlock()
-	return nil
-}
+func (l *LinkedIn) keep(name, v string) error { return l.values.Keep(name, v) }
 
 // self is his profile ID, or "" before his first sign-in and after his
 // Disconnect.
@@ -122,14 +96,7 @@ func (l *LinkedIn) forgetAccount() {
 
 // forget removes the stored value called name, whatever the memory of it
 // says.
-func (l *LinkedIn) forget(name string) {
-	if l.st.PutNetworkValue(Name, name, "") != nil {
-		return
-	}
-	l.vmu.Lock()
-	l.values[name] = ""
-	l.vmu.Unlock()
-}
+func (l *LinkedIn) forget(name string) { _ = l.values.Put(name, "") }
 
 // retireOtherAccounts makes read-only every stored conversation of another
 // account than self's: they stay readable, and are never written to or

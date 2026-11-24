@@ -179,20 +179,8 @@ func (m *Messenger) device(ctx context.Context, gen int, cli msgrClient, fbid in
 // marker is set, or cannot be read (an unreadable marker never lets it run
 // again).
 func (m *Messenger) reregistered() bool {
-	m.vmu.Lock()
-	v, ok := m.values[reregisteredKey]
-	m.vmu.Unlock()
-	if ok {
-		return v != ""
-	}
-	v, _, err := m.st.NetworkValue(Name, reregisteredKey)
-	if err != nil {
-		return true
-	}
-	m.vmu.Lock()
-	m.values[reregisteredKey] = v
-	m.vmu.Unlock()
-	return v != ""
+	v, err := m.values.Lookup(reregisteredKey)
+	return err != nil || v != ""
 }
 
 // reregister replaces his Messenger device for run gen, once ever: the

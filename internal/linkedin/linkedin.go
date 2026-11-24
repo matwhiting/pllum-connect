@@ -36,6 +36,7 @@ import (
 	"github.com/rs/zerolog"
 	"go.mau.fi/mautrix-linkedin/pkg/linkedingo"
 
+	"github.com/matwhiting/pllum-connect/internal/mediacache"
 	"github.com/matwhiting/pllum-connect/internal/meta"
 	"github.com/matwhiting/pllum-connect/internal/network"
 	"github.com/matwhiting/pllum-connect/internal/store"
@@ -117,6 +118,9 @@ type Options struct {
 	Clock     Clock
 	// Rand gives the background pace's randomness, in [0, 1).
 	Rand func() float64
+	// Media is the media folder every network shares; main gives each
+	// network the same one. nil makes one of its own.
+	Media *mediacache.Cache
 }
 
 // realClient is linkedingo's client, with the page's User-Agent in place of
@@ -200,8 +204,7 @@ type LinkedIn struct {
 	work  sync.WaitGroup
 	busy  atomic.Int32 // runs at work and stream stops still running
 
-	vmu    sync.Mutex
-	values map[string]string
+	values *network.Values
 
 	pmu    sync.Mutex
 	nextBg time.Time // the earliest the next background request may go
@@ -215,10 +218,8 @@ type LinkedIn struct {
 	outbox   []string
 	draining bool
 
-	// One lock per media file, so each is fetched once at a time (media.go).
-	mmu      sync.Mutex
-	mlocks   map[string]*sync.Mutex
-	mediaCap int64
+	// The media folder every network shares (media.go).
+	media *mediacache.Cache
 }
 
 var (
@@ -239,10 +240,9 @@ func New(st *store.Store, dir string, key [32]byte, emit network.Emit, opts Opti
 		rand:      opts.Rand,
 		diff:      meta.NewSessionDiff(SignInPage()),
 		state:     network.NotConnected,
-		values:    map[string]string{},
+		values:    network.NewValues(st, Name),
 		wake:      make(chan struct{}, 1),
-		mlocks:    map[string]*sync.Mutex{},
-		mediaCap:  mediaCap,
+		media:     opts.Media,
 	}
 	if l.newClient == nil {
 		l.newClient = realClient
@@ -252,6 +252,9 @@ func New(st *store.Store, dir string, key [32]byte, emit network.Emit, opts Opti
 	}
 	if l.rand == nil {
 		l.rand = rand.Float64
+	}
+	if l.media == nil {
+		l.media = mediacache.New(dir, key)
 	}
 	l.pause = &pause{now: func() time.Time { return l.clock.Now() }}
 	return l

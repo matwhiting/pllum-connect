@@ -1010,7 +1010,7 @@ func (w fakeWriter) Download(ctx context.Context, url string) ([]byte, error) {
 	}
 	data, ok := f.files[url]
 	if !ok {
-		return nil, statusError(404)
+		return nil, meta.StatusError(404)
 	}
 	return data, nil
 }

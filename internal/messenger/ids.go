@@ -102,37 +102,11 @@ func isEncryptedChat(chat string) bool {
 }
 
 // value is the network's stored value called name, or "".
-func (m *Messenger) value(name string) string {
-	m.vmu.Lock()
-	v, ok := m.values[name]
-	m.vmu.Unlock()
-	if ok {
-		return v
-	}
-	v, _, err := m.st.NetworkValue(Name, name)
-	if err != nil {
-		return ""
-	}
-	m.vmu.Lock()
-	m.values[name] = v
-	m.vmu.Unlock()
-	return v
-}
+func (m *Messenger) value(name string) string { return m.values.Get(name) }
 
 // keep stores the network's value called name ("" removes it), writing
 // only when it changes.
-func (m *Messenger) keep(name, v string) error {
-	if m.value(name) == v {
-		return nil
-	}
-	if err := m.st.PutNetworkValue(Name, name, v); err != nil {
-		return err
-	}
-	m.vmu.Lock()
-	m.values[name] = v
-	m.vmu.Unlock()
-	return nil
-}
+func (m *Messenger) keep(name, v string) error { return m.values.Keep(name, v) }
 
 // alias makes the unencrypted thread key an alias of chat, and keeps the
 // key as the thread whose history FetchOlder pages for it; it reports

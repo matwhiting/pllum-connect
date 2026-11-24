@@ -2,14 +2,8 @@ package whatsapp
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
-	"os"
-	"path/filepath"
-	"sort"
 	"strings"
-	"sync"
 	"time"
 
 	"go.mau.fi/whatsmeow"
@@ -19,49 +13,25 @@ import (
 	"go.mau.fi/whatsmeow/types/events"
 	"google.golang.org/protobuf/proto"
 
-	"github.com/matwhiting/pllum-connect/internal/sealed"
 	"github.com/matwhiting/pllum-connect/internal/store"
 	"github.com/matwhiting/pllum-connect/internal/wire"
 )
 
 // A photo or sticker is downloaded once, and a video's thumbnail (carried in
-// the message) written once, to connect/media/<sha256 of network|chat|message>,
-// sealed (package sealed), 0600 in a 0700 folder. Voice notes and documents
+// the message) written once, to the media folder every network shares
+// (package mediacache: sealed, 0600 in a 0700 folder). Voice notes and documents
 // have no file to show. A
 // file gone from WhatsApp's servers (404 or 410) is asked of his phone once;
 // with no answer in 30 s it is mediaGone. The folder is kept under 500 MB,
 // the least recently used files going first.
 
-const (
-	mediaCap       = 500 << 20
-	mediaRetryWait = 30 * time.Second
-)
+const mediaRetryWait = 30 * time.Second
 
 var (
 	errMediaGone   = &wire.Error{Kind: wire.MediaGone}
 	errRateLimited = &wire.Error{Kind: wire.RateLimited}
 	errTimeout     = &wire.Error{Kind: wire.Timeout}
 )
-
-func (w *WhatsApp) mediaDir() string { return filepath.Join(w.dir, "media") }
-
-// mediaPath is where a line's file is kept.
-func (w *WhatsApp) mediaPath(chat, msgID string) string {
-	sum := sha256.Sum256([]byte(Name + "|" + chat + "|" + msgID))
-	return filepath.Join(w.mediaDir(), hex.EncodeToString(sum[:]))
-}
-
-// mediaLock is the lock for one file, so it is fetched once at a time.
-func (w *WhatsApp) mediaLock(path string) *sync.Mutex {
-	w.mmu.Lock()
-	defer w.mmu.Unlock()
-	l, ok := w.mlocks[path]
-	if !ok {
-		l = &sync.Mutex{}
-		w.mlocks[path] = l
-	}
-	return l
-}
 
 // Media is the path of a line's photo, sticker or video thumbnail, fetched
 // the first time it is asked for. A file already kept is given even while
@@ -74,11 +44,10 @@ func (w *WhatsApp) Media(ctx context.Context, chatID, messageID string) (string,
 	if held, ok := w.st.ChatFor(Name, chatID); ok {
 		chat = held
 	}
-	path := w.mediaPath(chat, messageID)
-	lock := w.mediaLock(path)
-	lock.Lock()
-	defer lock.Unlock()
-	if kept(path) {
+	path := w.media.Path(Name, chat, messageID)
+	unlock := w.media.Lock(path)
+	defer unlock()
+	if w.media.Kept(path) {
 		return path, nil
 	}
 	gate := w.writeGate()
@@ -113,7 +82,7 @@ func (w *WhatsApp) Media(ctx context.Context, chatID, messageID string) (string,
 		if len(v.GetJPEGThumbnail()) == 0 {
 			return "", errMediaGone
 		}
-		return path, w.writeMedia(path, v.GetJPEGThumbnail())
+		return path, w.media.Write(path, v.GetJPEGThumbnail())
 	default:
 		return "", errUnsupported
 	}
@@ -128,17 +97,7 @@ func (w *WhatsApp) Media(ctx context.Context, chatID, messageID string) (string,
 	if err != nil {
 		return "", err
 	}
-	return path, w.writeMedia(path, data)
-}
-
-// kept reports whether a file is kept, marking it just used.
-func kept(path string) bool {
-	if fi, err := os.Stat(path); err != nil || !fi.Mode().IsRegular() {
-		return false
-	}
-	now := time.Now()
-	_ = os.Chtimes(path, now, now)
-	return true
+	return path, w.media.Write(path, data)
 }
 
 // download fetches a file; one gone from WhatsApp's servers is asked of his
@@ -235,25 +194,25 @@ func withDirectPath(part whatsmeow.DownloadableMessage, path string) whatsmeow.D
 // awaitRetry is where his phone's answer to a media retry for id arrives.
 func (w *WhatsApp) awaitRetry(id string) chan *events.MediaRetry {
 	ch := make(chan *events.MediaRetry, 1)
-	w.mmu.Lock()
+	w.rmu.Lock()
 	w.mretry[id] = ch
-	w.mmu.Unlock()
+	w.rmu.Unlock()
 	return ch
 }
 
 func (w *WhatsApp) dropRetry(id string, ch chan *events.MediaRetry) {
-	w.mmu.Lock()
+	w.rmu.Lock()
 	if w.mretry[id] == ch {
 		delete(w.mretry, id)
 	}
-	w.mmu.Unlock()
+	w.rmu.Unlock()
 }
 
 // mediaRetried hands his phone's answer to the fetch waiting for it.
 func (w *WhatsApp) mediaRetried(e *events.MediaRetry) {
-	w.mmu.Lock()
+	w.rmu.Lock()
 	ch := w.mretry[e.MessageID]
-	w.mmu.Unlock()
+	w.rmu.Unlock()
 	if ch == nil {
 		return
 	}
@@ -261,78 +220,4 @@ func (w *WhatsApp) mediaRetried(e *events.MediaRetry) {
 	case ch <- e:
 	default:
 	}
-}
-
-// keepMedia keeps a file he sent, so it opens without a download.
-func (w *WhatsApp) keepMedia(chat, msgID string, data []byte) {
-	path := w.mediaPath(chat, msgID)
-	lock := w.mediaLock(path)
-	lock.Lock()
-	defer lock.Unlock()
-	_ = w.writeMedia(path, data)
-}
-
-// writeMedia writes a file sealed under the files key (package sealed),
-// whole (never half), 0600, then trims the folder.
-func (w *WhatsApp) writeMedia(path string, data []byte) error {
-	if err := sealed.WriteFile(w.mediaDir(), path, sealed.Key(w.key), data); err != nil {
-		return errInternal
-	}
-	w.trimMedia(path)
-	return nil
-}
-
-// trimMedia removes the least recently used files until the folder holds
-// at most mediaCap bytes; keep (the file just written) stays.
-func (w *WhatsApp) trimMedia(keep string) {
-	entries, err := os.ReadDir(w.mediaDir())
-	if err != nil {
-		return
-	}
-	type file struct {
-		path string
-		size int64
-		at   time.Time
-	}
-	var files []file
-	var total int64
-	for _, e := range entries {
-		if strings.HasPrefix(e.Name(), ".") || !e.Type().IsRegular() {
-			continue
-		}
-		fi, err := e.Info()
-		if err != nil {
-			continue
-		}
-		files = append(files, file{filepath.Join(w.mediaDir(), e.Name()), fi.Size(), fi.ModTime()})
-		total += fi.Size()
-	}
-	if total <= w.mediaCap {
-		return
-	}
-	sort.Slice(files, func(i, j int) bool {
-		if !files[i].at.Equal(files[j].at) {
-			return files[i].at.Before(files[j].at)
-		}
-		return files[i].path < files[j].path
-	})
-	for _, f := range files {
-		if total <= w.mediaCap {
-			return
-		}
-		if f.path == keep {
-			continue
-		}
-		if os.Remove(f.path) == nil {
-			total -= f.size
-		}
-	}
-}
-
-// forgetMedia deletes every kept file: on his Disconnect his photos do not
-// stay behind as plain files.
-func (w *WhatsApp) forgetMedia() {
-	w.mmu.Lock()
-	defer w.mmu.Unlock()
-	_ = os.RemoveAll(w.mediaDir())
 }

@@ -18,6 +18,7 @@ import (
 	"go.mau.fi/mautrix-meta/pkg/messagix/types"
 	"go.mau.fi/util/jsontime"
 
+	"github.com/matwhiting/pllum-connect/internal/meta"
 	"github.com/matwhiting/pllum-connect/internal/network"
 	"github.com/matwhiting/pllum-connect/internal/store"
 	"github.com/matwhiting/pllum-connect/internal/testkit"
@@ -445,9 +446,9 @@ func (c *fakeIG) Download(ctx context.Context, url string) ([]byte, error) {
 	c.m.mu.Unlock()
 	switch {
 	case !ok:
-		return nil, statusError(404)
+		return nil, meta.StatusError(404)
 	case f.status != 0 && f.status != 200:
-		return nil, statusError(f.status)
+		return nil, meta.StatusError(f.status)
 	}
 	return f.data, nil
 }

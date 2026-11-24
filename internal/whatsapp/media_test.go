@@ -191,7 +191,7 @@ func TestAGonePhotoAsksThePhoneOnceThenIsMediaGone(t *testing.T) {
 func TestTheMediaFolderIsTrimmedOldestFirst(t *testing.T) {
 	r, c := withAlice(t)
 	// a sealed file is 37 bytes over its contents (magic, nonce, tag)
-	r.w.mediaCap = 137
+	r.w.media.SetCap(137)
 	dir := filepath.Join(r.dir, "media")
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		t.Fatal(err)

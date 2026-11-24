@@ -1284,7 +1284,7 @@ func (m *Messenger) storeSent(chat, lineID, kind, text, reply string, photo []by
 		line.Media = []store.Media{{Kind: kind}}
 	}
 	if _, err := m.st.PutMessage(Name, line); err == nil && kind == "photo" && photo != nil {
-		m.keepMedia(chat, lineID, photo)
+		m.media.Keep(Name, chat, lineID, photo)
 	}
 }
 
