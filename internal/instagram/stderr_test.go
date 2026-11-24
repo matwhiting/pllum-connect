@@ -189,7 +189,6 @@ func TestNothingReachesStderr(t *testing.T) {
 		{"messages", map[string]any{"chatID": aliceChat, "limit": 50}}, // reaches the oldest line: FetchOlder
 		{"search", map[string]any{"text": canary, "chatIDs": []string{}, "limit": 50}},
 		{"findChats", map[string]any{"query": canary, "limit": 20}},
-		{"chatByParticipant", map[string]any{"participantID": aliceIG}},
 		{"send", map[string]any{"chatID": aliceChat, "text": canary}},
 		{"markRead", map[string]any{"chatID": aliceChat}},
 		{"nudge", map[string]any{}},

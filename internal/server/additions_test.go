@@ -29,20 +29,9 @@ type metaNetwork struct {
 	histState  string
 	restored   []string // the PINs RestoreHistory got
 	restoreErr error
-
-	aliases    map[string]string // ParticipantAlias: Beeper's form -> the network's
-	aliasAsked []string          // every ID ParticipantAlias was asked about
 }
 
 func (m *metaNetwork) SignIn() meta.SignInPage { return m.page }
-
-func (m *metaNetwork) ParticipantAlias(id string) (string, bool) {
-	m.omu.Lock()
-	defer m.omu.Unlock()
-	m.aliasAsked = append(m.aliasAsked, id)
-	a, ok := m.aliases[id]
-	return a, ok
-}
 
 func (m *metaNetwork) SendState(string) network.SendState { return m.state }
 
@@ -141,9 +130,9 @@ func igCall(h *harness, id, method string, params map[string]any) map[string]any
 	return h.call(id, method, p)
 }
 
-func TestSignInAndChatByParticipantOverTheWire(t *testing.T) {
+func TestSignInOverTheWire(t *testing.T) {
 	ig := newMetaNetwork()
-	h, st := startMeta(t, ig, nil)
+	h, _ := startMeta(t, ig, nil)
 
 	r := result(t, igCall(h, "s1", "signIn", nil))
 	want := map[string]any{
@@ -178,123 +167,6 @@ func TestSignInAndChatByParticipantOverTheWire(t *testing.T) {
 		t.Errorf("signIn on a network with no page gave %s, want unsupported", k)
 	}
 
-	// chatByParticipant: the one-to-one, null for the rest.
-	const chat, group = "ig-chat-1", "ig-chat-2"
-	for id, kind := range map[string]string{chat: "single", group: "group"} {
-		if _, err := st.PutMessage("instagram", store.Message{ID: "m-" + id, ChatID: id, SenderID: "ig-1001", TimeMs: 1767225600000,
-			Text: "hello", Kind: "text", Source: store.SourceLive}); err != nil {
-			t.Fatal(err)
-		}
-		parts := []store.Participant{{ID: "ig-self", IsSelf: true}, {ID: "ig-1001", Name: "Alex Example"}}
-		if err := st.PutChat("instagram", store.ChatInfo{ID: id, Kind: kind, Participants: parts}); err != nil {
-			t.Fatal(err)
-		}
-	}
-	r = result(t, igCall(h, "p1", "chatByParticipant", map[string]any{"participantID": "ig-1001"}))
-	c, _ := r["chat"].(map[string]any)
-	if c["id"] != chat || c["kind"] != "single" {
-		t.Errorf("chatByParticipant = %v, want the one-to-one", r)
-	}
-	ps, _ := c["participants"].([]any)
-	if len(ps) != 2 {
-		t.Errorf("the chat has participants %v", c["participants"])
-	}
-	for _, id := range []string{"ig-nobody", "ig-self"} {
-		r = result(t, igCall(h, "p2", "chatByParticipant", map[string]any{"participantID": id}))
-		if v, present := r["chat"]; !present || v != nil {
-			t.Errorf("chatByParticipant(%s) = %v, want chat: null", id, r)
-		}
-	}
-	if k := kindOf(t, igCall(h, "p3", "chatByParticipant", nil)); k != string(wire.BadRequest) {
-		t.Errorf("chatByParticipant with no participant gave %s, want badRequest", k)
-	}
-	if k := kindOf(t, igCall(h, "p4", "chatByParticipant", map[string]any{"participantID": 7})); k != string(wire.BadRequest) {
-		t.Errorf("chatByParticipant with a number gave %s, want badRequest", k)
-	}
-	// Another network's chats are not reached.
-	r = result(t, h.call("p5", "chatByParticipant", map[string]any{"participantID": "ig-1001"}))
-	if r["chat"] != nil {
-		t.Errorf("whatsapp answered with instagram's chat: %v", r)
-	}
-}
-
-// putChat places a chat of kind with one other person (and him) in the store.
-func putChat(t *testing.T, st *store.Store, net, id, kind, person string) {
-	t.Helper()
-	if _, err := st.PutMessage(net, store.Message{ID: "m-" + id, ChatID: id, SenderID: person, TimeMs: 1767225600000,
-		Text: "hello", Kind: "text", Source: store.SourceLive}); err != nil {
-		t.Fatal(err)
-	}
-	parts := []store.Participant{{ID: "self", IsSelf: true}, {ID: person, Name: "Alex Example"}}
-	if err := st.PutChat(net, store.ChatInfo{ID: id, Kind: kind, Participants: parts}); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func chatIDFor(t *testing.T, h *harness, network, participant string) any {
-	t.Helper()
-	r := result(t, h.call("alias-"+participant, "chatByParticipant", map[string]any{"network": network, "participantID": participant}))
-	v, present := r["chat"]
-	if !present {
-		t.Fatalf("chatByParticipant(%s) has no chat key: %v", participant, r)
-	}
-	if c, ok := v.(map[string]any); ok {
-		return c["id"]
-	}
-	return v
-}
-
-func TestChatByParticipantFallsBackToTheNetworksFormOfTheID(t *testing.T) {
-	const igid, fbid = "17841400000000001", "100000000000001"
-	ig := newMetaNetwork()
-	ig.aliases = map[string]string{fbid: igid, "100000000000002": "17841400000000002"}
-	h, st := startMeta(t, ig, nil)
-	putChat(t, st, "instagram", "ig-chat-1", "single", igid)
-	putChat(t, st, "instagram", "ig-chat-2", "group", "17841400000000002")
-
-	// Beeper's form of the person finds the one-to-one.
-	if got := chatIDFor(t, h, "instagram", fbid); got != "ig-chat-1" {
-		t.Errorf("the mapped ID found %v, want ig-chat-1", got)
-	}
-	// A direct hit wins and asks the network nothing.
-	ig.omu.Lock()
-	ig.aliasAsked = nil
-	ig.omu.Unlock()
-	if got := chatIDFor(t, h, "instagram", igid); got != "ig-chat-1" {
-		t.Errorf("the stored ID found %v, want ig-chat-1", got)
-	}
-	ig.omu.Lock()
-	asked := len(ig.aliasAsked)
-	ig.omu.Unlock()
-	if asked != 0 {
-		t.Errorf("a direct hit asked the network for an alias %d time(s)", asked)
-	}
-	// An ID with no mapping, and a mapped one whose person is only in a group.
-	for _, id := range []string{"100000000000099", "100000000000002"} {
-		if got := chatIDFor(t, h, "instagram", id); got != nil {
-			t.Errorf("%s found %v, want null", id, got)
-		}
-	}
-}
-
-func TestChatByParticipantNeverAsksANetworkWithoutAnAlias(t *testing.T) {
-	ig := newMetaNetwork()
-	ig.aliases = map[string]string{"100000000000003": "wa-1"}
-	h, st := startMeta(t, ig, nil)
-	putChat(t, st, "whatsapp", "wa-chat-1", "single", "wa-1")
-
-	if got := chatIDFor(t, h, "whatsapp", "wa-1"); got != "wa-chat-1" {
-		t.Errorf("whatsapp direct hit found %v, want wa-chat-1", got)
-	}
-	if got := chatIDFor(t, h, "whatsapp", "100000000000003"); got != nil {
-		t.Errorf("whatsapp answered through another network's alias: %v", got)
-	}
-	ig.omu.Lock()
-	asked := len(ig.aliasAsked)
-	ig.omu.Unlock()
-	if asked != 0 {
-		t.Errorf("instagram was asked for an alias %d time(s) on a whatsapp lookup", asked)
-	}
 }
 
 func TestLoginBySessionTakesStringsAndNothingElse(t *testing.T) {

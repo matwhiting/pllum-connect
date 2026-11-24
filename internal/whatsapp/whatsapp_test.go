@@ -1068,15 +1068,12 @@ func TestHistoryIsDoneAfter120SecondsWithNoBatch(t *testing.T) {
 func TestCopiedHistoryStaysReadWhenWhatsAppsSyncTakesItOver(t *testing.T) {
 	r := newRig(t, true)
 	c := r.live()
-	// Pllum copies Beeper's history first: copied lines are never unread.
-	if _, err := r.st.Import("whatsapp", store.ImportBatch{
-		BeeperChatID: "bc-invented-1", ChatID: aliceJID.String(), Chat: store.ImportChat{Kind: "single"},
-		Messages: []store.ImportMessage{
-			{BeeperID: "bm-1", NetworkID: "3EB0B1000000000000001", TimeMs: base + 1000, Text: "an invented copied one", Kind: "text", SenderID: aliceJID.String()},
-			{BeeperID: "bm-2", NetworkID: "3EB0B1000000000000002", TimeMs: base + 2000, Text: "an invented copied two", Kind: "text", SenderID: aliceJID.String()},
-		},
+	// Beeper's history, copied before the switch: copied lines are never unread.
+	if _, err := r.st.SeedCopied("whatsapp", aliceJID.String(), "bc-invented-1", []store.CopiedLine{
+		{BeeperID: "bm-1", NetworkID: "3EB0B1000000000000001", TimeMs: base + 1000, Text: "an invented copied one", SenderID: aliceJID.String()},
+		{BeeperID: "bm-2", NetworkID: "3EB0B1000000000000002", TimeMs: base + 2000, Text: "an invented copied two", SenderID: aliceJID.String()},
 	}); err != nil {
-		t.Fatalf("Import: %v", err)
+		t.Fatalf("SeedCopied: %v", err)
 	}
 	if u := r.chat(aliceJID.String()).Unread; u != 0 {
 		t.Fatalf("copied history is unread: %d", u)

@@ -88,8 +88,7 @@ func TestTheStoreIsEncryptedAndOnlyHis(t *testing.T) {
 	for i := range 50 {
 		put(t, s, text(groupChat, idN("3EB0C", i), base+int64(i)*1000, "line "+canary))
 	}
-	importOne(t, s, ImportBatch{BeeperChatID: "bc-canary", Chat: ImportChat{Kind: "single", Title: canary},
-		Messages: []ImportMessage{beeperMsg("bm-canary", base, "copied "+canary)}})
+	seedCopies(t, s, "", "bc-canary", copyLine{beeperID: "bm-canary", ms: base, text: "copied " + canary})
 	if p, err := s.Search(net, Query{Text: canary, Limit: 50}); err != nil || len(p.Items) == 0 {
 		t.Fatalf("Search: %d found, %v", len(p.Items), err)
 	}
@@ -199,10 +198,9 @@ func TestCountsAreCountsOnly(t *testing.T) {
 	s := openTest(t)
 	put(t, s, text(phoneChat, "3EB0N0001", base+1000, "one"))
 	put(t, s, text(phoneChat, "3EB0N0002", base+2000, "two"))
-	importOne(t, s, ImportBatch{BeeperChatID: "bc-1", ChatID: phoneChat, Chat: ImportChat{Kind: "single"},
-		Messages: []ImportMessage{beeperMsg("bm-1", base+1000, "one"), beeperMsg("bm-2", base-5000, "older")}})
-	importOne(t, s, ImportBatch{BeeperChatID: "bc-2", Chat: ImportChat{Kind: "single"},
-		Messages: []ImportMessage{beeperMsg("bm-3", base-9000, "elsewhere")}})
+	carry(t, s, phoneChat, "3EB0N0001", "bm-1", "bc-1")
+	seedCopies(t, s, phoneChat, "bc-1", copyLine{beeperID: "bm-2", ms: base - 5000, text: "older"})
+	seedCopies(t, s, "", "bc-2", copyLine{beeperID: "bm-3", ms: base - 9000, text: "elsewhere"})
 
 	c, err := s.Counts(net)
 	if err != nil {

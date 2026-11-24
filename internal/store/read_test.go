@@ -267,8 +267,7 @@ func TestAliasingAChatThatHoldsLinesMergesIt(t *testing.T) {
 
 	// ...while the phone chat holds the clash, a Beeper line and its own line.
 	put(t, s, text(phoneChat, "3EB0Z0002", base+2000, "the same line"))
-	importOne(t, s, ImportBatch{BeeperChatID: "bc-1", ChatID: phoneChat, Chat: ImportChat{Kind: "single"},
-		Messages: []ImportMessage{beeperMsg("bm-dinner", base+3500, "<p>Dinner?</p>")}})
+	seedCopies(t, s, phoneChat, "bc-1", copyLine{beeperID: "bm-dinner", ms: base + 3500, text: "<p>Dinner?</p>"})
 	put(t, s, text(phoneChat, "3EB0Z0004", base+4000, "only under the number"))
 
 	// The number arrives for the LID: an alias, never a new chat.
@@ -290,8 +289,8 @@ func TestAliasingAChatThatHoldsLinesMergesIt(t *testing.T) {
 	if !got[1].Edited {
 		t.Errorf("the clashing line lost its edit")
 	}
-	if lines := lineIDs(t, s, []string{"bm-dinner"}); lines["bm-dinner"] != "3EB0Z0003" {
-		t.Errorf("the Beeper line was not taken over: %v", lines)
+	if got := carrier(t, s, "bm-dinner"); got != "3EB0Z0003" {
+		t.Errorf("the Beeper line was not taken over: %q", got)
 	}
 	c := chatOf(t, s, lidChat)
 	if c.ID != phoneChat || c.Title != name || len(c.Participants) != 1 || c.LastMessageID != "3EB0Z0004" {

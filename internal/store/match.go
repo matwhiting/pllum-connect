@@ -193,7 +193,8 @@ func beeperLineLike(tx *sql.Tx, network string, m Message, self int64) (rid int6
 	return beeperTwin(tx, network, m.ChatID, m.FromMe, m.TimeMs, m.Text, mediaKindOf(m.Kind, m.Media), self)
 }
 
-// beeperCopy is one Beeper message, as matchBeeperCopy compares it.
+// beeperCopy is one copied line, as matchBeeperCopy compares it when a merge
+// brings it into a chat (mergeLine).
 type beeperCopy struct {
 	beeperChatIDs []string // the Beeper chats it was copied from
 	networkID     string
@@ -202,10 +203,9 @@ type beeperCopy struct {
 	text          string
 	mediaKind     string
 	deleted       bool
-	peers         int // other copies arriving with it at its exact time and side; the twin rule needs none
 }
 
-// matchBeeperCopy finds the line a Beeper message is: the line its network ID
+// matchBeeperCopy finds the line a copied line is: the line its network ID
 // names (or a Beeper line naming the same network ID), else a line on the
 // same side, within the time window, with the same content, that no other
 // message of the same Beeper chats already holds, else its exact-time twin
@@ -244,7 +244,7 @@ func matchBeeperCopy(tx *sql.Tx, network, chat string, c beeperCopy) (rid int64,
 	if err != nil {
 		return 0, err
 	}
-	if rid, _, err = nearestMatch(rows, c.timeMs, c.text, c.mediaKind, false); err != nil || rid != 0 || c.peers > 0 {
+	if rid, _, err = nearestMatch(rows, c.timeMs, c.text, c.mediaKind, false); err != nil || rid != 0 {
 		return rid, err
 	}
 	return directTwin(tx, network, chat, c.fromMe, c.timeMs, c.text, c.mediaKind, 0)

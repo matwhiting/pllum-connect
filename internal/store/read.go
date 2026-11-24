@@ -305,31 +305,6 @@ func (s *Store) Chat(network, chatID string) (c Chat, ok bool, err error) {
 	return c, true, nil
 }
 
-// ChatByParticipant is the one-to-one chat with the person who has this
-// participant ID: the placed single chat that lists them (not as himself),
-// the most recently active if there are several. ok is false when there is
-// none. Groups never answer, nor do unplaced chats.
-func (s *Store) ChatByParticipant(network, participantID string) (c Chat, ok bool, err error) {
-	if err := s.ready(); err != nil {
-		return Chat{}, false, err
-	}
-	if network == "" || participantID == "" {
-		return Chat{}, false, errBadRequest
-	}
-	var chatID string
-	err = s.db.QueryRow(`SELECT c.chat_id FROM participants AS p
-			JOIN chats AS c ON c.network = p.network AND c.chat_id = p.chat_id
-			WHERE p.network = ? AND p.participant_id = ? AND p.is_self = 0 AND c.kind = 'single' AND c.placed = 1
-			ORDER BY c.last_activity_ms DESC, c.rid DESC LIMIT 1`, network, participantID).Scan(&chatID)
-	if errors.Is(err, sql.ErrNoRows) {
-		return Chat{}, false, nil
-	}
-	if err != nil {
-		return Chat{}, false, dbErr(err)
-	}
-	return s.Chat(network, chatID)
-}
-
 const messageColumns = `rid, chat_id, msg_id, sender_id, sender_name, from_me, ts_ms, text, kind,
 	hidden, deleted, edited, reply_to, media_json, seen_ms, source, beeper_id`
 

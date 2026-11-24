@@ -45,36 +45,29 @@ func TestTheReadMethodsAnswerOverTheWire(t *testing.T) {
 	})
 	result(t, h.hello())
 	st := <-stores
+	// Beeper's copy, as a store from before the switch holds it: a placed
+	// chat with two copied lines (the first one the network has since
+	// delivered, which takes it over) and an unplaced chat.
+	if _, err := st.SeedCopied("whatsapp", chat, "bc-1", []store.CopiedLine{
+		{BeeperID: "bm-1", SenderID: "bs-1", TimeMs: base + 900, Text: "Lunch on Friday?"},
+		{BeeperID: "bm-2", FromMe: true, TimeMs: base + 60_000, Text: "Yes, noon", ReplyToBeeperID: "bm-1",
+			Reactions: []store.Reaction{{Emoji: "👍", SenderID: "bs-1"}}},
+	}); err != nil {
+		t.Fatalf("SeedCopied: %v", err)
+	}
+	if _, err := st.SeedCopied("whatsapp", "", "bc-2", []store.CopiedLine{{BeeperID: "bm-3", TimeMs: base - 1000, Text: "Old news"}}); err != nil {
+		t.Fatalf("SeedCopied: %v", err)
+	}
+	title, phone := "Alex Example", "+10000000001"
+	if err := st.PutChat("whatsapp", store.ChatInfo{ID: chat, Title: &title, Phone: &phone}); err != nil {
+		t.Fatalf("PutChat: %v", err)
+	}
 	if _, err := st.PutMessage("whatsapp", store.Message{ID: "3EB0X0001", ChatID: chat, SenderID: chat,
 		TimeMs: base, Text: "Lunch on Friday?", Kind: "text", Source: store.SourceLive}); err != nil {
 		t.Fatalf("PutMessage: %v", err)
 	}
 
-	r := result(t, h.call("i1", "import", map[string]any{
-		"beeperChatID": "bc-1",
-		"chatID":       chat,
-		"chat":         map[string]any{"kind": "single", "title": "Alex Example", "phone": "+10000000001"},
-		"messages": []map[string]any{
-			{"beeperID": "bm-1", "networkID": nil, "fromMe": false, "senderID": "bs-1", "senderName": "Alex Example",
-				"timeMs": base + 900, "text": "Lunch on Friday?", "kind": "text", "hidden": false, "deleted": false,
-				"replyToBeeperID": nil, "media": []any{}, "reactions": []any{}},
-			{"beeperID": "bm-2", "networkID": nil, "fromMe": true, "senderID": nil, "senderName": nil,
-				"timeMs": base + 60_000, "text": "Yes, noon", "kind": "text", "hidden": false, "deleted": false,
-				"replyToBeeperID": "bm-1", "media": []any{}, "reactions": []map[string]any{{"emoji": "👍", "senderID": "bs-1", "fromMe": false}}},
-		},
-	}))
-	if r["added"] != float64(1) || r["matched"] != float64(1) || r["skipped"] != float64(0) {
-		t.Fatalf("import = %v", r)
-	}
-	r = result(t, h.call("i2", "import", map[string]any{
-		"beeperChatID": "bc-2", "chatID": nil, "chat": map[string]any{"kind": "group"},
-		"messages": []map[string]any{{"beeperID": "bm-3", "fromMe": false, "timeMs": base - 1000, "text": "Old news", "kind": "text", "media": []any{}, "reactions": []any{}}},
-	}))
-	if r["added"] != float64(1) {
-		t.Fatalf("unplaced import = %v", r)
-	}
-
-	r = result(t, h.call("c1", "chats", map[string]any{"sinceMs": 0, "limit": 50}))
+	r := result(t, h.call("c1", "chats", map[string]any{"sinceMs": 0, "limit": 50}))
 	items, _ := r["items"].([]any)
 	if len(items) != 2 {
 		t.Fatalf("chats = %v", r)
@@ -115,8 +108,16 @@ func TestTheReadMethodsAnswerOverTheWire(t *testing.T) {
 	}
 
 	r = result(t, h.call("s1", "search", map[string]any{"text": "noon", "chatIDs": []string{}, "limit": 10}))
-	if found, _ := r["items"].([]any); len(found) != 1 {
+	if found, _ := r["items"].([]any); len(found) != 1 || found[0].(map[string]any)["id"] != "beeper:bm-2" {
 		t.Fatalf("search = %v", r)
+	}
+	r = result(t, h.call("s3", "search", map[string]any{"text": "old news", "chatIDs": []string{}, "limit": 10}))
+	if found, _ := r["items"].([]any); len(found) != 1 || found[0].(map[string]any)["chatID"] != "unplaced:bc-2" {
+		t.Fatalf("search of the unplaced chat = %v", r)
+	}
+	r = result(t, h.call("m2", "messages", map[string]any{"chatID": "unplaced:bc-2", "limit": 50}))
+	if found, _ := r["items"].([]any); len(found) != 1 || found[0].(map[string]any)["id"] != "beeper:bm-3" {
+		t.Fatalf("messages of the unplaced chat = %v", r)
 	}
 	r = result(t, h.call("s2", "search", map[string]any{"text": nil, "chatIDs": []string{chat}, "fromMe": true, "limit": 10}))
 	if found, _ := r["items"].([]any); len(found) != 1 {
@@ -128,13 +129,12 @@ func TestTheReadMethodsAnswerOverTheWire(t *testing.T) {
 		t.Fatalf("findChats = %v", r)
 	}
 
-	r = result(t, h.call("b1", "beeperChats", nil))
-	if mp, _ := r["map"].(map[string]any); mp["bc-1"] != chat || mp["bc-2"] != "unplaced:bc-2" {
-		t.Fatalf("beeperChats = %v", r)
-	}
-	r = result(t, h.call("l1", "lineIDs", map[string]any{"beeperIDs": []string{"bm-1", "bm-2", "bm-none"}}))
-	if mp, _ := r["map"].(map[string]any); len(mp) != 2 || mp["bm-1"] != "3EB0X0001" || mp["bm-2"] != "beeper:bm-2" {
-		t.Fatalf("lineIDs = %v", r)
+	// The Beeper methods are gone: each is an unknown method.
+	for i, m := range []string{"import", "beeperChats", "lineIDs", "chatByParticipant"} {
+		if k := kindOf(t, h.call(fmt.Sprintf("gone%d", i), m, map[string]any{"beeperIDs": []string{"bm-1"},
+			"participantID": "bs-1"})); k != "unknownMethod" {
+			t.Errorf("%s = %s, want unknownMethod", m, k)
+		}
 	}
 
 	r = result(t, h.call("n1", "counts", nil))
@@ -151,10 +151,6 @@ func TestTheReadMethodsAnswerOverTheWire(t *testing.T) {
 	}
 
 	// Malformed reads are badRequest.
-	tooMany := make([]string, 1001)
-	for i := range tooMany {
-		tooMany[i] = fmt.Sprintf("bm-%d", i)
-	}
 	for i, bad := range []struct {
 		method string
 		params map[string]any
@@ -165,9 +161,6 @@ func TestTheReadMethodsAnswerOverTheWire(t *testing.T) {
 		{"chats", map[string]any{"limit": 10, "cursor": "nonsense"}},
 		{"chat", map[string]any{}},
 		{"findChats", map[string]any{"query": "", "limit": 5}},
-		{"lineIDs", map[string]any{"beeperIDs": tooMany}},
-		{"import", map[string]any{"chatID": chat, "messages": []any{}}},
-		{"import", map[string]any{"beeperChatID": "bc-9", "chatID": "unplaced:bc-9", "messages": []any{}}},
 	} {
 		if k := kindOf(t, h.call(fmt.Sprintf("bad%d", i), bad.method, bad.params)); k != "badRequest" {
 			t.Errorf("%s %v = %s, want badRequest", bad.method, bad.params, k)

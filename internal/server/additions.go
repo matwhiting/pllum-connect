@@ -23,8 +23,6 @@ func (s *server) ownMethod(name string) (handler, bool) {
 		return s.sendStatus, true
 	case "messages":
 		return s.messages, true
-	case "chatByParticipant":
-		return s.chatByParticipant, true
 	case "signIn":
 		return signIn, true
 	case "encryptedHistory":
@@ -145,35 +143,6 @@ func (s *server) askOlder(n network.Network, chatID string) {
 		}()
 		_, _ = op.FetchOlder(s.ctx, c.ID)
 	}()
-}
-
-// chatByParticipant answers the one-to-one chat with a person, or null.
-func (s *server) chatByParticipant(ctx context.Context, n network.Network, params json.RawMessage) (any, error) {
-	var p struct {
-		ParticipantID string `json:"participantID"`
-	}
-	if err := decode(params, &p); err != nil {
-		return nil, err
-	}
-	if p.ParticipantID == "" {
-		return nil, badRequest
-	}
-	c, ok, err := s.store.ChatByParticipant(n.Name(), p.ParticipantID)
-	if err != nil {
-		return nil, err
-	}
-	// A direct hit wins; only a miss asks the network for its own form.
-	if pa, can := n.(network.ParticipantAliaser); !ok && can {
-		if alias, found := pa.ParticipantAlias(p.ParticipantID); found && alias != p.ParticipantID {
-			if c, ok, err = s.store.ChatByParticipant(n.Name(), alias); err != nil {
-				return nil, err
-			}
-		}
-	}
-	if !ok {
-		return map[string]any{"chat": nil}, nil
-	}
-	return map[string]any{"chat": c}, nil
 }
 
 // signIn answers a network's sign-in page. The cookie lists go out as lists,

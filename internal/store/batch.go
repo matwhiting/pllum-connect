@@ -206,6 +206,11 @@ func (b *Batch) ChatOfLine(msgID string) (chatID string, ok bool) {
 	return chatOfLine(b.tx, b.network, msgID)
 }
 
+// lineKinds are the protocol's kinds of line.
+var lineKinds = map[string]bool{
+	"text": true, "photo": true, "video": true, "voiceNote": true, "sticker": true, "file": true, "notice": true, "undecryptable": true, "unavailable": true,
+}
+
 // checkMessage refuses a line the store cannot take (badRequest) and gives
 // one with no source the source live.
 func checkMessage(m *Message) error {

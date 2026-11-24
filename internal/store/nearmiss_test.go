@@ -12,12 +12,10 @@ func nearMisses(t *testing.T, s *Store) int {
 	return c.NearMisses
 }
 
-// beeperThenDirect makes a Beeper line, then a direct line gapMs later.
+// beeperThenDirect seeds a copied line, then writes a direct line gapMs later.
 func beeperThenDirect(t *testing.T, s *Store, chat string, gapMs int64, beeperFromMe, directFromMe bool, beeperText, directText string) {
 	t.Helper()
-	bm := beeperMsg("bm-"+idN("nm", int(gapMs)), base, beeperText)
-	bm.FromMe = beeperFromMe
-	importOne(t, s, ImportBatch{BeeperChatID: "bc-nm", ChatID: chat, Chat: ImportChat{Kind: "single"}, Messages: []ImportMessage{bm}})
+	seedCopies(t, s, chat, "bc-nm", copyLine{beeperID: "bm-" + idN("nm", int(gapMs)), ms: base, text: beeperText, fromMe: beeperFromMe})
 	d := text(chat, "3EB0NM"+idN("", int(gapMs)), base+gapMs, directText)
 	d.FromMe = directFromMe
 	put(t, s, d)
@@ -77,19 +75,17 @@ func TestNearMissesCountOnlyPlacedChatsAndOnlyBeeperLines(t *testing.T) {
 		t.Fatalf("two direct lines counted %d, want 0", got)
 	}
 	// A Beeper chat the copy could not place has no direct line beside it.
-	importOne(t, s, ImportBatch{BeeperChatID: "bc-lost", Chat: ImportChat{Kind: "single"},
-		Messages: []ImportMessage{beeperMsg("bm-lost-1", base, "x one"), beeperMsg("bm-lost-2", base+500, "x two")}})
+	seedCopies(t, s, "", "bc-lost", copyLine{beeperID: "bm-lost-1", ms: base, text: "x one"},
+		copyLine{beeperID: "bm-lost-2", ms: base + 500, text: "x two"})
 	if got := nearMisses(t, s); got != 0 {
 		t.Fatalf("an unplaced chat counted %d, want 0", got)
 	}
 	// A Beeper line in the placed chat, one near each of the two direct lines
 	// and one far from either: the two near ones miss; the far one does not.
-	importOne(t, s, ImportBatch{BeeperChatID: "bc-nm2", ChatID: phoneChat, Chat: ImportChat{Kind: "single"},
-		Messages: []ImportMessage{
-			beeperMsg("bm-n1", base+200, "Sam said hi"),
-			beeperMsg("bm-n2", base+400, "Sam said bye"),
-			beeperMsg("bm-n3", base+60_000, "much later"),
-		}})
+	seedCopies(t, s, phoneChat, "bc-nm2",
+		copyLine{beeperID: "bm-n1", ms: base + 200, text: "Sam said hi"},
+		copyLine{beeperID: "bm-n2", ms: base + 400, text: "Sam said bye"},
+		copyLine{beeperID: "bm-n3", ms: base + 60_000, text: "much later"})
 	// Counted per Beeper line, not per pair: two Beeper lines, each beside two direct lines.
 	if got := nearMisses(t, s); got != 2 {
 		t.Fatalf("nearMisses = %d, want 2", got)

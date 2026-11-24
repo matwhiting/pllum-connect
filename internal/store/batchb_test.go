@@ -311,8 +311,8 @@ func batchSetup(t *testing.T, s *Store) {
 			t.Fatal(err)
 		}
 	}
-	importOne(t, s, ImportBatch{BeeperChatID: "bc-1", ChatID: phoneChat, Chat: ImportChat{Kind: "single"},
-		Messages: []ImportMessage{beeperMsg("bm-1", base+60, "beeper copy one"), beeperMsg("bm-2", base+61, "beeper copy two")}})
+	seedCopies(t, s, phoneChat, "bc-1", copyLine{beeperID: "bm-1", ms: base + 60, text: "beeper copy one"},
+		copyLine{beeperID: "bm-2", ms: base + 61, text: "beeper copy two"})
 }
 
 // batchSteps covers every shape a network writes in one run of history:
@@ -467,8 +467,8 @@ func TestBatchMatchesWritesOneAtATime(t *testing.T) {
 	}
 	// The steps did what they are there for: a line took over Beeper's
 	// copy, a placeholder was taken over by its message, another settled.
-	if got := lineIDs(t, batched, []string{"bm-1"}); got["bm-1"] != "3EB0B0060" {
-		t.Fatalf("Beeper's copy is held as %v", got)
+	if got := carrier(t, batched, "bm-1"); got != "3EB0B0060" {
+		t.Fatalf("Beeper's copy is held as %q", got)
 	}
 	if st, _ := batched.LineState(net, phoneChat, "3EB0U0001"); st.Kind != "text" || st.Text != "now readable" {
 		t.Fatalf("the placeholder's message: %+v", st)

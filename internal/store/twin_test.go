@@ -1,7 +1,6 @@
 package store
 
 import (
-	"maps"
 	"slices"
 	"testing"
 )
@@ -10,9 +9,10 @@ import (
 // whose texts differ (a mention is a name in one, a number in the other),
 // told apart only by time and by being the only pair there.
 
-// groupBatch is one Beeper batch for the group chat.
-func groupBatch(ms ...ImportMessage) ImportBatch {
-	return ImportBatch{BeeperChatID: "bc-twin", ChatID: groupChat, Chat: ImportChat{Kind: "group"}, Messages: ms}
+// groupCopies seeds lines of Beeper's copy into the group chat.
+func groupCopies(t *testing.T, s *Store, ls ...copyLine) {
+	t.Helper()
+	seedCopies(t, s, groupChat, "bc-twin", ls...)
 }
 
 // groupLine is a direct line in the group chat from someone else.
@@ -22,69 +22,32 @@ func groupLine(id string, ms int64, body string) Message {
 	return m
 }
 
-func TestAnExactTimeTwinImportIsMatched(t *testing.T) {
+func TestATwinOneMsApartIsNotTakenOver(t *testing.T) {
 	s := openTest(t)
-	put(t, s, groupLine("3EB0TW0001", base, "@6421000099 hi"))
-	r := importOne(t, s, groupBatch(beeperMsg("bm-tw1", base, "Alex hi")))
-	if r != (ImportResult{Matched: 1}) {
-		t.Fatalf("import = %+v, want matched 1, added 0", r)
-	}
-	got := all(t, s, groupChat)
-	if g := ids(got); !slices.Equal(g, []string{"3EB0TW0001"}) {
-		t.Fatalf("the chat holds %v, want the one direct line", g)
-	}
-	if got[0].BeeperID != "bm-tw1" {
-		t.Fatalf("the line carries Beeper ID %q", got[0].BeeperID)
-	}
-	if l := lineIDs(t, s, []string{"bm-tw1"}); !maps.Equal(l, map[string]string{"bm-tw1": "3EB0TW0001"}) {
-		t.Fatalf("LineIDs = %v", l)
+	groupCopies(t, s, copyLine{beeperID: "bm-tw2", ms: base + 1, text: "Alex hi"})
+	if !put(t, s, groupLine("3EB0TW0002", base, "@6421000099 hi")) {
+		t.Fatalf("a line 1 ms from a copy with other text took it over (exact time only)")
 	}
 }
 
-func TestATwinOneMsApartIsNotMatched(t *testing.T) {
+func TestTwoCopiesAtOneTimeHaveNoTwin(t *testing.T) {
+	// Two copies held at one time, then one direct line: no takeover.
 	s := openTest(t)
-	put(t, s, groupLine("3EB0TW0002", base, "@6421000099 hi"))
-	if r := importOne(t, s, groupBatch(beeperMsg("bm-tw2", base+1, "Alex hi"))); r != (ImportResult{Added: 1}) {
-		t.Fatalf("import = %+v, want added 1 (exact time only)", r)
-	}
-}
-
-func TestTwoDirectLinesAtOneTimeHaveNoTwin(t *testing.T) {
-	s := openTest(t)
-	put(t, s, groupLine("3EB0TW0003", base, "@6421000099 hi"))
-	put(t, s, groupLine("3EB0TW0004", base, "@6421000099 bye"))
-	if r := importOne(t, s, groupBatch(beeperMsg("bm-tw3", base, "Alex hi"))); r != (ImportResult{Added: 1}) {
-		t.Fatalf("import = %+v, want added 1 (not one-to-one)", r)
-	}
-}
-
-func TestTwoBeeperCopiesAtOneTimeHaveNoTwin(t *testing.T) {
-	// Two copies in one batch: neither is the only one there.
-	s := openTest(t)
-	put(t, s, groupLine("3EB0TW0005", base, "@6421000099 hi"))
-	if r := importOne(t, s, groupBatch(beeperMsg("bm-tw4", base, "Alex hi"), beeperMsg("bm-tw5", base, "Alex bye"))); r != (ImportResult{Added: 2}) {
-		t.Fatalf("import = %+v, want added 2 (not one-to-one)", r)
-	}
-
-	// Two Beeper-only lines held, then one direct line: no fold.
-	s = openTest(t)
-	importOne(t, s, groupBatch(beeperMsg("bm-tw6", base, "Alex hi")))
-	importOne(t, s, groupBatch(beeperMsg("bm-tw7", base, "Alex bye")))
+	groupCopies(t, s, copyLine{beeperID: "bm-tw6", ms: base, text: "Alex hi"}, copyLine{beeperID: "bm-tw7", ms: base, text: "Alex bye"})
 	if !put(t, s, groupLine("3EB0TW0006", base, "@6421000099 hi")) {
-		t.Fatalf("the direct line was folded into one of two Beeper lines")
+		t.Fatalf("the direct line took over one of two copies")
 	}
 	if n := len(all(t, s, groupChat)); n != 3 {
 		t.Fatalf("the chat holds %d lines, want 3", n)
 	}
 }
 
-func TestADirectTwinArrivingSecondTakesItsBeeperLine(t *testing.T) {
+func TestADirectTwinTakesItsCopy(t *testing.T) {
 	s := openTest(t)
-	reply := beeperMsg("bm-tw9", base+60_000, "Yes")
-	reply.ReplyToBeeperID = "bm-tw8"
-	importOne(t, s, groupBatch(beeperMsg("bm-tw8", base, "Alex hi"), reply))
+	groupCopies(t, s, copyLine{beeperID: "bm-tw8", ms: base, text: "Alex hi"},
+		copyLine{beeperID: "bm-tw9", ms: base + 60_000, text: "Yes", replyTo: "bm-tw8"})
 	if put(t, s, groupLine("3EB0TW0008", base, "@6421000099 hi")) {
-		t.Fatalf("the direct line was added beside its Beeper twin")
+		t.Fatalf("the direct line was added beside its copied twin")
 	}
 	got := all(t, s, groupChat)
 	if g := ids(got); !slices.Equal(g, []string{"3EB0TW0008", "beeper:bm-tw9"}) {
@@ -96,19 +59,18 @@ func TestADirectTwinArrivingSecondTakesItsBeeperLine(t *testing.T) {
 	if got[1].ReplyTo != "3EB0TW0008" {
 		t.Fatalf("the reply points at %q, want the direct line", got[1].ReplyTo)
 	}
-	if l := lineIDs(t, s, []string{"bm-tw8"}); l["bm-tw8"] != "3EB0TW0008" {
-		t.Fatalf("LineIDs = %v", l)
+	if c := carrier(t, s, "bm-tw8"); c != "3EB0TW0008" {
+		t.Fatalf("bm-tw8 is carried by %q", c)
 	}
 }
 
-func TestAnEditedTwinLandingInItsEarlyRowFoldsItsBeeperLine(t *testing.T) {
-	// The edit comes first (an early row), then Beeper's copy, then the
-	// line itself: absorbBeeperCopy folds the Beeper line in.
+func TestAnEditedTwinLandingInItsEarlyRowFoldsItsCopy(t *testing.T) {
+	// The edit came first (an early row), then Beeper's copy was made, then
+	// the line itself lands: absorbBeeperCopy folds the copy in.
 	s := openTest(t)
 	put(t, s, Message{ID: "3EB0TW0010", ChatID: groupChat, Text: "@6421000099 hi!", Edited: true})
-	reply := beeperMsg("bm-tw11", base+60_000, "Yes")
-	reply.ReplyToBeeperID = "bm-tw10"
-	importOne(t, s, groupBatch(beeperMsg("bm-tw10", base, "Alex hi"), reply))
+	groupCopies(t, s, copyLine{beeperID: "bm-tw10", ms: base, text: "Alex hi"},
+		copyLine{beeperID: "bm-tw11", ms: base + 60_000, text: "Yes", replyTo: "bm-tw10"})
 	put(t, s, groupLine("3EB0TW0010", base, "@6421000099 hi"))
 	got := all(t, s, groupChat)
 	if g := ids(got); !slices.Equal(g, []string{"3EB0TW0010", "beeper:bm-tw11"}) {
@@ -117,30 +79,28 @@ func TestAnEditedTwinLandingInItsEarlyRowFoldsItsBeeperLine(t *testing.T) {
 	if got[1].ReplyTo != "3EB0TW0010" {
 		t.Fatalf("the reply points at %q, want the direct line", got[1].ReplyTo)
 	}
-	if l := lineIDs(t, s, []string{"bm-tw10"}); l["bm-tw10"] != "3EB0TW0010" {
-		t.Fatalf("LineIDs = %v", l)
+	if c := carrier(t, s, "bm-tw10"); c != "3EB0TW0010" {
+		t.Fatalf("bm-tw10 is carried by %q", c)
 	}
 }
 
 func TestATwinMustShareTextOrMediaKind(t *testing.T) {
-	// A photo with no text against a sticker: different kinds, no text.
+	// A sticker copy against a photo with no text: different kinds, no text.
 	s := openTest(t)
+	groupCopies(t, s, copyLine{beeperID: "bm-tw12", ms: base, kind: "sticker"})
 	photo := groupLine("3EB0TW0012", base, "")
 	photo.Kind, photo.Media = "photo", []Media{{Kind: "photo"}}
-	put(t, s, photo)
-	sticker := beeperMsg("bm-tw12", base, "")
-	sticker.Kind = "sticker"
-	if r := importOne(t, s, groupBatch(sticker)); r != (ImportResult{Added: 1}) {
-		t.Fatalf("a sticker against a photo = %+v, want added 1", r)
+	if !put(t, s, photo) {
+		t.Fatalf("a photo took over a sticker")
 	}
 
-	// A photo with a caption against text: the caption is the text.
+	// Text against a photo with a caption: the caption is the text.
 	s = openTest(t)
+	groupCopies(t, s, copyLine{beeperID: "bm-tw13", ms: base, text: "Alex look"})
 	captioned := groupLine("3EB0TW0013", base, "@6421000099 look")
 	captioned.Kind, captioned.Media = "photo", []Media{{Kind: "photo"}}
-	put(t, s, captioned)
-	if r := importOne(t, s, groupBatch(beeperMsg("bm-tw13", base, "Alex look"))); r != (ImportResult{Matched: 1}) {
-		t.Fatalf("text against a captioned photo = %+v, want matched 1", r)
+	if put(t, s, captioned) {
+		t.Fatalf("a captioned photo did not take over its copied twin")
 	}
 }
 
@@ -150,15 +110,13 @@ func TestTheUpgradeFoldsStoredTwins(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Beeper-only lines first, while nothing is beside them.
-	reply := beeperMsg("bm-up4", base+60_000, "Yes")
-	reply.ReplyToBeeperID = "bm-up1"
-	importOne(t, s, groupBatch(
-		beeperMsg("bm-up1", base, "Alex hi"),         // an exact twin
-		beeperMsg("bm-up2", base+10_001, "Alex two"), // 1 ms from its direct line
-		beeperMsg("bm-up3", base+20_000, "Alex three"),
-		reply,
-	))
+	// Copied lines first, while nothing is beside them.
+	groupCopies(t, s,
+		copyLine{beeperID: "bm-up1", ms: base, text: "Alex hi"},           // an exact twin
+		copyLine{beeperID: "bm-up2", ms: base + 10_001, text: "Alex two"}, // 1 ms from its direct line
+		copyLine{beeperID: "bm-up3", ms: base + 20_000, text: "Alex three"},
+		copyLine{beeperID: "bm-up4", ms: base + 60_000, text: "Yes", replyTo: "bm-up1"},
+	)
 	// The direct lines as an older helper stored them, unmatched.
 	for _, d := range []struct {
 		id   string

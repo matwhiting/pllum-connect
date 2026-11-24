@@ -2,6 +2,7 @@ package store
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"testing"
@@ -119,43 +120,12 @@ func ids(ms []Message) []string {
 	return out
 }
 
-func importOne(t *testing.T, s *Store, in ImportBatch) ImportResult {
-	t.Helper()
-	r, err := s.Import(net, in)
-	if err != nil {
-		t.Fatalf("Import: %v", err)
-	}
-	return r
-}
-
-func beeperMsg(id string, ms int64, body string) ImportMessage {
-	return ImportMessage{BeeperID: id, TimeMs: ms, Text: body, Kind: "text", SenderID: "beeper-sender"}
-}
-
 func idN(prefix string, i int) string { return fmt.Sprintf("%s%04d", prefix, i) }
-
-func lineIDs(t *testing.T, s *Store, beeperIDs []string) map[string]string {
-	t.Helper()
-	m, err := s.LineIDs(net, beeperIDs)
-	if err != nil {
-		t.Fatalf("LineIDs: %v", err)
-	}
-	return m
-}
-
-func beeperChats(t *testing.T, s *Store) map[string]string {
-	t.Helper()
-	m, err := s.BeeperChats(net)
-	if err != nil {
-		t.Fatalf("BeeperChats: %v", err)
-	}
-	return m
-}
 
 func ptr[T any](v T) *T { return &v }
 
 // copyLine is one line of Beeper's copy as a store made before the switch
-// holds it.
+// holds it (CopiedLine, shorter to write).
 type copyLine struct {
 	beeperID  string
 	networkID string // the network's own ID Beeper named, "" for none
@@ -164,67 +134,97 @@ type copyLine struct {
 	text      string
 	kind      string // "" is text
 	deleted   bool
+	media     []Media
 	replyTo   string // a Beeper ID
 	reactions []Reaction
 }
 
-// seedCopies writes lines of Beeper's copy straight in SQL, as the retired
-// import left them: chat made if new (placed; or, for chat "", the
-// read-only unplaced:<beeperChat>), and each line a beeper:<id> row of
-// source beeper carrying its Beeper message. Nothing writes such rows any
-// more; a store from before the switch still holds them. It returns the
-// chat written into.
+// seedCopies writes lines of Beeper's copy into chat (SeedCopied; chat ""
+// is the unplaced chat of beeperChat) and returns the chat written into.
 func seedCopies(tb testing.TB, s *Store, chat, beeperChat string, lines ...copyLine) string {
 	tb.Helper()
-	placed := chat != ""
-	if !placed {
-		chat = unplacedPrefix + beeperChat
+	ls := make([]CopiedLine, len(lines))
+	for i, l := range lines {
+		ls[i] = CopiedLine{BeeperID: l.beeperID, NetworkID: l.networkID, FromMe: l.fromMe, TimeMs: l.ms,
+			Text: l.text, Kind: l.kind, Deleted: l.deleted, ReplyToBeeperID: l.replyTo, Media: l.media, Reactions: l.reactions}
 	}
+	got, err := s.SeedCopied(net, chat, beeperChat, ls)
+	if err != nil {
+		tb.Fatalf("SeedCopied: %v", err)
+	}
+	return got
+}
+
+// fillCopy fills the early row id of chat with a line of Beeper's copy that
+// named it, as the retired import did (fillEarly): the row shows at the
+// copy's time and side, as copied history, and carries the Beeper message.
+func fillCopy(tb testing.TB, s *Store, chat, beeperChat, id string, l copyLine) {
+	tb.Helper()
 	err := s.write(func(tx *sql.Tx) error {
-		if _, err := tx.Exec(`INSERT OR IGNORE INTO chats (network, chat_id, kind, placed, read_only, beeper_chat_id)
-				VALUES (?, ?, 'single', ?, ?, ?)`, net, chat, placed, !placed, beeperChat); err != nil {
+		var rid int64
+		if err := tx.QueryRow(`SELECT rid FROM messages WHERE network = ? AND chat_id = ? AND msg_id = ?`,
+			net, chat, id).Scan(&rid); err != nil {
 			return err
 		}
-		if _, err := tx.Exec(`INSERT OR IGNORE INTO beeper_chats (network, beeper_chat_id, chat_id) VALUES (?, ?, ?)`,
-			net, beeperChat, chat); err != nil {
+		media, err := mediaJSON(l.media)
+		if err != nil {
 			return err
 		}
-		for _, l := range lines {
-			var text, reply any
-			if l.text != "" && !l.deleted {
-				text = l.text
-			}
-			if l.replyTo != "" {
-				reply = beeperPrefix + l.replyTo
-			}
-			var rid int64
-			if err := tx.QueryRow(`INSERT INTO messages
-					(network, chat_id, msg_id, sender_id, from_me, ts_ms, text, kind, deleted, reply_to,
-					 source, beeper_id, network_id)
-					VALUES (?, ?, ?, 'beeper-sender', ?, ?, ?, ?, ?, ?, 'beeper', ?, NULLIF(?, ''))
-					RETURNING rid`,
-				net, chat, beeperPrefix+l.beeperID, l.fromMe, l.ms, text, kindOr(l.kind), l.deleted, reply,
-				l.beeperID, l.networkID).Scan(&rid); err != nil {
-				return err
-			}
-			if _, err := tx.Exec(`INSERT INTO beeper_ids (rid, network, beeper_id, beeper_chat_id) VALUES (?, ?, ?, ?)`,
-				rid, net, l.beeperID, beeperChat); err != nil {
-				return err
-			}
-			for _, r := range l.reactions {
-				if _, err := tx.Exec(`INSERT OR IGNORE INTO reactions (network, chat_id, msg_id, sender_id, emoji, from_me)
-						VALUES (?, ?, ?, ?, ?, ?)`, net, chat, beeperPrefix+l.beeperID, r.SenderID, r.Emoji, r.FromMe); err != nil {
-					return err
-				}
-			}
+		if err := fillEarly(tx, rid, Message{FromMe: l.fromMe, SenderID: "beeper-sender", TimeMs: l.ms,
+			Text: l.text, Kind: kindOr(l.kind), Hidden: ptr(false), Deleted: l.deleted}, media, id, ""); err != nil {
+			return err
 		}
-		if err := resolveReplies(tx, net, chat); err != nil {
+		if err := carryIn(tx, rid, l.beeperID, beeperChat); err != nil {
 			return err
 		}
 		return refresh(tx, net, chat)
 	})
 	if err != nil {
-		tb.Fatalf("seedCopies: %v", err)
+		tb.Fatalf("fillCopy: %v", err)
 	}
-	return chat
+}
+
+// carry marks the direct line id of chat as carrying a Beeper message, as
+// the retired import left a line it matched.
+func carry(tb testing.TB, s *Store, chat, id, beeperID, beeperChat string) {
+	tb.Helper()
+	err := s.write(func(tx *sql.Tx) error {
+		var rid int64
+		if err := tx.QueryRow(`SELECT rid FROM messages WHERE network = ? AND chat_id = ? AND msg_id = ?`,
+			net, chat, id).Scan(&rid); err != nil {
+			return err
+		}
+		return carryIn(tx, rid, beeperID, beeperChat)
+	})
+	if err != nil {
+		tb.Fatalf("carry: %v", err)
+	}
+}
+
+func carryIn(tx *sql.Tx, rid int64, beeperID, beeperChat string) error {
+	if _, err := tx.Exec(`UPDATE messages SET beeper_id = COALESCE(beeper_id, ?) WHERE rid = ?`, beeperID, rid); err != nil {
+		return err
+	}
+	_, err := tx.Exec(`INSERT OR IGNORE INTO beeper_ids (rid, network, beeper_id, beeper_chat_id) VALUES (?, ?, ?, ?)`,
+		rid, net, beeperID, beeperChat)
+	return err
+}
+
+// carrier is the ID of the line that carries a Beeper message now (a line
+// in a placed chat first), "" for none: where the copied message lives on.
+func carrier(tb testing.TB, s *Store, beeperID string) string {
+	tb.Helper()
+	var id string
+	err := s.db.QueryRow(`SELECT m.msg_id FROM beeper_ids AS b
+			JOIN messages AS m ON m.rid = b.rid
+			JOIN chats AS c ON c.network = m.network AND c.chat_id = m.chat_id
+			WHERE b.network = ? AND b.beeper_id = ?
+			ORDER BY c.placed DESC, m.rid ASC LIMIT 1`, net, beeperID).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ""
+	}
+	if err != nil {
+		tb.Fatalf("carrier: %v", err)
+	}
+	return id
 }

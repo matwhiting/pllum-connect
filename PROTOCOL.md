@@ -41,12 +41,8 @@ The contract between Pllum and this helper. Pllum refuses any other protocol ver
 | `markUnread` | `chatID` | `{}` |
 | `setMuted` | `chatID`, `muted` | `{}` |
 | `media` | `chatID`, `messageID` | `path` (a file under `connect/media/`, sealed: see Media at rest) |
-| `import` | `beeperChatID`, `chatID`\|null, `chat: {kind, title?, phone?}`, `messages: [ImportMessage]`, `replaces`? | `added`, `matched`, `skipped` |
-| `beeperChats` | — | `map: {beeperChatID: chatID}` |
-| `lineIDs` | `beeperIDs: [String]` (≤1000) | `map: {beeperID: lineID}` |
 | `counts` | — | `chats`, `messages`, `imported`, `matched`, `unplacedChats`, `oldestMs`\|null, `nearMisses` (optional) |
 | `signIn` | — | `url`, `donePattern`, `cookieDomain`, `required: [String]`, `optional: [String]`, `userAgent`; `unsupported` for a network with no sign-in page |
-| `chatByParticipant` | `participantID` | `chat: Chat`\|null: the one-to-one with that person (never a group, never an unplaced chat; the most recently active if several). For Instagram it also accepts the person's FBID (Beeper's form), translated through the people the helper has seen |
 | `encryptedHistory` | — | `state`: `noBackup`\|`needsPIN`\|`restored`\|`skipped`; `unsupported` for a network with none |
 | `restoreHistory` | `pin` (a string; `""` skips; missing is `badRequest`) | `{}`; errors `pinWrong` (with `attemptsRemaining`?), `pinLimit`; `unsupported` for a network with none |
 
@@ -54,7 +50,7 @@ The contract between Pllum and this helper. Pllum refuses any other protocol ver
 
 `counts.nearMisses` is a measure, a count only: per network, the Beeper-only lines (`source` beeper) in placed chats that have a direct line on the same side (`fromMe`) within 2000 ms, none of which has the same content as the Beeper line under the matcher's `MatchKey` rules. It reads text to compare and returns a number, never text, IDs or JIDs, and changes nothing about matching. A helper that does not send it is read as 0.
 
-`ImportMessage`: `{"beeperID","networkID"|null,"fromMe","senderID"|null,"senderName"|null,"timeMs","text"|null,"kind","hidden","deleted","replyToBeeperID"|null,"media":[{"kind","width","height"}],"reactions":[{"emoji","senderID","fromMe"}]}`. A null `chatID` makes or extends the unplaced chat `unplaced:<beeperChatID>`; `replaces` names an unplaced chat whose rows are dropped once this placed import has them. An exact-time, one-to-one twin counts as matched: a copy whose text differs (a mention, say) from a direct line that carries no Beeper ID, on the same side at the same non-zero `timeMs`, when each is the only such line at that time in the chat and both have text or share a media kind.
+**Removed methods** (2026-11-25): `import`, `beeperChats`, `lineIDs` and `chatByParticipant`, which copied Beeper's history into the store and looked its IDs and people up. Pllum has sent none of them since it left Beeper, and the helper now answers each as any method it does not know (`unknownMethod`); the protocol stays 1. What the copy made is still read as before: a line the network had not delivered is held as `beeper:<Beeper message ID>` and a Beeper chat the copy could not place as the read-only chat `unplaced:<Beeper chat ID>`; both are listed, read, searched and counted like any other line and chat; a reaction to a copied line, its `media`, and any write into an unplaced chat are `notOnNetwork`, and a reply to a copied line goes without the quote. A line the network delivers later (a history sync, a backfill, an older page) still takes its copy over (by the network ID the copy named, else by side, time within 2000 ms and content under `MatchKey`, else as the one exact-time pair), so it shows once, under its own ID.
 
 **Events:** `session` `{session}`: the full named cookie set of a network signed in through a website, sent when it differs from the last one sent (or the one `login` was given), at most once a minute, and never a set missing a required cookie; `state` `{state, kind?}`; `qr` `{code, expiresMs}`; `history` `{chats, messages, done}` (counts while the link-time sync arrives; `done` after a 100% batch or 120 s with none); `changed` `{}` (something to re-read; at most one per 500 ms per network).
 
@@ -113,5 +109,5 @@ A network without one answers `unsupported` to its method (`OlderPages` is simpl
 
 `Session` is `map[string]string` whose `String`, `GoString` and `Format` all give `[session redacted]`, so no `fmt` verb prints a cookie.
 
-Reads (`chats`, `chat`, `messages`, `search`, `findChats`, `chatByParticipant`) and the Beeper calls (`import`, `beeperChats`, `lineIDs`, `counts`) are answered by `server` from `store` for every network; a network only writes into the store.
+Reads (`chats`, `chat`, `messages`, `search`, `findChats`, `counts`) are answered by `server` from `store` for every network; a network only writes into the store.
 

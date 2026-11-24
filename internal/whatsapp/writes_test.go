@@ -464,10 +464,8 @@ func TestAReplyQuotesTheOriginal(t *testing.T) {
 
 func TestAReplyToABeeperLineGoesWithoutTheQuote(t *testing.T) {
 	r, c := withAlice(t)
-	_, err := r.st.Import(Name, store.ImportBatch{BeeperChatID: "!invented:beeper.local", ChatID: aliceJID.String(),
-		Chat: store.ImportChat{Kind: "single"},
-		Messages: []store.ImportMessage{{BeeperID: "bm-1", FromMe: false, SenderID: aliceJID.String(),
-			TimeMs: base - 86_400_000, Text: "invented old line", Kind: "text"}}})
+	_, err := r.st.SeedCopied(Name, aliceJID.String(), "!invented:beeper.local", []store.CopiedLine{{BeeperID: "bm-1",
+		SenderID: aliceJID.String(), TimeMs: base - 86_400_000, Text: "invented old line"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -772,12 +770,28 @@ func TestTwoReactionsRacingWithOneTransactionSendOnce(t *testing.T) {
 
 func TestReactingToABeeperLineIsNotOnNetwork(t *testing.T) {
 	r, c := withAlice(t)
-	err := r.w.React(context.Background(), aliceJID.String(), "beeper:bm-9", "👍", "txn-b")
+	// A copied line held from before the switch, and a chat the copy could not place.
+	if _, err := r.st.SeedCopied(Name, aliceJID.String(), "!invented:beeper.local", []store.CopiedLine{{BeeperID: "bm-9",
+		SenderID: aliceJID.String(), TimeMs: base - 86_400_000, Text: "invented old line"}}); err != nil {
+		t.Fatal(err)
+	}
+	unplaced, err := r.st.SeedCopied(Name, "", "!invented-2:beeper.local", []store.CopiedLine{{BeeperID: "bm-10",
+		TimeMs: base - 86_400_000, Text: "invented unplaced line"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = r.w.React(context.Background(), aliceJID.String(), "beeper:bm-9", "👍", "txn-b")
 	if kindOf(err) != wire.NotOnNetwork {
 		t.Fatalf("got %v, want notOnNetwork", err)
 	}
+	if err := r.w.React(context.Background(), unplaced, "beeper:bm-10", "👍", "txn-d"); kindOf(err) != wire.NotOnNetwork {
+		t.Fatalf("a reaction in an unplaced chat gave %v, want notOnNetwork", err)
+	}
 	if c.writes() != 0 {
 		t.Fatalf("something was written")
+	}
+	if l := r.message(aliceJID.String(), "beeper:bm-9"); len(l.Reactions) != 0 || l.Text != "invented old line" {
+		t.Fatalf("the copied line is now %+v", l)
 	}
 	if err := r.w.React(context.Background(), aliceJID.String(), "3EB0A0000000000000099", "👍", "txn-c"); kindOf(err) != wire.NotFound {
 		t.Fatalf("a line nobody holds gave %v, want notFound", err)

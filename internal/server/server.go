@@ -686,8 +686,8 @@ func nullable(s string) any {
 	return s
 }
 
-// readMethod is the handler for a read or Beeper method: these are answered
-// from the store for every network, so the network itself is only named.
+// readMethod is the handler for a read method: these are answered from the
+// store for every network, so the network itself is only named.
 func (s *server) readMethod(name string) (handler, bool) {
 	r, ok := reads[name]
 	if !ok {
@@ -723,7 +723,7 @@ func messagesResult(page store.MessagePage) map[string]any {
 	return r
 }
 
-// readHandler answers one read or Beeper method from the store.
+// readHandler answers one read method from the store.
 type readHandler func(st *store.Store, network string, params json.RawMessage) (any, error)
 
 // reads are the methods answered from the store alone. (messages is
@@ -804,33 +804,6 @@ var reads = map[string]readHandler{
 			return nil, err
 		}
 		return map[string]any{"items": items}, nil
-	},
-	"import": func(st *store.Store, network string, params json.RawMessage) (any, error) {
-		var p store.ImportBatch
-		if err := decode(params, &p); err != nil {
-			return nil, err
-		}
-		return st.Import(network, p)
-	},
-	"beeperChats": func(st *store.Store, network string, _ json.RawMessage) (any, error) {
-		m, err := st.BeeperChats(network)
-		if err != nil {
-			return nil, err
-		}
-		return map[string]any{"map": m}, nil
-	},
-	"lineIDs": func(st *store.Store, network string, params json.RawMessage) (any, error) {
-		var p struct {
-			BeeperIDs []string `json:"beeperIDs"`
-		}
-		if err := decode(params, &p); err != nil {
-			return nil, err
-		}
-		m, err := st.LineIDs(network, p.BeeperIDs)
-		if err != nil {
-			return nil, err
-		}
-		return map[string]any{"map": m}, nil
 	},
 	"counts": func(st *store.Store, network string, _ json.RawMessage) (any, error) {
 		return st.Counts(network)

@@ -38,8 +38,13 @@ var schema = []string{
 	`CREATE INDEX IF NOT EXISTS chats_activity ON chats (network, last_activity_ms DESC, rid DESC)`,
 	`CREATE INDEX IF NOT EXISTS chats_beeper ON chats (network, beeper_chat_id)`,
 
-	// Which chat each Beeper chat's lines went to. One direct chat may hold
-	// several Beeper chats (Beeper can split one person across two).
+	// Legacy: which chat each Beeper chat's lines went to, as the retired
+	// import left it (one direct chat may hold several Beeper chats). Its
+	// only reader, `beeperChats`, is gone, so nothing reads or writes it now
+	// and a merge no longer re-points it; it is kept, not dropped (no
+	// destructive migration, and an older helper still opens the store). chats.beeper_chat_id is legacy
+	// in the same way: written only by the import, carried by a merge, read
+	// by nothing but the 1 → 2 upgrade.
 	`CREATE TABLE IF NOT EXISTS beeper_chats (
 		network        TEXT NOT NULL,
 		beeper_chat_id TEXT NOT NULL,
@@ -113,7 +118,9 @@ var schema = []string{
 	// Every Beeper message a line carries, and the Beeper chat it came from.
 	// messages.beeper_id is the first of them; one line can carry several when
 	// Beeper held the same message twice. Keyed by rid, so a line keeps them
-	// through a takeover or a move to another chat.
+	// through a takeover or a move to another chat. Only the retired import
+	// added rows; a fold or merge still moves them, and a merge reads them to
+	// keep two messages of one Beeper chat apart.
 	`CREATE TABLE IF NOT EXISTS beeper_ids (
 		rid            INTEGER NOT NULL REFERENCES messages (rid) ON DELETE CASCADE,
 		network        TEXT    NOT NULL,

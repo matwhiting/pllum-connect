@@ -7,20 +7,15 @@ import (
 
 // Every ID, number and text here is invented.
 
-// fillEarlyRow makes id an early row in chat through update, then lets
-// Beeper's copy (from Beeper chat bc, naming id, his, at base+300) fill it.
+// fillEarlyRow makes id an early row in chat through update, then fills it
+// as Beeper's copy (from Beeper chat bc, naming id, his, at base+300) did.
 func fillEarlyRow(t *testing.T, s *Store, chat, bc, id string, update Message, beeperText string) {
 	t.Helper()
 	update.ID, update.ChatID = id, chat
 	if _, err := s.PutMessage(net, update); err != nil {
 		t.Fatal(err)
 	}
-	in := beeperMsg("bm-"+id, base+300, beeperText)
-	in.NetworkID, in.FromMe = id, true
-	if r := importOne(t, s, ImportBatch{BeeperChatID: bc, ChatID: chat, Chat: ImportChat{Kind: "single"},
-		Messages: []ImportMessage{in}}); r != (ImportResult{Matched: 1}) {
-		t.Fatalf("filling %s: %+v", id, r)
-	}
+	fillCopy(t, s, chat, bc, id, copyLine{beeperID: "bm-" + id, ms: base + 300, text: beeperText, fromMe: true})
 }
 
 func TestAFilledRowSurvivesAnAlias(t *testing.T) {
@@ -126,9 +121,8 @@ func TestAFilledRowSurvivesAnAlias(t *testing.T) {
 		if len(got) != 1 || !got[0].Deleted || got[0].Text != "" || !got[0].Edited {
 			t.Fatalf("after the alias: %+v", got)
 		}
-		want := map[string]string{"bm-3EB0S0005": "3EB0S0005"}
-		if got := lineIDs(t, s, []string{"bm-3EB0S0005"}); got["bm-3EB0S0005"] != want["bm-3EB0S0005"] {
-			t.Fatalf("LineIDs = %v", got)
+		if got := carrier(t, s, "bm-3EB0S0005"); got != "3EB0S0005" {
+			t.Fatalf("bm-3EB0S0005 is carried by %q", got)
 		}
 	})
 }
@@ -139,10 +133,8 @@ func TestAnAliasedOriginalFoldsInItsBeeperLine(t *testing.T) {
 	if _, err := s.PutMessage(net, Message{ID: "3EB0T0001", ChatID: phoneChat, Text: "hello2", Edited: true}); err != nil {
 		t.Fatal(err)
 	}
-	in := beeperMsg("bm-t1", base+300, "hello2") // Beeper names no WhatsApp ID
-	in.FromMe = true
-	importOne(t, s, ImportBatch{BeeperChatID: "bc-p", ChatID: phoneChat, Chat: ImportChat{Kind: "single"},
-		Messages: []ImportMessage{in}})
+	// Beeper's copy names no WhatsApp ID.
+	seedCopies(t, s, phoneChat, "bc-p", copyLine{beeperID: "bm-t1", ms: base + 300, text: "hello2", fromMe: true})
 	put(t, s, mine(lidChat, "3EB0T0001", base, "hello"))
 	if err := s.Alias(net, lidChat, phoneChat); err != nil {
 		t.Fatal(err)
@@ -151,8 +143,8 @@ func TestAnAliasedOriginalFoldsInItsBeeperLine(t *testing.T) {
 	if !slices.Equal(ids(got), []string{"3EB0T0000", "3EB0T0001"}) || got[1].Text != "hello2" || got[1].TimeMs != base {
 		t.Fatalf("after the alias: %+v", got)
 	}
-	if got := lineIDs(t, s, []string{"bm-t1"}); got["bm-t1"] != "3EB0T0001" {
-		t.Fatalf("LineIDs = %v", got)
+	if got := carrier(t, s, "bm-t1"); got != "3EB0T0001" {
+		t.Fatalf("bm-t1 is carried by %q", got)
 	}
 }
 
@@ -174,8 +166,8 @@ func TestAFilledRowIsNeverAnotherLinesCopy(t *testing.T) {
 	if got := all(t, s, phoneChat); !slices.Equal(ids(got), want) || got[0].TimeMs != base {
 		t.Fatalf("after the first line's original: %+v", got)
 	}
-	if got := lineIDs(t, s, []string{"bm-3EB0W0001"}); got["bm-3EB0W0001"] != "3EB0W0001" {
-		t.Fatalf("LineIDs = %v", got)
+	if got := carrier(t, s, "bm-3EB0W0001"); got != "3EB0W0001" {
+		t.Fatalf("bm-3EB0W0001 is carried by %q", got)
 	}
 }
 
@@ -184,10 +176,7 @@ func TestABeeperCopyWithNoTimeLeavesAnEarlyRowEarly(t *testing.T) {
 	if _, err := s.PutMessage(net, Message{ID: "3EB0N0001", ChatID: phoneChat, Text: "fixed", Edited: true}); err != nil {
 		t.Fatal(err)
 	}
-	in := beeperMsg("bm-n1", 0, "typo")
-	in.NetworkID = "3EB0N0001"
-	importOne(t, s, ImportBatch{BeeperChatID: "bc-p", ChatID: phoneChat, Chat: ImportChat{Kind: "single"},
-		Messages: []ImportMessage{in}})
+	fillCopy(t, s, phoneChat, "bc-p", "3EB0N0001", copyLine{beeperID: "bm-n1", ms: 0, text: "typo"})
 	if got := all(t, s, phoneChat); len(got) != 0 {
 		t.Fatalf("a copy with no time showed the line: %+v", got)
 	}
@@ -195,8 +184,8 @@ func TestABeeperCopyWithNoTimeLeavesAnEarlyRowEarly(t *testing.T) {
 	if got := all(t, s, phoneChat); len(got) != 1 || got[0].TimeMs != base || got[0].Text != "fixed" {
 		t.Fatalf("after the original: %+v", got)
 	}
-	if got := lineIDs(t, s, []string{"bm-n1"}); got["bm-n1"] != "3EB0N0001" {
-		t.Fatalf("LineIDs = %v", got)
+	if got := carrier(t, s, "bm-n1"); got != "3EB0N0001" {
+		t.Fatalf("bm-n1 is carried by %q", got)
 	}
 }
 

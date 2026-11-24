@@ -2,7 +2,6 @@ package store
 
 import (
 	"fmt"
-	"maps"
 	"slices"
 	"testing"
 
@@ -116,7 +115,7 @@ func TestAnEarlyUpdateNeverShowsBeforeItsLine(t *testing.T) {
 	}
 }
 
-func TestABeeperCopyFillsAnEarlyRow(t *testing.T) {
+func TestAFilledRowReadsAsCopiedHistory(t *testing.T) {
 	s := openTest(t)
 	put(t, s, text(phoneChat, "3EB0F0000", base-60_000, "an earlier line"))
 	// An edit and a revoke of lines older than WhatsApp's history window.
@@ -126,16 +125,10 @@ func TestABeeperCopyFillsAnEarlyRow(t *testing.T) {
 	if _, err := s.PutMessage(net, Message{ID: "3EB0F0002", ChatID: phoneChat, Deleted: true}); err != nil {
 		t.Fatal(err)
 	}
-	// Beeper's copy holds both lines, naming their WhatsApp IDs.
-	a := beeperMsg("bm-f1", base, "typo")
-	a.NetworkID = "3EB0F0001"
-	b := beeperMsg("bm-f2", base+1000, "regret this")
-	b.NetworkID, b.FromMe = "3EB0F0002", true
-	b.Kind, b.Media = "photo", []ImportMedia{{Kind: "photo", Width: 4, Height: 3}}
-	if r := importOne(t, s, ImportBatch{BeeperChatID: "bc-1", ChatID: phoneChat, Chat: ImportChat{Kind: "single"},
-		Messages: []ImportMessage{a, b}}); r != (ImportResult{Matched: 2}) {
-		t.Fatalf("the import = %+v, want both matched", r)
-	}
+	// Beeper's copy held both lines, naming their WhatsApp IDs, and filled them.
+	fillCopy(t, s, phoneChat, "bc-1", "3EB0F0001", copyLine{beeperID: "bm-f1", ms: base, text: "typo"})
+	fillCopy(t, s, phoneChat, "bc-1", "3EB0F0002", copyLine{beeperID: "bm-f2", ms: base + 1000, text: "regret this",
+		fromMe: true, kind: "photo", media: []Media{{Kind: "photo", Width: 4, Height: 3}}})
 	got := all(t, s, phoneChat)
 	if !slices.Equal(ids(got), []string{"3EB0F0000", "3EB0F0001", "3EB0F0002"}) {
 		t.Fatalf("listed %v", ids(got))
@@ -150,19 +143,16 @@ func TestABeeperCopyFillsAnEarlyRow(t *testing.T) {
 	if c.LastMessageID != "3EB0F0001" || c.Unread != 1 || c.HistoryFromMs != base-60_000 {
 		t.Fatalf("the chat is %+v (only the earlier line is unread: copied history never is)", c)
 	}
-	want := map[string]string{"bm-f1": "3EB0F0001", "bm-f2": "3EB0F0002"}
-	if got := lineIDs(t, s, []string{"bm-f1", "bm-f2"}); !maps.Equal(got, want) {
-		t.Fatalf("LineIDs = %v, want %v", got, want)
+	for b, want := range map[string]string{"bm-f1": "3EB0F0001", "bm-f2": "3EB0F0002"} {
+		if got := carrier(t, s, b); got != want {
+			t.Fatalf("%s is carried by %q, want %q", b, got, want)
+		}
 	}
-	// counts agrees with the import: both filled rows are matched lines.
+	// counts: both filled rows are matched lines.
 	if n, err := s.Counts(net); err != nil || n.Matched != 2 || n.Imported != 2 || n.Messages != 3 {
 		t.Fatalf("Counts = %+v, %v", n, err)
 	}
-	// Copying again adds nothing; the original arriving after all sets its own time.
-	if r := importOne(t, s, ImportBatch{BeeperChatID: "bc-1", ChatID: phoneChat, Chat: ImportChat{Kind: "single"},
-		Messages: []ImportMessage{a, b}}); r != (ImportResult{Skipped: 2}) {
-		t.Fatalf("the second import = %+v", r)
-	}
+	// The original arriving after all sets its own time.
 	orig := text(phoneChat, "3EB0F0001", base+300, "typo")
 	orig.Source = SourceSync
 	if put(t, s, orig) {
@@ -181,12 +171,6 @@ func TestAMediaEntryNeedsAMediaKind(t *testing.T) {
 		if _, err := s.PutMessage(net, m); wire.KindOf(err) != wire.BadRequest {
 			t.Errorf("PutMessage with media kind %q gave %v", k, err)
 		}
-		in := beeperMsg("bm-m1", base, "")
-		in.Kind, in.Media = "photo", []ImportMedia{{Kind: k}}
-		if _, err := s.Import(net, ImportBatch{BeeperChatID: "bc-1", ChatID: phoneChat,
-			Messages: []ImportMessage{beeperMsg("bm-m0", base-1, "fine"), in}}); wire.KindOf(err) != wire.BadRequest {
-			t.Errorf("import with media kind %q gave %v", k, err)
-		}
 	}
 	if _, ok := s.ChatFor(net, phoneChat); ok {
 		t.Fatalf("a refused write left a chat behind")
@@ -197,21 +181,12 @@ func TestAMediaEntryNeedsAMediaKind(t *testing.T) {
 		if _, err := s.PutMessage(net, m); err != nil {
 			t.Errorf("media kind %q was refused: %v", k, err)
 		}
-		in := beeperMsg("bm-"+k, base+5000, "")
-		in.Kind, in.Media = k, []ImportMedia{{Kind: k}}
-		if _, err := s.Import(net, ImportBatch{BeeperChatID: "bc-1", ChatID: phoneChat,
-			Messages: []ImportMessage{in}}); err != nil {
-			t.Errorf("imported media kind %q was refused: %v", k, err)
-		}
 	}
 }
 
 func TestAPlaceholderNeverHidesReadableText(t *testing.T) {
 	s := openTest(t)
-	in := beeperMsg("bm-h", base, "readable in Beeper")
-	in.NetworkID = "3EB0H0101"
-	importOne(t, s, ImportBatch{BeeperChatID: "bc-1", ChatID: phoneChat, Chat: ImportChat{Kind: "single"},
-		Messages: []ImportMessage{in}})
+	seedCopies(t, s, phoneChat, "bc-1", copyLine{beeperID: "bm-h", ms: base, text: "readable in Beeper", networkID: "3EB0H0101"})
 	put(t, s, text(phoneChat, "3EB0H0102", base+1000, "readable here"))
 
 	for _, id := range []string{"3EB0H0101", "3EB0H0102"} {
@@ -295,9 +270,10 @@ func permutations(n int) [][]int {
 	return out
 }
 
-// The five things that can reach the store about one line of his, in any
-// order: the original (from history), an edit and a revoke (live, with no
-// time), a read receipt, and Beeper's copy (which saw the edit).
+// The five things that can reach the store about one line of his: Beeper's
+// copy (which saw the edit), held from before the switch, then in any order
+// the original (from history), an edit and a revoke (live, with no time) and
+// a read receipt.
 const (
 	evOriginal = iota
 	evEdit
@@ -306,10 +282,11 @@ const (
 	evBeeper
 )
 
-// TestEveryOrderShowsTheLineOnce runs all 120 orders of those five events
-// (Review Focus 2 and 3). After every step nothing early shows; at the end
-// there is exactly one line, at the original's time and side, edited or
-// deleted.
+// TestEveryOrderShowsTheLineOnce runs every order of those events that a
+// store can still see (Review Focus 2 and 3): the copy first, as nothing
+// copies any more, then all 24 orders of the other four. After every step
+// nothing early shows; at the end there is exactly one line, at the
+// original's time and side, edited or deleted.
 func TestEveryOrderShowsTheLineOnce(t *testing.T) {
 	cases := []struct {
 		revoke, networkID bool
@@ -327,7 +304,11 @@ func TestEveryOrderShowsTheLineOnce(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(fmt.Sprintf("revoke %v, networkID %v", tc.revoke, tc.networkID), func(t *testing.T) {
 			s := openTest(t)
-			for n, order := range permutations(5) {
+			for n, rest := range permutations(4) {
+				order := []int{evBeeper}
+				for _, e := range rest {
+					order = append(order, e) // evOriginal..evReceipt are 0..3
+				}
 				chat := fmt.Sprintf("1%010d@s.whatsapp.net", n)
 				if bad := runOrder(t, s, chat, order, tc.revoke, tc.networkID, tc.strict); bad != "" {
 					t.Fatalf("order %v: %s", order, bad)
@@ -361,13 +342,11 @@ func runOrder(t *testing.T, s *Store, chat string, order []int, revoke, networkI
 			receiptLands = seen[evOriginal] || seen[evEdit] || (revoke && seen[evRevoke]) || (networkID && seen[evBeeper])
 			_, err = s.PutMessage(net, Message{ID: id, ChatID: chat, SeenMs: base + 10})
 		case evBeeper:
-			in := beeperMsg("bm-q-"+chat, base+300, "hello2")
-			in.FromMe = true
+			l := copyLine{beeperID: "bm-q-" + chat, ms: base + 300, text: "hello2", fromMe: true}
 			if networkID {
-				in.NetworkID = id
+				l.networkID = id
 			}
-			_, err = s.Import(net, ImportBatch{BeeperChatID: "bc-" + chat, ChatID: chat,
-				Chat: ImportChat{Kind: "single"}, Messages: []ImportMessage{in}})
+			seedCopies(t, s, chat, "bc-"+chat, l)
 		}
 		if err != nil {
 			return fmt.Sprintf("event %d: %v", e, err)
@@ -453,15 +432,9 @@ func TestAliasingKeepsEarlyRowsEarlyUntilTheirLine(t *testing.T) {
 	}
 	// An early edit on one side, Beeper's copy naming it on the other: both ways round.
 	edit(phoneChat, "3EB0A0004")
-	in := beeperMsg("bm-a4", base+4000, "four")
-	in.NetworkID = "3EB0A0004"
-	importOne(t, s, ImportBatch{BeeperChatID: "bc-l", ChatID: lidChat, Chat: ImportChat{Kind: "single"},
-		Messages: []ImportMessage{in}})
+	seedCopies(t, s, lidChat, "bc-l", copyLine{beeperID: "bm-a4", ms: base + 4000, text: "four", networkID: "3EB0A0004"})
 	edit(lidChat, "3EB0A0005")
-	in = beeperMsg("bm-a5", base+5000, "five")
-	in.NetworkID = "3EB0A0005"
-	importOne(t, s, ImportBatch{BeeperChatID: "bc-p", ChatID: phoneChat, Chat: ImportChat{Kind: "single"},
-		Messages: []ImportMessage{in}})
+	seedCopies(t, s, phoneChat, "bc-p", copyLine{beeperID: "bm-a5", ms: base + 5000, text: "five", networkID: "3EB0A0005"})
 
 	if err := s.Alias(net, lidChat, phoneChat); err != nil {
 		t.Fatal(err)
@@ -478,9 +451,10 @@ func TestAliasingKeepsEarlyRowsEarlyUntilTheirLine(t *testing.T) {
 			t.Errorf("line %d is %+v, want %q at %+d", i, got[i], want.text, want.ms-base)
 		}
 	}
-	wantIDs := map[string]string{"bm-a4": "3EB0A0004", "bm-a5": "beeper:bm-a5"}
-	if got := lineIDs(t, s, []string{"bm-a4", "bm-a5"}); !maps.Equal(got, wantIDs) {
-		t.Errorf("LineIDs = %v, want %v", got, wantIDs)
+	for b, want := range map[string]string{"bm-a4": "3EB0A0004", "bm-a5": "beeper:bm-a5"} {
+		if got := carrier(t, s, b); got != want {
+			t.Errorf("%s is carried by %q, want %q", b, got, want)
+		}
 	}
 	// The early revoke came across and still waits for its line.
 	if put(t, s, text(lidChat, "3EB0A0003", base+3000, "three")) {
@@ -488,5 +462,70 @@ func TestAliasingKeepsEarlyRowsEarlyUntilTheirLine(t *testing.T) {
 	}
 	if got := all(t, s, phoneChat); len(got) != 5 || got[2].ID != "3EB0A0003" || !got[2].Deleted || got[2].Text != "" {
 		t.Fatalf("after the revoked line: %+v", got)
+	}
+}
+
+func TestAHiddenLineCanBeShownAgain(t *testing.T) {
+	s := openTest(t)
+	placeholder := text(phoneChat, "3EB0H0001", base, "")
+	placeholder.Hidden = ptr(true) // could not be decrypted yet
+	put(t, s, placeholder)
+	put(t, s, text(phoneChat, "3EB0H0000", base-1000, "before"))
+	if _, err := s.PutMessage(net, Message{ID: "3EB0H0001", ChatID: phoneChat, SeenMs: base + 1}); err != nil {
+		t.Fatal(err)
+	}
+	if got := all(t, s, phoneChat); !*got[1].Hidden {
+		t.Fatalf("an update that says nothing of hidden showed the line")
+	}
+	decrypted := text(phoneChat, "3EB0H0001", base, "now readable")
+	decrypted.Hidden = ptr(false)
+	put(t, s, decrypted)
+	got := all(t, s, phoneChat)
+	if *got[1].Hidden || got[1].Text != "now readable" {
+		t.Fatalf("the decrypted line is %+v", got[1])
+	}
+	if c := chatOf(t, s, phoneChat); c.LastMessageID != "3EB0H0001" {
+		t.Fatalf("lastMessageID = %q", c.LastMessageID)
+	}
+}
+
+func TestARevokeBeforeItsLineStillDeletesIt(t *testing.T) {
+	s := openTest(t)
+	put(t, s, text(phoneChat, "3EB0V0000", base-1000, "earlier"))
+	// The revoke comes live; the line itself is still in pending history.
+	added, err := s.PutMessage(net, Message{ID: "3EB0V0001", ChatID: phoneChat, Deleted: true})
+	if err != nil || !added {
+		t.Fatalf("the revoke: added %v, %v; want a tombstone kept", added, err)
+	}
+	if c := chatOf(t, s, phoneChat); c.HistoryFromMs != base-1000 || c.LastMessageID != "3EB0V0000" {
+		t.Fatalf("the tombstone moved the chat: %+v", c)
+	}
+	if put(t, s, text(phoneChat, "3EB0V0001", base, "regret this")) {
+		t.Fatalf("the line was added beside its tombstone")
+	}
+	got := all(t, s, phoneChat)
+	if len(got) != 2 || got[1].ID != "3EB0V0001" || !got[1].Deleted || got[1].Text != "" || got[1].TimeMs != base {
+		t.Fatalf("the line that arrived after its revoke is %+v", got[len(got)-1])
+	}
+	if c := chatOf(t, s, phoneChat); c.LastMessageID != "3EB0V0000" {
+		t.Fatalf("lastMessageID = %q, want the line before the deleted one", c.LastMessageID)
+	}
+}
+
+func TestAKindlessHiddenPlaceholderIsKeptUntilItDecrypts(t *testing.T) {
+	s := openTest(t)
+	added, err := s.PutMessage(net, Message{ID: "3EB0P0001", ChatID: phoneChat, TimeMs: base, Hidden: ptr(true)})
+	if err != nil || !added {
+		t.Fatalf("the placeholder: added %v, %v", added, err)
+	}
+	// Kept as an early row (fix round 4): it shows nowhere until it decrypts.
+	if got := all(t, s, phoneChat); len(got) != 0 {
+		t.Fatalf("the placeholder is listed: %+v", got)
+	}
+	decrypted := text(phoneChat, "3EB0P0001", base, "now readable")
+	decrypted.Hidden = ptr(false)
+	put(t, s, decrypted)
+	if c := chatOf(t, s, phoneChat); c.LastMessageID != "3EB0P0001" {
+		t.Fatalf("the decrypted line does not show: %+v", c)
 	}
 }

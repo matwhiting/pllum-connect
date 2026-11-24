@@ -1,7 +1,7 @@
 // Package store is the helper's encrypted message store: one SQLite database
-// every network writes into, from which the server answers every read and
-// Beeper call. Each database the helper keeps is encrypted with Adiantum
-// under the 32-byte key hello carries, in a folder only he can open.
+// every network writes into, from which the server answers every read. Each
+// database the helper keeps is encrypted with Adiantum under the 32-byte key
+// hello carries, in a folder only he can open.
 package store
 
 import (
@@ -35,6 +35,18 @@ const (
 	SourceSync   = "sync"   // in the network's own history sync
 	SourceBeeper = "beeper" // copied from Beeper and not yet seen directly
 )
+
+// Beeper's copy. Before Pllum left Beeper, its history was copied into the
+// store (the retired `import`): a copied line the network had not delivered
+// became a line of its own under beeperPrefix and source beeper, and a Beeper
+// chat the copy could not place became a read-only chat under
+// unplacedPrefix. Nothing makes such rows any more (checkMessage refuses both
+// prefixes and the source), but a store from before the switch still holds
+// them, and they are read, listed, searched and shown like any other line.
+// The networks can still deliver the lines they copied (history syncs,
+// backfills, older pages), so a direct line still takes over its copy
+// (putNewID, absorbBeeperCopy) and a merge still joins a copy to its line
+// (mergeLine).
 
 // beeperPrefix starts the ID of a line that exists only in Beeper's copy.
 const beeperPrefix = "beeper:"
@@ -635,7 +647,6 @@ func mergeChat(tx *sql.Tx, network, from, into string) error {
 		`INSERT OR IGNORE INTO participants (network, chat_id, participant_id, name, phone, is_self, position)
 			SELECT network, ?, participant_id, name, phone, is_self, position FROM participants
 			WHERE network = ? AND chat_id = ?`,
-		`UPDATE beeper_chats SET chat_id = ? WHERE network = ? AND chat_id = ?`,
 		`UPDATE outgoing SET chat_id = ? WHERE network = ? AND chat_id = ?`,
 	); err != nil {
 		return err
@@ -683,6 +694,18 @@ func mergeChat(tx *sql.Tx, network, from, into string) error {
 		return err
 	}
 	return refresh(tx, network, into)
+}
+
+// resolveReplies points every reply to beeper:<id> in a chat at the line now
+// carrying that Beeper message, wherever it arrived from: after a merge or a
+// fold, the copied line a reply named may live on under the network's ID.
+func resolveReplies(tx *sql.Tx, network, chat string) error {
+	const carrier = `SELECT t.msg_id FROM beeper_ids AS b JOIN messages AS t ON t.rid = b.rid
+			WHERE t.network = m.network AND t.chat_id = m.chat_id AND b.beeper_id = substr(m.reply_to, 8)`
+	_, err := tx.Exec(`UPDATE messages AS m SET reply_to = (`+carrier+` ORDER BY t.rid LIMIT 1)
+		WHERE m.network = ? AND m.chat_id = ? AND m.reply_to LIKE 'beeper:%'
+		AND EXISTS (`+carrier+` AND t.msg_id <> m.reply_to)`, network, chat)
+	return err
 }
 
 // execAll runs each statement with the same arguments.
