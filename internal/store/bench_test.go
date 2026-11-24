@@ -37,6 +37,15 @@ var (
 	fixtureErr  error
 )
 
+// TestMain removes the benchmarks' fixture once the run is over.
+func TestMain(m *testing.M) {
+	code := m.Run()
+	if fixtureDir != "" {
+		os.RemoveAll(filepath.Dir(fixtureDir))
+	}
+	os.Exit(code)
+}
+
 // benchFixture builds the invented store once per run, straight in SQL (a
 // line at a time through PutMessage would take most of a minute), and
 // returns the folder holding it, closed.
