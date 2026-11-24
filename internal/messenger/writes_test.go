@@ -51,7 +51,7 @@ var (
 // sends waits for every send in line to have gone.
 func (h *harness) sends(t *testing.T) {
 	t.Helper()
-	eventually(t, "the sends to go", func() bool { return h.m.busy.Load() == 0 })
+	eventually(t, "the sends to go", func() bool { return h.m.sends.busy.Load() == 0 })
 }
 
 // send sends o and waits for it to go.
@@ -1355,7 +1355,7 @@ func TestASendStoppedInLineAfterItsTextIsUnclear(t *testing.T) {
 		t.Fatal(err)
 	}
 	h.m.Stop()
-	h.m.outbox.Enqueue(id)
+	h.m.sends.outbox.Enqueue(id)
 	if st := h.m.SendState(id); st.State != network.SendFailed || st.Kind != wire.Unclear {
 		t.Errorf("the send is %+v, want failed unclear", st)
 	}

@@ -45,8 +45,8 @@ func (m *Messenger) diag(line string) { m.diagLine(sanitize(line)) }
 // page's passed-over lines (passedOver), made of words, yes/no and counts,
 // never an ID.
 func (m *Messenger) diagLine(line string) {
-	m.diagmu.Lock()
-	defer m.diagmu.Unlock()
+	m.diagFile.mu.Lock()
+	defer m.diagFile.mu.Unlock()
 	path := filepath.Join(m.dir, Name, "diagnostics.txt")
 	if info, err := os.Stat(path); err == nil && info.Size() > diagLimit-1024 {
 		_ = os.Remove(path)
@@ -133,9 +133,9 @@ func (m *Messenger) checkICDC(ctx context.Context, gen int) (missing bool) {
 	cli, fbid := m.cli, m.fbid
 	ok := gen == m.runs.Gen && !m.stopped && cli != nil
 	m.mu.Unlock()
-	m.dmu.Lock()
-	dev := m.dev
-	m.dmu.Unlock()
+	m.devStore.mu.Lock()
+	dev := m.devStore.dev
+	m.devStore.mu.Unlock()
 	if !ok || dev == nil || dev.IdentityKey == nil || dev.IdentityKey.Pub == nil {
 		return false
 	}

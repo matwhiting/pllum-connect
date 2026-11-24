@@ -12,15 +12,19 @@
 // history backup, which his PIN restores (history.go), lists every folder
 // of his inbox and fetches the recent history of the unencrypted threads
 // (backfill.go). Everything the messages page, the pages and the main
-// socket say is written into the store (ingest.go): groups as chats, his
+// socket say is written into the store (ingest.go; the encrypted side's in
+// enc_ingest.go): groups as chats, his
 // older one-to-one threads as aliases of their encrypted chats (ids.go),
 // their lines, reactions, read receipts, mutes and people; and so is
 // everything the encrypted socket says of the encrypted chats (their lines,
 // receipts and undecryptable messages) and, once his PIN has restored it,
-// his backup of them (history.go). The gate (gate.go) counts what it sees.
-// It sends, reacts, marks read and mutes (writes.go: the group's main socket
-// tasks and whatsmeow's encrypted sends, nothing else, each sent at most
-// once), and fetches photos and stickers once each (media.go).
+// his backup of them (enc_history.go). The gate (gate.go) counts what it
+// sees. It sends (send.go, its files uploaded by upload.go), reacts, marks
+// read and mutes (marks.go): the group's main socket tasks and whatsmeow's
+// encrypted sends, nothing else (writes.go), each sent at most once; and it
+// fetches photos and stickers once each (media.go). The run, its redials
+// (redial.go) and the session's requests and blocks (session.go) are
+// below; the state each lock guards is in state.go.
 //
 // Meta locks accounts that behave like a script, so every request goes
 // through one meta.Pace: one at a time, 2 to 4 s apart, none for a while
@@ -40,8 +44,6 @@ package messenger
 
 import (
 	"context"
-	"database/sql"
-	"maps"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -51,12 +53,10 @@ import (
 	"github.com/rs/zerolog"
 	"go.mau.fi/mautrix-meta/pkg/messagix"
 	"go.mau.fi/mautrix-meta/pkg/messagix/cookies"
-	"go.mau.fi/mautrix-meta/pkg/messagix/securehistory"
 	"go.mau.fi/mautrix-meta/pkg/messagix/socket"
 	"go.mau.fi/mautrix-meta/pkg/messagix/table"
 	"go.mau.fi/mautrix-meta/pkg/messagix/types"
 	wastore "go.mau.fi/whatsmeow/store"
-	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types/events"
 
 	"github.com/matwhiting/pllum-connect/internal/mediacache"
@@ -198,67 +198,18 @@ type Messenger struct {
 	// self-check, which Stop does not wait for); tests settle on it.
 	side atomic.Int32
 
-	// the whatsmeow device store (e2ee.go)
-	dmu       sync.Mutex
-	db        *sql.DB
-	container *sqlstore.Container
-	dev       *wastore.Device // his registered, saved device
-	// pending is a device made for pendingFor whose registration or save
-	// failed in this helper: the next sign-in registers its keys again.
-	pending    *wastore.Device
-	pendingFor int64
-	// replacing is the device a re-registration replaces (reregister):
-	// while it is set, the pending device is registered in its place and
-	// its row deleted once that has gone.
-	replacing *wastore.Device
-
-	// the secure history (history.go)
-	hmu      sync.Mutex // one restore at a time
-	backup   *securehistory.Backup
-	history  string          // historyState: "", noBackup, needsPIN, restored, skipped
-	epmu     sync.Mutex      // one change to the history device's keys at a time
-	ebActive atomic.Bool     // the first read of his backup is running
-	efmu     sync.Mutex      // the run of failed backup requests
-	diagmu   sync.Mutex      // diagnostics.txt (diag.go)
-	checked  atomic.Bool     // this run's self-check has run (diag.go)
-	fillmu   sync.Mutex      // filling
-	filling  map[string]bool // chats whose newest backup page is due (catchup.go)
-	// refilling: chats whose newest backup page is due again an hour on
-	// (catchup.go). Both are in memory only: a restart forgets them, and
-	// the daily catch-up still reads the chat.
-	refilling map[string]bool
-	odmu      sync.Mutex // the day's pages of the backup asked on demand
-
-	// what the gate counts (gate.go)
-	cmu                   sync.Mutex
-	counts                GateCounts
-	listing               listing
-	newestOneToOne        int64 // the thread key of the newest encrypted one-to-one, 0 for none
-	newestAt              int64 // its last activity, in ms
-	liveEncryptedReceived atomic.Int64
-	liveUndecryptable     atomic.Int64
-
-	values *network.Values // the network's own store values, as read or written
-
-	nmu   sync.Mutex
-	names map[int64]string // people's names from contact rows, this run only
-
-	lmu         sync.Mutex
-	recent      map[string]string // a line seen this run → its chat, for edits
-	recentOrder []string
-
-	wmu     sync.Mutex
-	waiters map[int64]chan rangeNote // a thread key → the FetchOlder waiting for its page
-
-	lkmu  sync.Mutex
-	locks map[string]*sync.Mutex // one history fetch per chat at a time
-
-	changes network.Changed // the changed events (backfill.go)
-
-	// the sends waiting their turn (writes.go)
-	outbox network.Outbox
-	rmu    sync.Mutex   // one resume of a failed send at a time
-	busy   atomic.Int64 // sends in line or going
+	devStore deviceStore // the whatsmeow device store (e2ee.go)
+	restore  restoreState
+	book     backupBook
+	diagFile diagFile
+	checked  atomic.Bool // this run's self-check has run (diag.go)
+	ebActive atomic.Bool // the first read of his backup is running (enc_history.go)
+	fills    fills
+	gauge    gauge
+	memo     runMemo
+	values   *network.Values // the network's own store values, as read or written
+	changes  network.Changed // the changed events (backfill.go)
+	sends    sends
 
 	// the media folder every network shares (media.go)
 	media *mediacache.Cache
@@ -299,11 +250,13 @@ func New(st *store.Store, dir string, key [32]byte, emit network.Emit) *Messenge
 		writeWait:     writeWait,
 		state:         network.NotConnected,
 		values:        network.NewValues(st, Name),
-		names:         map[int64]string{},
-		recent:        map[string]string{},
-		waiters:       map[int64]chan rangeNote{},
-		locks:         map[string]*sync.Mutex{},
-		media:         mediacache.New(dir, key),
+		memo: runMemo{
+			names:   map[int64]string{},
+			recent:  map[string]string{},
+			waiters: map[int64]chan rangeNote{},
+			locks:   map[string]*sync.Mutex{},
+		},
+		media: mediacache.New(dir, key),
 	}
 	// The pace reads the network's clock when it runs, so a test's clock,
 	// set after New, is the one it uses.
@@ -312,8 +265,8 @@ func New(st *store.Store, dir string, key [32]byte, emit network.Emit) *Messenge
 		Sleep: func(ctx context.Context, d time.Duration) error { return m.clock.Sleep(ctx, d) },
 	}
 	m.sess = &meta.Session{Page: meta.FacebookPage, Pace: m.pace, Values: m.values, KindOf: kindOf, Terminal: terminal}
-	m.outbox = network.Outbox{Begin: m.beginSends, End: m.work.Done, Deliver: func(_ context.Context, id string) { m.deliver(id) },
-		Stopped: m.failStopped, Busy: func(d int) { m.busy.Add(int64(d)) }}
+	m.sends.outbox = network.Outbox{Begin: m.beginSends, End: m.work.Done, Deliver: func(_ context.Context, id string) { m.deliver(id) },
+		Stopped: m.failStopped, Busy: func(d int) { m.sends.busy.Add(int64(d)) }}
 	return m
 }
 
@@ -478,118 +431,6 @@ func (m *Messenger) Nudge() {
 	}
 }
 
-// maxDrops is how many main-socket failures in a row, without it
-// connecting, the library's own loop is let run (Instagram's rule).
-const maxDrops = 5
-
-// passing reports whether a failure of this kind may be retried: no
-// connection, or a timeout.
-func passing(kind wire.Kind) bool { return kind == wire.Offline || kind == wire.Timeout }
-
-// again starts a new run with the session held, unless one is in force or
-// the pace forbids a request now; ok reports whether it started. m.mu is
-// held.
-func (m *Messenger) again() (ok bool) {
-	if !m.started || m.stopped || m.session == nil || m.cli != nil {
-		return false
-	}
-	if _, blocked := m.pace.Blocked(); blocked {
-		return false
-	}
-	m.retire()
-	m.startRun()
-	return true
-}
-
-// calm forgets every retry the network had planned (a new sign-in, a
-// sign-out, Meta stopping the session). m.mu is held.
-func (m *Messenger) calm() {
-	if m.stopRetry != nil {
-		m.stopRetry()
-		m.stopRetry = nil
-	}
-	m.drops, m.redials = 0, 0
-	m.redialDue, m.redialing, m.retry = false, false, false
-}
-
-// disconnected records a main-socket failure of run gen. messagix redials
-// by itself (2 s, doubling to 5 minutes) for ever, and each dial is a
-// handshake with his cookies that the pace never sees; a checkpoint or a
-// dead session can look like any other failure there. So past maxDrops in
-// a row the run is stopped (both sockets), the state is offline, and one
-// redial is due through the pace, which a checkpoint found then stops as
-// any request's would. Instagram's disconnected, for Messenger.
-func (m *Messenger) disconnected(gen int) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if gen != m.runs.Gen || m.stopped {
-		return
-	}
-	m.drops++
-	if m.drops <= maxDrops {
-		return
-	}
-	m.drops = 0
-	m.retire() // messagix's Disconnect stops its loop (in its own goroutine)
-	m.setState(network.Offline, "")
-	m.scheduleRedial()
-}
-
-// connected records the main socket of run gen connecting: its failures
-// in a row, and the redials', start over.
-func (m *Messenger) connected(gen int) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if gen == m.runs.Gen {
-		m.drops, m.redials, m.redialing = 0, 0, false
-	}
-}
-
-// scheduleRedial: one redial is due meta.Backoff(redials) on (15 minutes,
-// doubling to 4 hours while redials fail; a connect starts it over).
-// m.mu is held.
-func (m *Messenger) scheduleRedial() {
-	if m.stopRetry != nil {
-		m.stopRetry()
-	}
-	m.redialDue = true
-	gen := m.runs.Gen
-	m.stopRetry = m.clock.AfterFunc(meta.Backoff(m.redials), func() {
-		m.mu.Lock()
-		defer m.mu.Unlock()
-		if gen == m.runs.Gen {
-			m.redial()
-		}
-	})
-}
-
-// redial runs the redial due, once: a new run with the session held (its
-// messages page loaded through the pace, then the socket connected). While
-// the pace forbids a request it waits for the next, twice as long; a run
-// that fails for any other reason than Meta stopping the session does too
-// (failed). m.mu is held.
-func (m *Messenger) redial() {
-	if !m.redialDue || m.stopped || m.session == nil {
-		return
-	}
-	m.redialDue = false
-	if m.stopRetry != nil {
-		m.stopRetry()
-		m.stopRetry = nil
-	}
-	m.redials++
-	if kind, blocked := m.pace.Blocked(); blocked {
-		if kind == wire.RateLimited {
-			m.setState(network.Offline, wire.RateLimited)
-		}
-		m.scheduleRedial()
-		return
-	}
-	if m.again() {
-		m.redialing = true
-	}
-}
-
 // Stop disconnects, waits briefly for the network's work to end, and closes
 // the device database. The store is the server's to close.
 func (m *Messenger) Stop() {
@@ -618,12 +459,12 @@ func (m *Messenger) Stop() {
 	case <-time.After(2 * time.Second):
 		// A request is stuck; it ends with the process.
 	}
-	m.dmu.Lock()
-	if m.db != nil {
-		m.db.Close()
-		m.db, m.container, m.dev, m.pending, m.replacing = nil, nil, nil, nil, nil
+	m.devStore.mu.Lock()
+	if m.devStore.db != nil {
+		m.devStore.db.Close()
+		m.devStore.db, m.devStore.container, m.devStore.dev, m.devStore.pending, m.devStore.replacing = nil, nil, nil, nil, nil
 	}
-	m.dmu.Unlock()
+	m.devStore.mu.Unlock()
 }
 
 // retire ends the current run, if any: its context, its encrypted socket,
@@ -652,10 +493,10 @@ func (m *Messenger) retire() {
 			old.Disconnect()
 		}()
 	}
-	m.cmu.Lock()
-	m.counts.E2EEConnected = false
-	m.counts.MainConnected = false
-	m.cmu.Unlock()
+	m.gauge.mu.Lock()
+	m.gauge.counts.E2EEConnected = false
+	m.gauge.counts.MainConnected = false
+	m.gauge.mu.Unlock()
 }
 
 // startRun signs in with m.session in the background, as run gen. m.mu is
@@ -796,7 +637,7 @@ func (m *Messenger) beginE2EE(gen int, cli msgrClient, fbid int64) {
 		if !m.gate {
 			// The gate only counts: it fetches no history (review I4).
 			m.backfill(ctx, gen, cli)
-			// His restored backup, once (history.go); a restore made later
+			// His restored backup, once (enc_history.go); a restore made later
 			// in this run starts it itself.
 			m.encryptedBackfill(ctx, gen, cli, fbid)
 			// what the encrypted socket didn't bring, once a day (catchup.go)
@@ -817,14 +658,14 @@ func (m *Messenger) socketUp(gen int, encrypted, up bool) {
 	if gen != m.runs.Gen || m.stopped {
 		return
 	}
-	m.cmu.Lock()
+	m.gauge.mu.Lock()
 	if encrypted {
-		m.counts.E2EEConnected = up
+		m.gauge.counts.E2EEConnected = up
 	} else {
-		m.counts.MainConnected = up
+		m.gauge.counts.MainConnected = up
 	}
-	main, enc := m.counts.MainConnected, m.counts.E2EEConnected
-	m.cmu.Unlock()
+	main, enc := m.gauge.counts.MainConnected, m.gauge.counts.E2EEConnected
+	m.gauge.mu.Unlock()
 	if encrypted && up {
 		m.e2eeEverUp, m.e2eeFailed = true, false
 	}
@@ -862,145 +703,4 @@ func (m *Messenger) failed(gen int, kind wire.Kind) {
 	}
 	m.setState(network.NotConnected, kind)
 	m.retry = passing(kind)
-}
-
-// request makes one request to Meta through the pace (meta.Session): none
-// while a block is in force, then a 2 to 4 s gap after the last. A success
-// may carry rotated cookies to Pllum; Meta pushing back blocks the pace
-// and, for a checkpoint, an ended session or a suspension, ends the run. A
-// caller that expects an answer Meta gives as an error (no backup, a wrong
-// PIN) catches it inside fn and returns nil: Meta answered.
-func (m *Messenger) request(ctx context.Context, gen int, fn func(ctx context.Context) error) error {
-	return m.sess.Request(ctx, func() bool { return m.current(gen) }, fn,
-		func() { m.checkSession(gen) }, func(kind wire.Kind) { m.pushedBack(gen, kind) })
-}
-
-// blocked is the error for a request now, when the pace forbids one.
-func (m *Messenger) blocked() error { return m.sess.Gate() }
-
-// kindOf is the kind of a client error, as Instagram's (meta.KindOf), and
-// also: messagix's "please log in" is an ended session, and a connection
-// that failed at the network (the encrypted socket's dial, say) is no
-// connection, or a timeout.
-func kindOf(err error) wire.Kind {
-	return meta.KindOf(err, meta.KindRules{Ended: []error{types.ErrPleaseLogIn}, Net: true})
-}
-
-// errorKind is the wire kind to return for kind (meta.ErrorKind).
-func errorKind(kind wire.Kind) wire.Kind { return meta.ErrorKind(kind) }
-
-// stateFor is the state Meta pushing back with kind leaves: ok is false for
-// a kind that does not end the run.
-func stateFor(kind wire.Kind) (s network.State, k wire.Kind, ok bool) {
-	switch kind {
-	case wire.Checkpoint:
-		return network.ReconnectNeeded, wire.Checkpoint, true
-	case meta.ReconnectNeeded:
-		return network.ReconnectNeeded, "", true
-	case meta.Banned:
-		return network.Banned, "", true
-	case wire.RegistrationUnclear:
-		return network.ReconnectNeeded, wire.RegistrationUnclear, true
-	}
-	return "", "", false
-}
-
-// paceKind is what a block stops the pace with: a registration whose
-// answer was lost stops it as an ended session does.
-func paceKind(kind wire.Kind) wire.Kind {
-	if kind == wire.RegistrationUnclear {
-		return meta.ReconnectNeeded
-	}
-	return kind
-}
-
-// pushedBack: Meta asked him to confirm it is him, ended the session or
-// suspended the account (the pace is already blocked). The run ends, its
-// encrypted socket too, and nothing is asked again until a new login.
-func (m *Messenger) pushedBack(gen int, kind wire.Kind) {
-	s, k, ok := stateFor(kind)
-	if !ok {
-		return
-	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if gen != m.runs.Gen || m.stopped {
-		return
-	}
-	m.retire()
-	m.calm() // nothing redials or retries until a new login
-	m.setState(s, k)
-	// Kept, so neither a restart nor any version of these cookies sent again
-	// asks Meta.
-	hashes := m.hashes
-	if len(hashes) == 0 {
-		hashes = []string{sessionHash(m.session)}
-	}
-	m.sess.KeepBlock(kind, hashes)
-}
-
-// terminal reports whether kind stops the session until a new login.
-func terminal(kind wire.Kind) bool {
-	_, _, ok := stateFor(kind)
-	return ok
-}
-
-// sessionHash is a SHA-256 of a session's required cookies
-// (meta.SessionHash): what tells the session Meta stopped from a new
-// sign-in, with no cookie value kept.
-func sessionHash(s network.Session) string { return meta.SessionHash(meta.FacebookPage, s) }
-
-// keptBlock is the kind that stopped a session in this or an earlier run,
-// and the hashes of every version of that session; ok is false when none
-// is kept.
-func (m *Messenger) keptBlock() (wire.Kind, []string, bool) { return m.sess.KeptBlock() }
-
-// holdBlock reports a kept block's state again and blocks the pace on it
-// (never Clear: only a new session lifts it). m.mu is held.
-func (m *Messenger) holdBlock(kind wire.Kind) {
-	st, k, _ := stateFor(kind)
-	m.pace.Fail(paceKind(kind))
-	m.setState(st, k)
-}
-
-// checkSession sends the session event when the client's cookies have
-// changed (Meta rotates some as it answers): Pllum keeps the copy it signs
-// in again from.
-func (m *Messenger) checkSession(gen int) {
-	m.mu.Lock()
-	cli := m.cli
-	ok := gen == m.runs.Gen && cli != nil
-	m.mu.Unlock()
-	if !ok {
-		return
-	}
-	s, changed := m.diff.Changed(cli.GetCookies(), m.clock.Now())
-	if !changed {
-		return
-	}
-	// The rotated set is the session now: a block names it as well as the
-	// versions before.
-	m.mu.Lock()
-	if gen == m.runs.Gen {
-		m.session = network.Session(maps.Clone(s))
-		if hash := sessionHash(m.session); !slices.Contains(m.hashes, hash) {
-			m.hashes = append(m.hashes, hash)
-		}
-	}
-	m.mu.Unlock()
-	m.emit(map[string]any{"event": "session", "session": s})
-}
-
-// setState moves the state and tells Pllum; m.mu is held. The state event
-// goes out under the lock, so state events keep their order.
-func (m *Messenger) setState(s network.State, kind wire.Kind) {
-	if s == m.state && kind == m.kind {
-		return
-	}
-	m.state, m.kind = s, kind
-	ev := map[string]any{"event": "state", "state": s}
-	if kind != "" {
-		ev["kind"] = string(kind)
-	}
-	m.emit(ev)
 }

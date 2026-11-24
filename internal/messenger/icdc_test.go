@@ -392,9 +392,9 @@ func TestAReRegistrationOfARetiredRunArmsNothing(t *testing.T) {
 	if began || err != nil {
 		t.Fatalf("reregister of a retired run began %v, %v", began, err)
 	}
-	h.m.dmu.Lock()
-	armed := h.m.replacing != nil
-	h.m.dmu.Unlock()
+	h.m.devStore.mu.Lock()
+	armed := h.m.devStore.replacing != nil
+	h.m.devStore.mu.Unlock()
 	if armed {
 		t.Errorf("a retired run armed a device to replace")
 	}

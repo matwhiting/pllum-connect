@@ -146,9 +146,9 @@ func settled(t *testing.T, h *harness, chat, id, kind string) {
 
 // fillingNow reports whether chat's newest page is due or being read.
 func (h *harness) fillingNow(chat string) bool {
-	h.m.fillmu.Lock()
-	defer h.m.fillmu.Unlock()
-	return h.m.filling[chat]
+	h.m.fills.mu.Lock()
+	defer h.m.fills.mu.Unlock()
+	return h.m.fills.due[chat]
 }
 
 // storeAlicePage stores a page of Alice's backup as a read of it would.
@@ -287,9 +287,9 @@ func filledAt(t *testing.T, h *harness, chat string, want int) {
 
 // refillingNow reports whether chat's hour-later page is due or being read.
 func (h *harness) refillingNow(chat string) bool {
-	h.m.fillmu.Lock()
-	defer h.m.fillmu.Unlock()
-	return h.m.refilling[chat]
+	h.m.fills.mu.Lock()
+	defer h.m.fills.mu.Unlock()
+	return h.m.fills.again[chat]
 }
 
 // A message his phone hadn't backed up by the two minutes is read again an

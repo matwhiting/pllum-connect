@@ -40,29 +40,29 @@ const (
 // unless that is already due, and again refillDelay from now, unless that
 // is already due, if the chat still shows a line that couldn't be read.
 func (m *Messenger) fillLater(chat string) {
-	m.fillAfter(chat, fillDelay, &m.filling, false)
-	m.fillAfter(chat, refillDelay, &m.refilling, true)
+	m.fillAfter(chat, fillDelay, &m.fills.due, false)
+	m.fillAfter(chat, refillDelay, &m.fills.again, true)
 }
 
 // fillAfter reads chat's newest page of the backup d from now, unless due
-// (filling or refilling, under m.fillmu) already marks one for it; with
+// (filling or refilling, under m.fills.mu) already marks one for it; with
 // unreadOnly, only if the chat then still shows a line that couldn't be
 // read.
 func (m *Messenger) fillAfter(chat string, d time.Duration, due *map[string]bool, unreadOnly bool) {
-	m.fillmu.Lock()
+	m.fills.mu.Lock()
 	if *due == nil {
 		*due = map[string]bool{}
 	}
 	if (*due)[chat] {
-		m.fillmu.Unlock()
+		m.fills.mu.Unlock()
 		return
 	}
 	(*due)[chat] = true
-	m.fillmu.Unlock()
+	m.fills.mu.Unlock()
 	done := func() {
-		m.fillmu.Lock()
+		m.fills.mu.Lock()
 		delete(*due, chat)
-		m.fillmu.Unlock()
+		m.fills.mu.Unlock()
 	}
 	m.clock.AfterFunc(d, func() {
 		m.mu.Lock()

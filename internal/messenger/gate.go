@@ -87,14 +87,14 @@ type GateCounts struct {
 // GateCounts is the gate's counts now.
 func (m *Messenger) GateCounts() any {
 	yearAgo := m.clock.Now().Add(-yearReach).UnixMilli()
-	m.cmu.Lock()
-	c := m.counts
-	c.FolderStops = maps.Clone(m.counts.FolderStops)
+	m.gauge.mu.Lock()
+	c := m.gauge.counts
+	c.FolderStops = maps.Clone(m.gauge.counts.FolderStops)
 	if c.FolderStops == nil {
 		c.FolderStops = map[string]int{}
 	}
 	c.ByFolder, c.ByType, c.BySyncGroup, c.OlderThanYearByType = map[string]int{}, map[string]int{}, map[string]int{}, map[string]int{}
-	for t, s := range m.listing.threads {
+	for t, s := range m.gauge.listing.threads {
 		tw := typeWord(t.encrypted, s.tt)
 		c.ByFolder[folderWord(s.folder)]++
 		c.ByType[tw]++
@@ -110,7 +110,7 @@ func (m *Messenger) GateCounts() any {
 			c.OlderThanYearByType[tw]++
 		}
 	}
-	for p := range m.listing.parents {
+	for p := range m.gauge.listing.parents {
 		if p != topParent {
 			c.OtherParents++
 		}
@@ -120,11 +120,11 @@ func (m *Messenger) GateCounts() any {
 		tt     table.ThreadType
 		folder string
 	}
-	threads := make([]placed, 0, len(m.listing.threads))
-	for t, s := range m.listing.threads {
+	threads := make([]placed, 0, len(m.gauge.listing.threads))
+	for t, s := range m.gauge.listing.threads {
 		threads = append(threads, placed{t.key, s.tt, s.folder})
 	}
-	m.cmu.Unlock()
+	m.gauge.mu.Unlock()
 	ones, groups := map[string]bool{}, map[string]bool{}
 	for _, t := range threads {
 		p, ok := placeThread(t.key, t.tt)
@@ -145,8 +145,8 @@ func (m *Messenger) GateCounts() any {
 		}
 	}
 	c.OneToOneChats, c.GroupChats = len(ones), len(groups)
-	c.LiveEncryptedReceived = m.liveEncryptedReceived.Load()
-	c.LiveUndecryptable = m.liveUndecryptable.Load()
+	c.LiveEncryptedReceived = m.gauge.liveEncryptedReceived.Load()
+	c.LiveUndecryptable = m.gauge.liveUndecryptable.Load()
 	return c
 }
 
@@ -243,15 +243,15 @@ func (m *Messenger) addTable(tbl *table.LSTable) {
 	if tbl == nil {
 		return
 	}
-	m.cmu.Lock()
-	defer m.cmu.Unlock()
-	l := &m.listing
+	m.gauge.mu.Lock()
+	defer m.gauge.mu.Unlock()
+	l := &m.gauge.listing
 	if l.threads == nil {
 		l.threads, l.pointers = map[listedThread]*seenThread{}, map[int64]bool{}
 		l.parents, l.ranges = map[int64]bool{}, map[folderKey]folderRange{}
 		l.configParents = map[int64]bool{}
 	}
-	c := &m.counts
+	c := &m.gauge.counts
 	add := func(key int64, tt table.ThreadType, folder string, group, parent, lastMs int64) {
 		if key == 0 {
 			return
@@ -259,8 +259,8 @@ func (m *Messenger) addTable(tbl *table.LSTable) {
 		if strings.HasPrefix(folder, cutoverFolder) && !tt.IsWhatsApp() {
 			l.pointers[key] = true
 		}
-		if tt == table.ENCRYPTED_OVER_WA_ONE_TO_ONE && (lastMs > m.newestAt || m.newestOneToOne == 0) {
-			m.newestOneToOne, m.newestAt = key, lastMs
+		if tt == table.ENCRYPTED_OVER_WA_ONE_TO_ONE && (lastMs > m.gauge.newestAt || m.gauge.newestOneToOne == 0) {
+			m.gauge.newestOneToOne, m.gauge.newestAt = key, lastMs
 		}
 		if parent != 0 {
 			l.parents[parent] = true
@@ -335,17 +335,17 @@ func (m *Messenger) addTable(tbl *table.LSTable) {
 
 // rangeOf is how far a folder's listing reaches, as Meta last said.
 func (m *Messenger) rangeOf(f folderKey) (folderRange, bool) {
-	m.cmu.Lock()
-	defer m.cmu.Unlock()
-	r, ok := m.listing.ranges[f]
+	m.gauge.mu.Lock()
+	defer m.gauge.mu.Unlock()
+	r, ok := m.gauge.listing.ranges[f]
 	return r, ok
 }
 
 // listed records how a listing of every folder ended.
 func (m *Messenger) listed(complete, capped bool) {
-	m.cmu.Lock()
-	defer m.cmu.Unlock()
-	m.counts.ListComplete, m.counts.ListCapped = complete, capped
+	m.gauge.mu.Lock()
+	defer m.gauge.mu.Unlock()
+	m.gauge.counts.ListComplete, m.gauge.counts.ListCapped = complete, capped
 }
 
 // isGroup reports whether an unencrypted thread type is a group chat.

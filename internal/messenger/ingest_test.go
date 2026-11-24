@@ -60,7 +60,7 @@ func (h *harness) settle() { settleOn(h.m, h.f) }
 // settleOn is settle for a network made outside a harness.
 func settleOn(m *Messenger, f *fakeMeta) {
 	testkit.Wait(func() bool {
-		return m.work.Running() == 0 && m.busy.Load() == 0 && m.side.Load() == 0 && f.inflight.Load() == 0
+		return m.work.Running() == 0 && m.sends.busy.Load() == 0 && m.side.Load() == 0 && f.inflight.Load() == 0
 	})
 }
 

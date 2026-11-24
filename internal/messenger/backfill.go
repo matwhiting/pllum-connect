@@ -116,10 +116,10 @@ const (
 // waits for a listing that ends). A folder that fails with an error of its
 // own is passed over.
 func (m *Messenger) listThreads(ctx context.Context, gen int, cli msgrClient) (ok bool) {
-	m.cmu.Lock()
-	m.counts.ListPages, m.counts.ListComplete, m.counts.ListCapped = 0, false, false
-	m.counts.FolderStops = map[string]int{}
-	m.cmu.Unlock()
+	m.gauge.mu.Lock()
+	m.gauge.counts.ListPages, m.gauge.counts.ListComplete, m.gauge.counts.ListCapped = 0, false, false
+	m.gauge.counts.FolderStops = map[string]int{}
+	m.gauge.mu.Unlock()
 
 	keep := !m.gate
 	reach := !m.gate
@@ -137,9 +137,9 @@ func (m *Messenger) listThreads(ctx context.Context, gen int, cli msgrClient) (o
 		f := queue[0]
 		done[f] = true
 		stop, err := m.listFolder(ctx, gen, cli, f, reach, keep, &total)
-		m.cmu.Lock()
-		m.counts.FolderStops[stop]++
-		m.cmu.Unlock()
+		m.gauge.mu.Lock()
+		m.gauge.counts.FolderStops[stop]++
+		m.gauge.mu.Unlock()
 		if stop == stopFailed {
 			if !m.current(gen) || kindOf(err) != wire.Internal {
 				m.listed(false, false)
@@ -172,18 +172,18 @@ func (m *Messenger) listThreads(ctx context.Context, gen int, cli msgrClient) (o
 // done), in order: sync group, then the inbox before other parents. Sync
 // group 95 is listed only under the parents the messages page names.
 func (m *Messenger) folders(done map[folderKey]bool, kept bool) []folderKey {
-	m.cmu.Lock()
+	m.gauge.mu.Lock()
 	parents := []int64{topParent}
 	config := map[int64]bool{topParent: true}
-	for p := range m.listing.parents {
+	for p := range m.gauge.listing.parents {
 		if p != topParent {
 			parents = append(parents, p)
 		}
 	}
-	for p := range m.listing.configParents {
+	for p := range m.gauge.listing.configParents {
 		config[p] = true
 	}
-	m.cmu.Unlock()
+	m.gauge.mu.Unlock()
 	slices.Sort(parents[1:])
 	var out []folderKey
 	for _, g := range syncGroups {
@@ -259,9 +259,9 @@ func (m *Messenger) listFolder(ctx context.Context, gen int, cli msgrClient, f f
 			return err
 		})
 		*total++
-		m.cmu.Lock()
-		m.counts.ListPages++
-		m.cmu.Unlock()
+		m.gauge.mu.Lock()
+		m.gauge.counts.ListPages++
+		m.gauge.mu.Unlock()
 		if err != nil || !m.current(gen) {
 			return stopFailed, err
 		}
@@ -401,7 +401,7 @@ func (m *Messenger) activeChats() (chats []string, ok bool) {
 
 // FetchOlder fetches one page of a chat's history older than what the
 // store holds, and tells Pllum when it added lines: of its encrypted
-// backup first, once his history is restored (history.go), until that has
+// backup first, once his history is restored (enc_history.go), until that has
 // nothing older; then of its unencrypted thread (a group's, or the older
 // thread of a one-to-one). A chat with neither, or none of its lines held,
 // or held after a page that did not move, asks nothing; one the store does
@@ -574,25 +574,25 @@ type rangeNote struct {
 // await registers a wait for a thread's next range.
 func (m *Messenger) await(key int64) chan rangeNote {
 	ch := make(chan rangeNote, 8)
-	m.wmu.Lock()
-	m.waiters[key] = ch
-	m.wmu.Unlock()
+	m.memo.mu.Lock()
+	m.memo.waiters[key] = ch
+	m.memo.mu.Unlock()
 	return ch
 }
 
 func (m *Messenger) unawait(key int64, ch chan rangeNote) {
-	m.wmu.Lock()
-	if m.waiters[key] == ch {
-		delete(m.waiters, key)
+	m.memo.mu.Lock()
+	if m.memo.waiters[key] == ch {
+		delete(m.memo.waiters, key)
 	}
-	m.wmu.Unlock()
+	m.memo.mu.Unlock()
 }
 
 // answer hands a thread's range to the FetchOlder waiting on it, if any.
 func (m *Messenger) answer(key int64, note rangeNote) {
-	m.wmu.Lock()
-	ch := m.waiters[key]
-	m.wmu.Unlock()
+	m.memo.mu.Lock()
+	ch := m.memo.waiters[key]
+	m.memo.mu.Unlock()
 	if ch == nil {
 		return
 	}
@@ -618,12 +618,12 @@ func (m *Messenger) wait(ctx context.Context, ch chan rangeNote) (rangeNote, boo
 
 // chatLock is the lock that keeps one history fetch per chat at a time.
 func (m *Messenger) chatLock(chat string) *sync.Mutex {
-	m.lkmu.Lock()
-	defer m.lkmu.Unlock()
-	l, ok := m.locks[chat]
+	m.memo.mu.Lock()
+	defer m.memo.mu.Unlock()
+	l, ok := m.memo.locks[chat]
 	if !ok {
 		l = &sync.Mutex{}
-		m.locks[chat] = l
+		m.memo.locks[chat] = l
 	}
 	return l
 }

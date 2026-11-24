@@ -78,7 +78,7 @@ func (c realClient) PrepareE2EE() (e2eeClient, error) {
 // device is his Messenger device for this account, registered with Meta
 // and saved: the one saved in an earlier run or sign-in, or else one
 // registered now (once, timed), with a Messenger Lite session's Facebook
-// device ID where there is one, else the one RegisterE2EE makes. While a re-registration is pending (m.replacing, set
+// device ID where there is one, else the one RegisterE2EE makes. While a re-registration is pending (m.devStore.replacing, set
 // by reregister) the saved device is passed over: the pending device is
 // registered, and once it is, the replaced device's row is deleted before
 // the new one is saved (a device Meta gives the same number would
@@ -91,15 +91,15 @@ func (c realClient) PrepareE2EE() (e2eeClient, error) {
 // same keys and keeps one device, where new keys would add a second. Its
 // error is
 // registrationUnclear: it may have happened, and the network keeps it as
-// the session's block (messenger.go), so neither a restart nor the same
+// the session's block (session.go), so neither a restart nor the same
 // session sent again registers anything (a restart would have only new
 // keys) until he signs in again. A registration that went clears it. The
 // device database is opened the first time, never at Start, so nothing is
 // made on disk until he signs in.
 func (m *Messenger) device(ctx context.Context, gen int, cli msgrClient, fbid int64) (dev *wastore.Device, registerMs int64, err error) {
-	m.dmu.Lock()
-	defer m.dmu.Unlock()
-	if m.container == nil {
+	m.devStore.mu.Lock()
+	defer m.devStore.mu.Unlock()
+	if m.devStore.container == nil {
 		db, err := store.OpenDevice(filepath.Join(m.dir, Name, "device.db"), m.key)
 		if err != nil {
 			return nil, 0, err
@@ -109,30 +109,30 @@ func (m *Messenger) device(ctx context.Context, gen int, cli msgrClient, fbid in
 			db.Close()
 			return nil, 0, errInternal
 		}
-		m.db, m.container = db, c
+		m.devStore.db, m.devStore.container = db, c
 	}
-	devices, err := m.container.GetAllDevices(ctx)
+	devices, err := m.devStore.container.GetAllDevices(ctx)
 	if err != nil {
 		return nil, 0, errInternal
 	}
 	user := strconv.FormatInt(fbid, 10)
-	if m.replacing != nil && m.pendingFor != fbid {
-		m.replacing = nil // another account's sign-in: nothing to replace
+	if m.devStore.replacing != nil && m.devStore.pendingFor != fbid {
+		m.devStore.replacing = nil // another account's sign-in: nothing to replace
 	}
-	if m.replacing == nil {
+	if m.devStore.replacing == nil {
 		for _, d := range devices {
 			if d.ID != nil && d.ID.User == user && d.ID.Server == watypes.MessengerServer {
-				m.dev = d
+				m.devStore.dev = d
 				cli.SetDevice(d)
 				return d, 0, nil
 			}
 		}
 	}
 
-	dev = m.pending
-	if dev == nil || m.pendingFor != fbid {
-		dev = m.container.NewDevice()
-		m.pending, m.pendingFor = dev, fbid
+	dev = m.devStore.pending
+	if dev == nil || m.devStore.pendingFor != fbid {
+		dev = m.devStore.container.NewDevice()
+		m.devStore.pending, m.devStore.pendingFor = dev, fbid
 	}
 	cli.SetDevice(dev)
 	if dev.ID == nil {
@@ -156,19 +156,19 @@ func (m *Messenger) device(ctx context.Context, gen int, cli msgrClient, fbid in
 			return nil, 0, errRegistrationUnclear
 		}
 	}
-	if old := m.replacing; old != nil && old.ID != nil {
+	if old := m.devStore.replacing; old != nil && old.ID != nil {
 		// the row only (its sessions, keys and identities go with it): the
 		// object stays as the old socket last saw it
-		if err := m.container.DeleteDevice(ctx, old); err != nil {
+		if err := m.devStore.container.DeleteDevice(ctx, old); err != nil {
 			return nil, 0, errRegistrationUnclear
 		}
 	}
 	if err := dev.Save(ctx); err != nil {
 		return nil, 0, errRegistrationUnclear
 	}
-	m.replacing = nil
-	m.pending, m.pendingFor = nil, 0
-	m.dev = dev
+	m.devStore.replacing = nil
+	m.devStore.pending, m.devStore.pendingFor = nil, 0
+	m.devStore.dev = dev
 	if kind, _, ok := m.keptBlock(); ok && kind == wire.RegistrationUnclear {
 		_ = m.keep("block", "") // the device is registered and saved now
 	}
@@ -234,28 +234,28 @@ func (m *Messenger) reregister(ctx context.Context, gen int) (began bool, err er
 		old.Disconnect()
 	}
 	m.e2eeUp(gen, false)
-	m.dmu.Lock()
+	m.devStore.mu.Lock()
 	if !m.current(gen) {
-		m.dmu.Unlock()
+		m.devStore.mu.Unlock()
 		return false, nil // retired meanwhile: nothing armed for another run
 	}
-	prev := m.dev
+	prev := m.devStore.dev
 	var prevID *watypes.JID
 	if prev != nil && prev.ID != nil {
 		id := *prev.ID
 		prevID = &id
 	}
-	m.replacing, m.pending, m.pendingFor = prev, nil, fbid
-	m.dmu.Unlock()
+	m.devStore.replacing, m.devStore.pending, m.devStore.pendingFor = prev, nil, fbid
+	m.devStore.mu.Unlock()
 	m.checked.Store(false) // the new socket's first connect checks and asks again
 	if err := m.connectE2EE(ctx, gen, cli, fbid); err != nil {
 		m.diagLine("re-registration: failed (" + string(wire.KindOf(err)) + "); not tried again until a new sign-in")
 		m.e2eeSetupFailed(gen, err)
 		return true, err
 	}
-	m.dmu.Lock()
-	now := m.dev
-	m.dmu.Unlock()
+	m.devStore.mu.Lock()
+	now := m.devStore.dev
+	m.devStore.mu.Unlock()
 	if now == prev {
 		m.diagLine("re-registration: nothing registered, the saved device was kept")
 		return true, nil
@@ -297,10 +297,10 @@ func (m *Messenger) connectE2EE(ctx context.Context, gen int, cli msgrClient, fb
 	if err != nil {
 		return err
 	}
-	m.cmu.Lock()
-	m.counts.Registered = true
-	m.counts.RegisterMs = registerMs
-	m.cmu.Unlock()
+	m.gauge.mu.Lock()
+	m.gauge.counts.Registered = true
+	m.gauge.counts.RegisterMs = registerMs
+	m.gauge.mu.Unlock()
 
 	e, err := cli.PrepareE2EE()
 	if err != nil {
@@ -379,12 +379,12 @@ func (m *Messenger) e2eeHandler(gen int, self e2eeClient) func(evt any) bool {
 				m.e2eeUp(gen, false)
 			}
 		case *events.FBMessage:
-			m.liveEncryptedReceived.Add(1)
+			m.gauge.liveEncryptedReceived.Add(1)
 			return m.keptOr(e.Info, func() (bool, error) { return m.onFBMessage(e) })
 		case *events.Receipt:
 			return m.keptOr(watypes.MessageInfo{}, func() (bool, error) { return m.onEncReceipt(e) })
 		case *events.UndecryptableMessage:
-			m.liveUndecryptable.Add(1)
+			m.gauge.liveUndecryptable.Add(1)
 			return m.keptOr(watypes.MessageInfo{}, func() (bool, error) { return m.onUndecryptable(e) })
 		case *events.TemporaryBan:
 			// Meta suspended the encrypted device: a suspension of
@@ -447,9 +447,9 @@ func safeWrite(write func() (bool, error)) (wrote bool, err error, panicked bool
 // e2eeEnded records that Meta ended run gen's encrypted session: failed,
 // and no history asked, until a new sign-in.
 func (m *Messenger) e2eeEnded(gen int) {
-	m.cmu.Lock()
-	m.counts.E2EEFailed = true
-	m.cmu.Unlock()
+	m.gauge.mu.Lock()
+	m.gauge.counts.E2EEFailed = true
+	m.gauge.mu.Unlock()
 	m.mu.Lock()
 	if gen == m.runs.Gen && !m.stopped {
 		m.e2eeFailed = true
@@ -463,9 +463,9 @@ func (m *Messenger) e2eeEnded(gen int) {
 // up, connecting while a sign-in is in force, else notRegistered (no
 // encrypted session in force). m.mu is held.
 func (m *Messenger) encryptedState() string {
-	m.cmu.Lock()
-	up := m.counts.E2EEConnected
-	m.cmu.Unlock()
+	m.gauge.mu.Lock()
+	up := m.gauge.counts.E2EEConnected
+	m.gauge.mu.Unlock()
 	switch {
 	case m.e2eeFailed:
 		return encFailed
@@ -497,9 +497,9 @@ func (m *Messenger) isE2EE(e e2eeClient) bool {
 
 // e2eeConnected reports whether run gen's encrypted socket is up.
 func (m *Messenger) e2eeConnected() bool {
-	m.cmu.Lock()
-	defer m.cmu.Unlock()
-	return m.counts.E2EEConnected
+	m.gauge.mu.Lock()
+	defer m.gauge.mu.Unlock()
+	return m.gauge.counts.E2EEConnected
 }
 
 // encryptedEnded reports whether Meta has ended the encrypted session of

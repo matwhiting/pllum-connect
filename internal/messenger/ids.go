@@ -32,9 +32,9 @@ import (
 // encrypted side, "cursor.<chat>" → where its older history goes on
 // ("<ms>\n<message ID>"), "olderDone.<chat>" when an encrypted chat's
 // older thread has no more, "backfilled" once the first sign-in's
-// backfill has run, "block" and "rate" (messenger.go), and "ereregistered"
+// backfill has run, "block" and "rate" (session.go), and "ereregistered"
 // (the day the one re-registration began; e2ee.go). His restored
-// backup's (history.go): "ecursor.<chat>" → where a chat's backup goes on
+// backup's (enc_history.go): "ecursor.<chat>" → where a chat's backup goes on
 // (ms), "encDone.<chat>" when it has no more, "estalled.<chat>" while it is
 // held, "ebf.<chat>" and "ebfPages" (the first restore's pages, a chat's
 // and in all) and "ebackfilled" once that has run.
@@ -176,9 +176,9 @@ func (m *Messenger) personOf(fbid int64) (id string, isSelf bool) {
 
 // nameOf is the name of a person seen in a contact row this run, or "".
 func (m *Messenger) nameOf(fbid int64) string {
-	m.nmu.Lock()
-	defer m.nmu.Unlock()
-	return m.names[fbid]
+	m.memo.mu.Lock()
+	defer m.memo.mu.Unlock()
+	return m.memo.names[fbid]
 }
 
 // learnName keeps a person's name for this run (only in memory; the store
@@ -187,9 +187,9 @@ func (m *Messenger) learnName(fbid int64, name string) {
 	if fbid == 0 || name == "" {
 		return
 	}
-	m.nmu.Lock()
-	defer m.nmu.Unlock()
-	m.names[fbid] = name
+	m.memo.mu.Lock()
+	defer m.memo.mu.Unlock()
+	m.memo.names[fbid] = name
 }
 
 // foldTwins makes every "<key>@msgr" chat whose key already leads to
