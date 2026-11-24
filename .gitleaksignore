@@ -1,0 +1,12 @@
+# Findings gitleaks reports here that are not secrets. Each is listed twice: by commit, for a history scan (gitleaks git),
+# and by path alone, for a scan of the working tree (gitleaks dir). A line number that moves needs its entry moved too.
+
+# A public LinkedIn GraphQL query ID (messengerConversations.<hash>), not a key: the web client sends it with every
+# messaging request. The file is upstream mautrix-linkedin's constants.go, byte-identical to the module.
+f5dc175a74c2e1339058b042467ddd1663ab03dc:third_party/mautrix-linkedin/pkg/linkedingo/constants.go:generic-api-key:64
+third_party/mautrix-linkedin/pkg/linkedingo/constants.go:generic-api-key:64
+
+# A test vector, not a key: the files key HKDF derives from the tests' invented store key (bytes 00 to 1f), so Go and
+# Pllum's CryptoKit can be checked against each other.
+b933c9de46a203384c8b49323293632c82e5566f:internal/sealed/sealed_test.go:generic-api-key:34
+internal/sealed/sealed_test.go:generic-api-key:34
