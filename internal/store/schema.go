@@ -105,6 +105,10 @@ var schema = []string{
 	`CREATE INDEX IF NOT EXISTS messages_beeper ON messages (network, beeper_id)`,
 	`CREATE INDEX IF NOT EXISTS messages_network_id ON messages (network, chat_id, network_id)`,
 	`CREATE INDEX IF NOT EXISTS messages_all_time ON messages (network, ts_ms)`,
+	// A line by its ID alone (ChatOfLine), first row first: an index's rows
+	// end in the rid. Added without a schema version: an index changes no
+	// row, so an older helper still opens a store that has it.
+	`CREATE INDEX IF NOT EXISTS messages_id ON messages (network, msg_id)`,
 
 	// Every Beeper message a line carries, and the Beeper chat it came from.
 	// messages.beeper_id is the first of them; one line can carry several when

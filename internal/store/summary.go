@@ -95,8 +95,16 @@ func (s *Store) ChatOfLine(network, msgID string) (chatID string, ok bool) {
 	if s.ready() != nil || network == "" || msgID == "" {
 		return "", false
 	}
-	err := s.db.QueryRow(`SELECT chat_id FROM messages WHERE network = ? AND msg_id = ? ORDER BY rid LIMIT 1`,
-		network, msgID).Scan(&chatID)
+	return chatOfLine(s.db, network, msgID)
+}
+
+// chatOfLineQuery finds a line's chat by its ID alone, through messages_id.
+const chatOfLineQuery = `SELECT chat_id FROM messages WHERE network = ? AND msg_id = ? ORDER BY rid LIMIT 1`
+
+// chatOfLine is ChatOfLine read through q (the store, or a batch's
+// transaction, which sees its own writes).
+func chatOfLine(q querier, network, msgID string) (chatID string, ok bool) {
+	err := q.QueryRow(chatOfLineQuery, network, msgID).Scan(&chatID)
 	if errors.Is(err, sql.ErrNoRows) || err != nil {
 		return "", false
 	}
