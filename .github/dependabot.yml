@@ -1,0 +1,15 @@
+# Weekly dependency bumps, as pull requests to review: nothing merges on its own.
+version: 2
+updates:
+  # The root module's go.mod lists every module the helper builds with, the patched copy in third_party/ included (its
+  # requirements are settled by the root's), so one entry covers them all. third_party/mautrix-linkedin is left as the
+  # upstream snapshot it is (PLLUM-CHANGES.md) rather than bumped on its own.
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+  # Moves the commit SHAs the workflows pin, keeping the version comment beside each in step.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
