@@ -316,3 +316,83 @@ func BenchmarkNextChatByIDs(b *testing.B) {
 		}
 	}
 }
+
+// BenchmarkLiveWrite is one line arriving live into a chat of 34: a new
+// incoming line (new), 200 of them in one batch, where the commit no longer
+// hides the per-line work (batch), and the same line written again whole,
+// as a network sending it twice does (again); each also in a chat holding
+// 300 lines of Beeper's copy older than any of its own (copies), as chats
+// copied before the switch do.
+func BenchmarkLiveWrite(b *testing.B) {
+	for _, copies := range []bool{false, true} {
+		name := "plain"
+		if copies {
+			name = "copies"
+		}
+		b.Run("new/"+name, func(b *testing.B) {
+			s, next := liveWriteFixture(b, copies)
+			i := 0
+			for b.Loop() {
+				m := next(i)
+				if _, err := s.PutMessage(net, m); err != nil {
+					b.Fatal(err)
+				}
+				i++
+			}
+		})
+		b.Run("batch/"+name, func(b *testing.B) {
+			s, next := liveWriteFixture(b, copies)
+			i := 0
+			for b.Loop() {
+				err := s.Batch(net, func(bt *Batch) error {
+					for range 200 {
+						if _, err := bt.PutMessage(next(i)); err != nil {
+							return err
+						}
+						i++
+					}
+					return nil
+				})
+				if err != nil {
+					b.Fatal(err)
+				}
+			}
+			b.ReportMetric(float64(b.Elapsed().Microseconds())/float64(i), "µs/line")
+		})
+		b.Run("again/"+name, func(b *testing.B) {
+			s, next := liveWriteFixture(b, copies)
+			m := next(0)
+			if _, err := s.PutMessage(net, m); err != nil {
+				b.Fatal(err)
+			}
+			for b.Loop() {
+				if _, err := s.PutMessage(net, m); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+// liveWriteFixture opens a copy of the fixture for BenchmarkLiveWrite, with
+// Beeper's copy seeded into its chat when copies, and the i'th new line.
+func liveWriteFixture(b *testing.B, copies bool) (*Store, func(i int) Message) {
+	b.Helper()
+	s := openFixture(b)
+	c := 300
+	chat := benchChat(c)
+	first := base + int64(c)*1000
+	if copies {
+		lines := make([]copyLine, 300)
+		for i := range lines {
+			lines[i] = copyLine{beeperID: fmt.Sprintf("$bench%06d", i), fromMe: i%3 == 0,
+				ms: first - int64(300-i)*60000, text: fmt.Sprintf("invented copy %d", i)}
+		}
+		seedCopies(b, s, chat, "!bench:beeper.local", lines...)
+	}
+	newest := first + 34*60000
+	return s, func(i int) Message {
+		return Message{ID: fmt.Sprintf("LIVE%08d", i), ChatID: chat, SenderID: chat, TimeMs: newest + int64(i)*1000,
+			Text: fmt.Sprintf("invented live line %d", i), Kind: "text", Source: SourceLive}
+	}
+}

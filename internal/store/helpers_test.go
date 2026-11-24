@@ -1,6 +1,7 @@
 package store
 
 import (
+	"database/sql"
 	"fmt"
 	"path/filepath"
 	"testing"
@@ -152,3 +153,78 @@ func beeperChats(t *testing.T, s *Store) map[string]string {
 }
 
 func ptr[T any](v T) *T { return &v }
+
+// copyLine is one line of Beeper's copy as a store made before the switch
+// holds it.
+type copyLine struct {
+	beeperID  string
+	networkID string // the network's own ID Beeper named, "" for none
+	fromMe    bool
+	ms        int64
+	text      string
+	kind      string // "" is text
+	deleted   bool
+	replyTo   string // a Beeper ID
+	reactions []Reaction
+}
+
+// seedCopies writes lines of Beeper's copy straight in SQL, as the retired
+// import left them: chat made if new (placed; or, for chat "", the
+// read-only unplaced:<beeperChat>), and each line a beeper:<id> row of
+// source beeper carrying its Beeper message. Nothing writes such rows any
+// more; a store from before the switch still holds them. It returns the
+// chat written into.
+func seedCopies(tb testing.TB, s *Store, chat, beeperChat string, lines ...copyLine) string {
+	tb.Helper()
+	placed := chat != ""
+	if !placed {
+		chat = unplacedPrefix + beeperChat
+	}
+	err := s.write(func(tx *sql.Tx) error {
+		if _, err := tx.Exec(`INSERT OR IGNORE INTO chats (network, chat_id, kind, placed, read_only, beeper_chat_id)
+				VALUES (?, ?, 'single', ?, ?, ?)`, net, chat, placed, !placed, beeperChat); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`INSERT OR IGNORE INTO beeper_chats (network, beeper_chat_id, chat_id) VALUES (?, ?, ?)`,
+			net, beeperChat, chat); err != nil {
+			return err
+		}
+		for _, l := range lines {
+			var text, reply any
+			if l.text != "" && !l.deleted {
+				text = l.text
+			}
+			if l.replyTo != "" {
+				reply = beeperPrefix + l.replyTo
+			}
+			var rid int64
+			if err := tx.QueryRow(`INSERT INTO messages
+					(network, chat_id, msg_id, sender_id, from_me, ts_ms, text, kind, deleted, reply_to,
+					 source, beeper_id, network_id)
+					VALUES (?, ?, ?, 'beeper-sender', ?, ?, ?, ?, ?, ?, 'beeper', ?, NULLIF(?, ''))
+					RETURNING rid`,
+				net, chat, beeperPrefix+l.beeperID, l.fromMe, l.ms, text, kindOr(l.kind), l.deleted, reply,
+				l.beeperID, l.networkID).Scan(&rid); err != nil {
+				return err
+			}
+			if _, err := tx.Exec(`INSERT INTO beeper_ids (rid, network, beeper_id, beeper_chat_id) VALUES (?, ?, ?, ?)`,
+				rid, net, l.beeperID, beeperChat); err != nil {
+				return err
+			}
+			for _, r := range l.reactions {
+				if _, err := tx.Exec(`INSERT OR IGNORE INTO reactions (network, chat_id, msg_id, sender_id, emoji, from_me)
+						VALUES (?, ?, ?, ?, ?, ?)`, net, chat, beeperPrefix+l.beeperID, r.SenderID, r.Emoji, r.FromMe); err != nil {
+					return err
+				}
+			}
+		}
+		if err := resolveReplies(tx, net, chat); err != nil {
+			return err
+		}
+		return refresh(tx, net, chat)
+	})
+	if err != nil {
+		tb.Fatalf("seedCopies: %v", err)
+	}
+	return chat
+}
