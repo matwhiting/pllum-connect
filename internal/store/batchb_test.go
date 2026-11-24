@@ -1,8 +1,11 @@
 package store
 
 import (
+	"database/sql"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 // plan is SQLite's query plan for q, one detail a line.
@@ -74,5 +77,55 @@ func TestOldStoreGainsTheLineIDIndex(t *testing.T) {
 	}
 	if chat, ok := s.ChatOfLine(net, "3EB0L0001"); !ok || chat != phoneChat {
 		t.Fatalf("ChatOfLine = %q, %v", chat, ok)
+	}
+}
+
+// The store keeps a small pool of connections (each a SQLite instance of its
+// own) and reuses them: a burst of reads beside writes neither opens one per
+// request nor waits for ever (review C10).
+func TestPoolIsBoundedAndKeptWarm(t *testing.T) {
+	s := openTest(t)
+	put(t, s, text(phoneChat, "3EB0P0001", base, "hello"))
+	if got := s.db.Stats().MaxOpenConnections; got != maxConns {
+		t.Fatalf("MaxOpenConnections = %d; want %d", got, maxConns)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		var wg sync.WaitGroup
+		for i := range 32 {
+			wg.Go(func() {
+				if _, ok, err := s.Chat(net, phoneChat); err != nil || !ok {
+					t.Errorf("Chat: %v %v", ok, err)
+				}
+			})
+			if i%8 == 0 {
+				wg.Go(func() {
+					// A write that also reads through the pool while it holds
+					// its own connection.
+					err := s.write(func(tx *sql.Tx) error {
+						var n int
+						return s.db.QueryRow(`SELECT count(*) FROM chats`).Scan(&n)
+					})
+					if err != nil {
+						t.Errorf("write: %v", err)
+					}
+				})
+			}
+		}
+		wg.Wait()
+	}()
+	select {
+	case <-done:
+	case <-time.After(20 * time.Second):
+		t.Fatal("a burst of reads beside writes never finished")
+	}
+	st := s.db.Stats()
+	if st.OpenConnections > maxConns {
+		t.Fatalf("OpenConnections = %d; want at most %d", st.OpenConnections, maxConns)
+	}
+	if st.MaxIdleClosed > 0 {
+		t.Fatalf("closed %d idle connections; want them kept", st.MaxIdleClosed)
 	}
 }

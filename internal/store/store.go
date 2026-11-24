@@ -168,6 +168,17 @@ func Open(dir string, key [32]byte) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Every connection is a SQLite instance of its own (its own memory, the
+	// Adiantum VFS, FTS5), so a few are kept and reused rather than one
+	// made and thrown away for each request in a burst. Writes take turns
+	// on wmu, so a write holds one connection and the rest serve reads. No
+	// read holds a connection while it waits on a write, so a full pool
+	// only ever waits for a read to finish, even for a write that reads
+	// through s.db while it holds its own.
+	db.SetMaxOpenConns(maxConns)
+	db.SetMaxIdleConns(maxConns)
+	db.SetConnMaxLifetime(0)
+	db.SetConnMaxIdleTime(0)
 	s := &Store{db: db}
 	if err := s.migrate(); err != nil {
 		db.Close()
@@ -183,8 +194,21 @@ func OpenDevice(path string, key [32]byte) (*sql.DB, error) {
 	if err := privateFolder(filepath.Dir(path)); err != nil {
 		return nil, errInternal
 	}
-	return openEncrypted(path, key, false)
+	db, err := openEncrypted(path, key, false)
+	if err != nil {
+		return nil, err
+	}
+	// The network's own library runs its transactions on this database as
+	// it sees fit, so its pool is not capped (a cap could leave a
+	// transaction waiting on a connection its own callers hold); its idle
+	// connections are kept, so a burst does not make and throw away
+	// SQLite instances.
+	db.SetMaxIdleConns(maxConns)
+	return db, nil
 }
+
+// maxConns is the most connections the store keeps open, and idle.
+const maxConns = 4
 
 // Close closes the store.
 func (s *Store) Close() error {
