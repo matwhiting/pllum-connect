@@ -192,7 +192,8 @@ func BenchmarkHistoryImport(b *testing.B) {
 }
 
 // BenchmarkHistoryImportBatched is the same sync a conversation at a time
-// (PutMessages: one transaction and one refresh of the chat for each).
+// (a Batch: one transaction and one refresh of the chat for each), as
+// WhatsApp writes it.
 func BenchmarkHistoryImportBatched(b *testing.B) {
 	convs := historyImport()
 	for b.Loop() {
@@ -200,7 +201,15 @@ func BenchmarkHistoryImportBatched(b *testing.B) {
 		s := openFixture(b)
 		b.StartTimer()
 		for _, ms := range convs {
-			if _, _, err := s.PutMessages(net, ms); err != nil {
+			err := s.Batch(net, func(bt *Batch) error {
+				for _, m := range ms {
+					if _, err := bt.PutMessage(m); err != nil {
+						return err
+					}
+				}
+				return nil
+			})
+			if err != nil {
 				b.Fatal(err)
 			}
 		}

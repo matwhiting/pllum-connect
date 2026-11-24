@@ -58,38 +58,6 @@ func (s *Store) Batch(network string, fn func(b *Batch) error) error {
 	})
 }
 
-// PutMessages stores a slice of lines in one batch, as PutMessage would one
-// at a time, and counts the new rows (added) and the lines whose row
-// changed (changed: a new row, a row that was not held before, or one whose
-// LineState differs after the write). The first line refused or failed
-// fails the slice as a whole, and nothing of it is kept.
-func (s *Store) PutMessages(network string, ms []Message) (added, changed int, err error) {
-	for i := range ms {
-		if err := checkMessage(&ms[i]); err != nil {
-			return 0, 0, err
-		}
-	}
-	err = s.Batch(network, func(b *Batch) error {
-		for _, m := range ms {
-			p, err := b.Put(m)
-			if err != nil {
-				return err
-			}
-			if p.Added {
-				added++
-			}
-			if p.Changed {
-				changed++
-			}
-		}
-		return nil
-	})
-	if err != nil {
-		return 0, 0, err
-	}
-	return added, changed, nil
-}
-
 // Put is what one line's write did: Added when it made a new row, Changed
 // when anything Pllum shows of the row moved (a new row, a row not held
 // before, or a LineState that differs after the write). The same line

@@ -478,36 +478,51 @@ func TestBatchMatchesWritesOneAtATime(t *testing.T) {
 	}
 }
 
-// PutMessages counts what it added and changed, and the same lines again
-// change nothing; one refused line fails the slice and keeps none of it.
-func TestPutMessagesCountsAndFailsWhole(t *testing.T) {
+// A batch's Put tells what each line did, and the same lines again change
+// nothing; a refused line changes nothing and the batch goes on, its other
+// lines kept; the chat is refreshed once, at the end, all the same.
+func TestBatchPutCountsAndRefusesOneLine(t *testing.T) {
 	s := openTest(t)
 	ms := []Message{
 		{ID: "3EB0P0001", ChatID: phoneChat, SenderID: "sender-1", TimeMs: base + 1, Kind: "text", Text: "one"},
+		{ID: "3EB0P0004", ChatID: phoneChat, TimeMs: base + 4, Kind: "nonsense"},
 		{ID: "3EB0P0002", ChatID: phoneChat, SenderID: "sender-1", TimeMs: base + 2, Kind: "text", Text: "two"},
 		{ID: "3EB0P0002", ChatID: phoneChat, Text: "two, edited", Edited: true},
 	}
-	added, changed, err := s.PutMessages(net, ms)
-	if err != nil || added != 2 || changed != 3 {
-		t.Fatalf("PutMessages = %d added, %d changed, %v", added, changed, err)
+	run := func() (added, changed, refused int) {
+		t.Helper()
+		err := s.Batch(net, func(b *Batch) error {
+			for _, m := range ms {
+				p, err := b.Put(m)
+				switch {
+				case err != nil:
+					refused++
+				case p.Added:
+					added++
+					changed++
+				case p.Changed:
+					changed++
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("Batch: %v", err)
+		}
+		return
 	}
-	if added, changed, err = s.PutMessages(net, ms); err != nil || added != 0 || changed != 0 {
-		t.Fatalf("again = %d added, %d changed, %v", added, changed, err)
+	if a, c, r := run(); a != 2 || c != 3 || r != 1 {
+		t.Fatalf("first run: %d added, %d changed, %d refused", a, c, r)
+	}
+	if a, c, r := run(); a != 0 || c != 0 || r != 1 {
+		t.Fatalf("again: %d added, %d changed, %d refused", a, c, r)
 	}
 	c := chatOf(t, s, phoneChat)
 	if c.Unread != 2 || c.LastMessageID != "3EB0P0002" || c.LastActivityMs != base+2 || c.HistoryFromMs != base+1 {
 		t.Fatalf("chat after the batch: %+v", c)
 	}
-
-	bad := []Message{
-		{ID: "3EB0P0003", ChatID: phoneChat, SenderID: "sender-1", TimeMs: base + 3, Kind: "text", Text: "three"},
-		{ID: "3EB0P0004", ChatID: phoneChat, TimeMs: base + 4, Kind: "nonsense"},
-	}
-	if _, _, err := s.PutMessages(net, bad); err == nil {
-		t.Fatal("PutMessages took a line of no kind it knows")
-	}
-	if _, ok := s.LineState(net, phoneChat, "3EB0P0003"); ok {
-		t.Fatal("a refused slice kept a line")
+	if _, ok := s.LineState(net, phoneChat, "3EB0P0004"); ok {
+		t.Fatal("a refused line was kept")
 	}
 }
 
