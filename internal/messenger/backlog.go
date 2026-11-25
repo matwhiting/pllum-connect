@@ -34,6 +34,8 @@ func (m *Messenger) WithHistoryQueue() *Messenger {
 		Kind:    kindOf,
 		Next:    m.backlogNext,
 		Left:    m.openChats,
+		List:    m.listOlder,
+		Listed:  m.olderListed,
 	}
 	m.bqGen = -1
 	return m

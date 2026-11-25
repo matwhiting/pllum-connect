@@ -18,15 +18,16 @@ import (
 // a day, and anything it does not know stops it until the helper is next
 // started. Getting an account locked costs far more than slow history.
 const (
-	BacklogMinGap = 15 * time.Second // after the queue's last request ended, at least
-	BacklogMaxGap = 25 * time.Second // and less than this, at random
-	BacklogQuiet  = 10 * time.Second // no other request of the network for this long
-	BacklogYield  = 60 * time.Second // after an older read
-	BacklogLook   = 30 * time.Second // how often it looks again while it may not ask
-	BacklogEmpty  = 10 * time.Minute // how long it waits when no chat has more
-	BacklogHold   = 24 * time.Hour   // after any pushback on the network
-	BacklogDayCap = 1500             // queue requests in a local day
-	BacklogStalls = 3                // passed-over chats in a row with an error that stop it
+	BacklogMinGap    = 15 * time.Second // after the queue's last request ended, at least
+	BacklogMaxGap    = 25 * time.Second // and less than this, at random
+	BacklogQuiet     = 10 * time.Second // no other request of the network for this long
+	BacklogYield     = 60 * time.Second // after an older read
+	BacklogLook      = 30 * time.Second // how often it looks again while it may not ask
+	BacklogEmpty     = 10 * time.Minute // how long it waits when no chat has more
+	BacklogHold      = 24 * time.Hour   // after any pushback on the network
+	BacklogDayCap    = 1500             // queue requests in a local day
+	BacklogStalls    = 3                // passed-over chats in a row with an error that stop it
+	BacklogListEvery = 5                // chat steps between two list steps, while the listing is not done
 )
 
 // StepOutcome is what one step of the queue did.
@@ -81,6 +82,13 @@ type Backlog struct {
 	// passed reports. It makes at most one request.
 	Next func(ctx context.Context, passed func(chat string) bool) Step
 	Left func() (int, bool) // chats whose history is open, for the day line
+	// List, when set, lists one more page of the network's chats past
+	// those listed (the first sign-in lists a year), at most one request,
+	// under ctx: called in place of Next after every BacklogListEvery chat
+	// steps, and whenever Next finds no chat with more, until Listed
+	// reports the listing done. Its step is judged as Next's.
+	List   func(ctx context.Context) Step
+	Listed func() bool
 
 	turnOnce sync.Once
 	turn     chan struct{} // held by the Run running: one at a time
@@ -94,6 +102,8 @@ type Backlog struct {
 
 	// The rest is Run's alone: one Run at a time touches it.
 	stalls     int       // chats passed over with an error, in a row
+	chatSteps  int       // chat steps since the last list step
+	listDue    bool      // Next found no chat with more: list next
 	emptyUntil time.Time // no chat had more: it looks again then
 	today      queueDay
 	since      time.Time // allowed to ask since then, not yet counted in today; zero while not
@@ -307,7 +317,24 @@ func (b *Backlog) askAt(at time.Time) (time.Time, bool) {
 // Next again itself: the next call waits for Run's gap.
 func (b *Backlog) step(ctx context.Context) {
 	before := b.Traffic.BacklogAsked()
-	s := b.Next(WithBacklog(ctx), b.isPassed)
+	listing := b.List != nil && b.Listed != nil && !b.Listed()
+	var s Step
+	if listing && (b.listDue || b.chatSteps >= BacklogListEvery) {
+		b.chatSteps, b.listDue = 0, false
+		s = b.List(WithBacklog(ctx))
+		if s.Outcome == StepNothing || s.Outcome == StepStart {
+			s.Outcome = StepPassed // a list step finishes no chat, and empties nothing
+		}
+	} else {
+		b.chatSteps++
+		s = b.Next(WithBacklog(ctx), b.isPassed)
+		if s.Outcome == StepNothing && s.Err == nil && listing {
+			// No chat has more now, but the listing has more to bring:
+			// list next, after the gap, rather than wait.
+			b.listDue = true
+			s.Outcome = StepPassed
+		}
+	}
 	now := b.Clock.Now()
 	n := b.Traffic.BacklogAsked() - before
 	b.account(now)

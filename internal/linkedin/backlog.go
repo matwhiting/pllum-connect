@@ -31,9 +31,11 @@ func (l *LinkedIn) newBacklog() *network.Backlog {
 			_, blocked := l.pause.blocked()
 			return wire.RateLimited, blocked
 		},
-		Kind: kindOf,
-		Next: l.backlogNext,
-		Left: l.openChats,
+		Kind:   kindOf,
+		Next:   l.backlogNext,
+		Left:   l.openChats,
+		List:   l.listOlder,
+		Listed: l.olderListed,
 	}
 }
 

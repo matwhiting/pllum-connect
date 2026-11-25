@@ -12,6 +12,7 @@ import (
 	"go.mau.fi/mautrix-meta/pkg/messagix/httpclient"
 	"go.mau.fi/mautrix-meta/pkg/messagix/securehistory"
 	"go.mau.fi/mautrix-meta/pkg/messagix/socket"
+	"go.mau.fi/mautrix-meta/pkg/messagix/table"
 
 	"github.com/matwhiting/pllum-connect/internal/network"
 	"github.com/matwhiting/pllum-connect/internal/store"
@@ -662,5 +663,149 @@ func TestTheQueueReadsAtMost300BackupPagesADay(t *testing.T) {
 	h.advance(t, 10*time.Minute, time.Second)
 	if got := f.history.total() - before; got == 0 {
 		t.Errorf("the next day the queue asked no page of the backup")
+	}
+}
+
+// Listing past the year: the inbox folder's pages, the second reaching past
+// a year (the first sign-in's listing stops there), then two older ones.
+// Each listed thread carries its newest line and his read marker at it.
+const (
+	listYear  int64 = 8800000000000102 // 400 days old
+	listOld   int64 = 8800000000000103 // 500 days old, with an older page
+	listOlder int64 = 8800000000000104 // 600 days old
+)
+
+func listingFake() *fakeMeta {
+	f := newFakeMeta()
+	now := f.clock.Now()
+	listed := func(key int64, days int) *table.LSTable {
+		at := now.Add(-time.Duration(days) * 24 * time.Hour)
+		th := thread(key, table.GROUP_THREAD, at, "inbox")
+		th.LastReadWatermarkTimestampMs = at.UnixMilli()
+		page := threadsPage(folderKey{1, -1}, true, th)
+		h := history(key, true, line(fmt.Sprintf("mid.$invented-l%d", key%1000), aliceFBID, at, canary))
+		page.LSUpsertMessage, page.LSInsertNewMessageRange = h.LSUpsertMessage, h.LSInsertNewMessageRange
+		return page
+	}
+	last := listed(listOlder, 600)
+	last.LSUpsertSyncGroupThreadsRange[0].HasMoreBefore = false
+	f.folders[folderKey{1, -1}] = []*table.LSTable{
+		threadsPage(folderKey{1, -1}, true, thread(8800000000000101, table.GROUP_THREAD, now.Add(-30*24*time.Hour), "inbox")),
+		listed(listYear, 400), listed(listOld, 500), last,
+	}
+	at := now.Add(-501 * 24 * time.Hour)
+	f.older[listOld] = []*table.LSTable{history(listOld, false, line("mid.$invented-l103-old", aliceFBID, at, canary))}
+	return f
+}
+
+func newListingHarness(t *testing.T, dir string, f *fakeMeta) *harness {
+	t.Helper()
+	if dir == "" {
+		dir = t.TempDir() + "/connect"
+	}
+	return newHarnessOver(t, dir, f, withQueue(false))
+}
+
+func TestTheQueueListsChatsPastTheYear(t *testing.T) {
+	f := listingFake()
+	h := newListingHarness(t, "", f)
+	h.signIn(t)
+	h.waitValue(t, "listed")
+	if _, ok, _ := h.st.Chat(Name, keyID(listOld)); ok {
+		t.Fatalf("a chat past the year was listed at the first sign-in")
+	}
+	h.startQueue(t)
+	h.advance(t, 30*time.Minute, time.Second)
+	for _, key := range []int64{listOld, listOlder} {
+		if _, ok, _ := h.st.Chat(Name, keyID(key)); !ok {
+			t.Errorf("chat %d past the year was not listed", key)
+		}
+	}
+	if !h.chat(t, keyID(listOld)).HistoryComplete {
+		t.Errorf("a chat listed past the year was not paged to its start")
+	}
+	if !h.m.olderListed() {
+		t.Errorf("the listing is not done")
+	}
+}
+
+func TestAnOldListedChatLandsInThePastWithNoUnread(t *testing.T) {
+	f := listingFake()
+	h := newListingHarness(t, "", f)
+	h.signIn(t)
+	h.startQueue(t)
+	h.advance(t, 30*time.Minute, time.Second)
+	p, err := h.st.Chats(Name, 0, "", 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pos := map[string]int{}
+	for i, c := range p.Items {
+		pos[c.ID] = i
+		if c.Unread != 0 && (c.ID == keyID(listOld) || c.ID == keyID(listOlder)) {
+			t.Errorf("old chat %s has %d unread", c.ID, c.Unread)
+		}
+	}
+	if pos[keyID(listOlder)] != len(p.Items)-1 || pos[keyID(listOld)] != len(p.Items)-2 {
+		t.Errorf("the old chats are at %d and %d of %d, want last", pos[keyID(listOld)], pos[keyID(listOlder)], len(p.Items))
+	}
+}
+
+func TestListingStopsWhenThereIsNothingOlder(t *testing.T) {
+	dir := t.TempDir() + "/connect"
+	f := listingFake()
+	h := newListingHarness(t, dir, f)
+	h.signIn(t)
+	h.startQueue(t)
+	h.advance(t, 30*time.Minute, time.Second)
+	if !h.m.olderListed() {
+		t.Fatalf("the listing is not done")
+	}
+	h.close()
+
+	f2 := listingFake()
+	h2 := newListingHarness(t, dir, f2)
+	h2.signIn(t)
+	n := f2.mark()
+	h2.startQueue(t)
+	h2.advance(t, 30*time.Minute, time.Second)
+	for _, name := range f2.since(n) {
+		if name == "FetchThreadsTask" {
+			t.Fatalf("after a relaunch the queue listed again")
+		}
+	}
+}
+
+func TestListingObeysPushback(t *testing.T) {
+	f := listingFake()
+	h := newListingHarness(t, "", f)
+	h.signIn(t)
+	// The queue's first listing page is rate-limited.
+	lists := 0
+	f.mu.Lock()
+	f.taskErr = func(task socket.Task) error {
+		if _, ok := task.(*socket.FetchThreadsTask); ok {
+			if lists++; lists == 1 {
+				return httpclient.ErrRateLimited
+			}
+		}
+		return nil
+	}
+	f.mu.Unlock()
+	h.startQueue(t)
+	h.advance(t, 30*time.Minute, time.Second)
+	f.mu.Lock()
+	got := lists
+	f.mu.Unlock()
+	if got != 1 {
+		t.Fatalf("%d listing pages from the queue, want the rate-limited one", got)
+	}
+	keptHold(t, h, wire.RateLimited, f.clock.Now().Add(-30*time.Minute))
+	n := f.mark()
+	h.advance(t, 23*time.Hour, 10*time.Minute)
+	for _, name := range f.since(n) {
+		if name == "FetchThreadsTask" || name == "FetchMessagesTask" {
+			t.Fatalf("the queue asked %s within the day", name)
+		}
 	}
 }

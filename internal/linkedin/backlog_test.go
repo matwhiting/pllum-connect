@@ -112,9 +112,14 @@ func TestTheQueuePagesPastTwoYears(t *testing.T) {
 	if !r.chat(convURN(1)).HistoryComplete {
 		t.Fatalf("the chat is not historyComplete after the queue")
 	}
-	pages := r.pagesOf(1, i)
-	if pages == 0 || r.l.traffic.BacklogAsked() != int64(pages) {
-		t.Errorf("the queue asked %d pages and counted %d", pages, r.l.traffic.BacklogAsked())
+	pages, lists := r.pagesOf(1, i), 0
+	for _, c := range r.f.callsNow()[i:] {
+		if c.name == "GetConversationsWithNextCursor" {
+			lists++ // the queue's listing of older chats
+		}
+	}
+	if pages == 0 || r.l.traffic.BacklogAsked() != int64(pages+lists) {
+		t.Errorf("the queue asked %d pages and %d list pages, and counted %d", pages, lists, r.l.traffic.BacklogAsked())
 	}
 	if ch := r.chat(convURN(1)); ch.HistoryFromMs > start.Add(-790*24*time.Hour).UnixMilli() {
 		t.Errorf("history reaches back to %v, want to its start", time.UnixMilli(ch.HistoryFromMs))
@@ -335,5 +340,151 @@ func TestAnUncountedPageIsNotPassedOver(t *testing.T) {
 	}
 	if s.Outcome != network.StepMoved || s.Err != nil {
 		t.Errorf("the uncounted page is %+v, want StepMoved", s)
+	}
+}
+
+// listingRig lists the inbox past the year: conversation 1 active 10 days
+// ago, 2 at 400 days (the first listing stops there), then 3 and 4 older.
+func listingRig(t *testing.T) *rig {
+	t.Helper()
+	r := newQueueRig(t)
+	listingFeed(r)
+	return r
+}
+
+func listingFeed(r *rig) {
+	day := func(n int) time.Time { return start.Add(-time.Duration(n) * 24 * time.Hour) }
+	r.f.syncPage = func(string) *linkedingo.CollectionResponse[linkedingo.ConversationSyncMetadata, linkedingo.Conversation] {
+		return syncPageOf([]linkedingo.Conversation{conv(1, day(10))})
+	}
+	r.f.cursorPage = func(cursor string) *linkedingo.CollectionResponse[linkedingo.ConversationCursorMetadata, linkedingo.Conversation] {
+		switch cursor {
+		case "":
+			return cursorPageOf("list-invented-1", conv(1, day(10)))
+		case "list-invented-1":
+			return cursorPageOf("list-invented-2", conv(2, day(400)))
+		case "list-invented-2":
+			return cursorPageOf("list-invented-3", conv(3, day(500)))
+		case "list-invented-3":
+			return cursorPageOf("", conv(4, day(600)))
+		}
+		return cursorPageOf("")
+	}
+}
+
+// firstSignIn signs in for the first time (the listing owed) and waits
+// until live and idle.
+func (r *rig) firstSignIn() {
+	r.t.Helper()
+	r.keep("self", selfID)
+	if err := r.login(validSession()); err != nil {
+		r.t.Fatalf("Login: %v", err)
+	}
+	r.waitState(network.Live, "")
+	r.idle()
+}
+
+func (r *rig) listCalls(i int) []string {
+	var out []string
+	for _, c := range r.f.callsNow()[i:] {
+		if c.name == "GetConversationsWithNextCursor" {
+			out = append(out, c.arg)
+		}
+	}
+	return out
+}
+
+func TestTheQueueListsChatsPastTheYear(t *testing.T) {
+	r := listingRig(t)
+	r.firstSignIn()
+	if got := r.value("olderCursor.INBOX"); got != "list-invented-2" {
+		t.Fatalf("the first listing kept %q, want where it stopped", got)
+	}
+	if _, ok, _ := r.st.Chat(Name, convURN(3)); ok {
+		t.Fatalf("a conversation past the year was listed at the first sign-in")
+	}
+	i := len(r.f.callsNow())
+	r.startQueue()
+	r.advance(30*time.Minute, time.Second)
+	for _, n := range []int{3, 4} {
+		if _, ok, _ := r.st.Chat(Name, convURN(n)); !ok {
+			t.Errorf("conversation %d past the year was not listed", n)
+		}
+	}
+	if got := r.listCalls(i); len(got) < 2 || !strings.HasSuffix(got[0], "list-invented-2") {
+		t.Errorf("the queue listed %v, want on from where the first listing stopped", got)
+	}
+	if !r.chat(convURN(3)).HistoryComplete {
+		t.Errorf("a conversation listed past the year was not paged")
+	}
+	if !r.l.olderListed() {
+		t.Errorf("the listing is not done")
+	}
+}
+
+func TestAnOldListedChatLandsInThePastWithNoUnread(t *testing.T) {
+	r := listingRig(t)
+	r.firstSignIn()
+	r.startQueue()
+	r.advance(30*time.Minute, time.Second)
+	p, err := r.st.Chats(Name, 0, "", 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ids []string
+	for _, c := range p.Items {
+		ids = append(ids, c.ID)
+		if c.Unread != 0 {
+			t.Errorf("conversation %s has %d unread", c.ID, c.Unread)
+		}
+	}
+	if want := []string{convURN(1), convURN(2), convURN(3), convURN(4)}; strings.Join(ids, " ") != strings.Join(want, " ") {
+		t.Errorf("the conversations are in the order %v, want %v", ids, want)
+	}
+}
+
+func TestListingStopsWhenThereIsNothingOlder(t *testing.T) {
+	r := listingRig(t)
+	r.firstSignIn()
+	r.startQueue()
+	r.advance(30*time.Minute, time.Second)
+	if !r.l.olderListed() {
+		t.Fatalf("the listing is not done")
+	}
+	i := len(r.f.callsNow())
+	r.advance(30*time.Minute, time.Second)
+	if got := r.listCalls(i); len(got) != 0 {
+		t.Errorf("the queue listed %v once there was nothing older", got)
+	}
+
+	r.restart()
+	r.firstSignIn()
+	i = len(r.f.callsNow())
+	r.startQueue()
+	r.advance(30*time.Minute, time.Second)
+	if got := r.listCalls(i); len(got) != 0 {
+		t.Errorf("after a relaunch the queue listed %v again", got)
+	}
+}
+
+func TestListingObeysPushback(t *testing.T) {
+	r := listingRig(t)
+	r.firstSignIn()
+	r.f.foldersErr = map[string]error{"INBOX": statusErr(999)}
+	i := len(r.f.callsNow())
+	r.startQueue()
+	r.advance(30*time.Minute, time.Second)
+	if got := r.listCalls(i); len(got) != 1 {
+		t.Fatalf("the queue listed %v, want the paused page", got)
+	}
+	v := r.value("hq.hold")
+	if _, kind, _ := strings.Cut(v, "\n"); kind != string(wire.RateLimited) {
+		t.Fatalf("hq.hold is %q", v)
+	}
+	r.f.foldersErr = nil
+	asked := r.l.traffic.BacklogAsked()
+	r.advance(23*time.Hour, 10*time.Minute)
+	if r.l.traffic.BacklogAsked() != asked {
+		t.Errorf("the queue asked within the day")
 	}
 }

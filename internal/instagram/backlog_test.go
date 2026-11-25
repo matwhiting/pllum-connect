@@ -628,3 +628,170 @@ func TestAnUncountedPageIsNotPassedOver(t *testing.T) {
 		t.Errorf("the uncounted page is %+v, want StepMoved for the engine to judge", s)
 	}
 }
+
+// serveListing lists first on the inbox's first page and each later page
+// of pages by its cursor ("inbox-<i>", i from 1), every chat with its
+// history, and his read marker at its last activity.
+func serveListing(m *fakeMeta, first []oldChat, pages ...[]oldChat) {
+	all := append([]oldChat{}, first...)
+	for _, p := range pages {
+		all = append(all, p...)
+	}
+	serve(m, all...)
+	threads := func(cs []oldChat) []*slidetypes.ThreadInfo {
+		var out []*slidetypes.ThreadInfo
+		for _, c := range cs {
+			t := threadWith(c.key, c.thread, alice(), c.active)
+			t.SlideReadReceipts = []slidetypes.ReadReceipt{{ParticipantFBID: selfFBID, WatermarkTimestampMS: ms(c.active)}}
+			out = append(out, t)
+		}
+		return out
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.mailbox = mailboxOf(len(pages) > 0, threads(first)...)
+	m.mailbox.ThreadsByFolder.PageInfo.EndCursor = "inbox-1"
+	m.mailboxPage = func(_ int, cursor string) (*slidetypes.PaginateMailboxResponse, error) {
+		i, err := strconv.Atoi(strings.TrimPrefix(cursor, "inbox-"))
+		if err != nil || i < 1 || i > len(pages) {
+			return nil, fmt.Errorf("invented: unknown inbox cursor")
+		}
+		mb := mailboxOf(i < len(pages), threads(pages[i-1])...)
+		if i < len(pages) {
+			mb.ThreadsByFolder.PageInfo.EndCursor = fmt.Sprintf("inbox-%d", i+1)
+		}
+		return &slidetypes.PaginateMailboxResponse{Mailbox: &slidetypes.MailboxPage{ThreadsByFolder: mb.ThreadsByFolder}}, nil
+	}
+}
+
+// The listing beyond the year: a chat active 10 days ago, one 400 days
+// ago (the first listing stops there), then two older pages.
+var (
+	listNew   = oldChat{key: 1000401, thread: "340282366841710300000000000000401", active: start.Add(-10 * 24 * time.Hour), pages: 1}
+	listYear  = oldChat{key: 1000402, thread: "340282366841710300000000000000402", active: start.Add(-400 * 24 * time.Hour), pages: 1}
+	listOld   = oldChat{key: 1000403, thread: "340282366841710300000000000000403", active: start.Add(-500 * 24 * time.Hour), pages: 2}
+	listOlder = oldChat{key: 1000404, thread: "340282366841710300000000000000404", active: start.Add(-600 * 24 * time.Hour), pages: 1}
+)
+
+func listingHarness(t *testing.T, dir string) *harness {
+	t.Helper()
+	h := newQueueHarness(t, dir)
+	serveListing(h.m, []oldChat{listNew}, []oldChat{listYear}, []oldChat{listOld}, []oldChat{listOlder})
+	return h
+}
+
+func (m *fakeMeta) listPagesSince(n int) []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []string
+	for _, c := range m.calls[n:] {
+		if c.name == "PaginateMailbox" {
+			out = append(out, c.arg)
+		}
+	}
+	return out
+}
+
+func TestTheQueueListsChatsPastTheYear(t *testing.T) {
+	h := listingHarness(t, t.TempDir()+"/connect")
+	h.login(validSession())
+	if got := h.g.value("olderCursor"); got != "inbox-2" {
+		t.Fatalf("the first listing kept %q, want where it stopped", got)
+	}
+	if _, ok, _ := h.st.Chat(Name, listOld.chat()); ok {
+		t.Fatalf("a chat past the year was listed at the first sign-in")
+	}
+	n := h.m.mark()
+	h.goLive()
+	h.advance(30*time.Minute, time.Second)
+	if got := h.m.listPagesSince(n); strings.Join(got, " ") != "inbox-2 inbox-3" {
+		t.Errorf("the queue listed %v, want the two pages past the first listing", got)
+	}
+	for _, c := range []oldChat{listOld, listOlder} {
+		if !h.chat(c.chat()).HistoryComplete {
+			t.Errorf("chat %s listed past the year was not paged to its start", c.chat())
+		}
+	}
+	if !h.g.olderListed() {
+		t.Errorf("the listing is not done")
+	}
+}
+
+func TestAnOldListedChatLandsInThePastWithNoUnread(t *testing.T) {
+	h := listingHarness(t, t.TempDir()+"/connect")
+	h.login(validSession())
+	h.goLive()
+	h.advance(30*time.Minute, time.Second)
+	p, err := h.st.Chats(Name, 0, "", 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ids []string
+	for _, c := range p.Items {
+		ids = append(ids, c.ID)
+		if c.Unread != 0 {
+			t.Errorf("chat %s has %d unread", c.ID, c.Unread)
+		}
+	}
+	want := []string{listNew.chat(), listYear.chat(), listOld.chat(), listOlder.chat()}
+	if strings.Join(ids, " ") != strings.Join(want, " ") {
+		t.Errorf("the chats are in the order %v, want %v (older chats in the past)", ids, want)
+	}
+	if c := h.chat(listOld.chat()); c.LastActivityMs != listOld.active.UnixMilli() {
+		t.Errorf("an old chat's activity is %v, want its own", time.UnixMilli(c.LastActivityMs))
+	}
+}
+
+func TestListingStopsWhenThereIsNothingOlder(t *testing.T) {
+	dir := t.TempDir() + "/connect"
+	h := listingHarness(t, dir)
+	h.login(validSession())
+	h.goLive()
+	h.advance(30*time.Minute, time.Second)
+	if !h.g.olderListed() {
+		t.Fatalf("the listing is not done")
+	}
+	n := h.m.mark()
+	h.advance(30*time.Minute, time.Second)
+	if got := h.m.listPagesSince(n); len(got) != 0 {
+		t.Errorf("the queue listed %v once there was nothing older", got)
+	}
+	h.close()
+
+	h = listingHarness(t, dir)
+	h.login(validSession())
+	n = h.m.mark()
+	h.goLive()
+	h.advance(30*time.Minute, time.Second)
+	if got := h.m.listPagesSince(n); len(got) != 0 {
+		t.Errorf("after a relaunch the queue listed %v again", got)
+	}
+}
+
+func TestListingObeysPushback(t *testing.T) {
+	h := listingHarness(t, t.TempDir()+"/connect")
+	h.login(validSession())
+	f := h.m.mailboxPage
+	h.m.mailboxPage = func(n int, cursor string) (*slidetypes.PaginateMailboxResponse, error) {
+		if cursor == "inbox-2" {
+			return nil, httpclient.ErrRateLimited
+		}
+		return f(n, cursor)
+	}
+	n := h.m.mark()
+	h.goLive()
+	h.advance(30*time.Minute, time.Second)
+	got := h.m.listPagesSince(n)
+	if len(got) != 1 {
+		t.Fatalf("the queue listed %v, want the rate-limited page", got)
+	}
+	v := h.g.value("hq.hold")
+	if _, kind, _ := strings.Cut(v, "\n"); kind != string(wire.RateLimited) {
+		t.Fatalf("hq.hold is %q", v)
+	}
+	m := h.m.mark()
+	h.advance(23*time.Hour, 10*time.Minute)
+	if got := h.m.namesSince(m); len(got) != 0 {
+		t.Errorf("the queue asked %v within the day", got)
+	}
+}

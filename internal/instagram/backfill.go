@@ -67,6 +67,8 @@ func (g *Instagram) backfill(ctx context.Context, gen int, cli igClient, first *
 			reached = olderThan(more, now.Add(-inboxReach).UnixMilli())
 			page = resp.Mailbox.ThreadsByFolder.PageInfo
 		}
+		// Where the history queue's listing of older chats goes on (list.go).
+		g.keepOlderListing(page)
 	}
 
 	active := now.Add(-activeWithin).UnixMilli()

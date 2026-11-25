@@ -847,3 +847,79 @@ func TestBacklogMayAskOnlyWhenNotHeldStoppedOrYielding(t *testing.T) {
 		t.Errorf("it may ask once stopped")
 	}
 }
+
+// withList gives the queue a listing of older chats: listed reports it done
+// after done list steps (0: never). It records which calls were list steps.
+func (q *queue) withList(done int) *[]string {
+	var mu sync.Mutex
+	var order []string
+	lists := 0
+	next := q.b.Next
+	q.b.Next = func(ctx context.Context, passed func(string) bool) Step {
+		mu.Lock()
+		order = append(order, "chat")
+		mu.Unlock()
+		return next(ctx, passed)
+	}
+	q.b.List = func(ctx context.Context) Step {
+		mu.Lock()
+		order = append(order, "list")
+		lists++
+		mu.Unlock()
+		end := q.traffic.Begin(ctx, q.clock.Now())
+		q.clock.Advance(q.took)
+		end(q.clock.Now())
+		q.mu.Lock()
+		q.calls = append(q.calls, asked{at: q.clock.Now(), end: q.clock.Now(), chat: "list"})
+		if q.stopAt > 0 && len(q.calls) >= q.stopAt {
+			q.stopping = true
+		}
+		q.mu.Unlock()
+		return Step{Outcome: StepMoved}
+	}
+	q.b.Listed = func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return done > 0 && lists >= done
+	}
+	return &order
+}
+
+func TestBacklogListsAfterEveryFiveChatSteps(t *testing.T) {
+	q := newQueue(t)
+	order := q.withList(0)
+	q.run(24*time.Hour, 12)
+	got := strings.Join(*order, " ")
+	want := "chat chat chat chat chat list chat chat chat chat chat list"
+	if got != want {
+		t.Errorf("the steps were %q, want %q", got, want)
+	}
+	calls := q.asked()
+	for i := 1; i < len(calls); i++ {
+		if d := calls[i].at.Sub(calls[i-1].end); d < BacklogMinGap {
+			t.Fatalf("step %d came %v after the last, want the gap", i, d)
+		}
+	}
+}
+
+func TestBacklogListsWhenNoChatIsLeft(t *testing.T) {
+	q := newQueue(t)
+	q.script = []Step{{Outcome: StepNothing}}
+	order := q.withList(0)
+	q.run(24*time.Hour, 2)
+	if got := strings.Join(*order, " "); got != "chat list" {
+		t.Errorf("the steps were %q, want a list step straight after nothing was left", got)
+	}
+	if calls := q.asked(); len(calls) != 2 || calls[1].at.Sub(calls[0].end) >= BacklogEmpty {
+		t.Errorf("the list step waited the empty wait")
+	}
+}
+
+func TestBacklogStopsListingOnceListed(t *testing.T) {
+	q := newQueue(t)
+	order := q.withList(1)
+	q.run(24*time.Hour, 13)
+	if n := strings.Count(strings.Join(*order, " "), "list"); n != 1 {
+		t.Errorf("%d list steps, want 1 then none once listed: %v", n, *order)
+	}
+}

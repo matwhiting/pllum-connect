@@ -30,6 +30,8 @@ func (g *Instagram) WithHistoryQueue() *Instagram {
 		Kind:    kindOf,
 		Next:    g.backlogNext,
 		Left:    g.openChats,
+		List:    g.listOlder,
+		Listed:  g.olderListed,
 	}
 	g.bqGen = -1
 	return g

@@ -239,47 +239,9 @@ func (m *Messenger) listFolder(ctx context.Context, gen int, cli msgrClient, f f
 		if *total >= listPages {
 			return stopCapped, nil
 		}
-		task := &socket.FetchThreadsTask{
-			ParentThreadKey:            f.parent,
-			ReferenceThreadKey:         ref.minKey,
-			ReferenceActivityTimestamp: ref.minAt,
-			SyncGroup:                  int(f.group),
-		}
-		if f.group == 1 {
-			// As the library's own page of sync group 1 does.
-			task.Cursor = cli.GetCursor(1)
-		}
-		var tbl *table.LSTable
-		err := m.request(ctx, gen, func(ctx context.Context) (err error) {
-			if tbl, err = cli.ExecuteTasks(ctx, task); err == nil && tbl != nil {
-				// The sync cursors a page carries, as FetchMoreThreads hands
-				// them on (review M5).
-				cli.PostHandlePublishResponse(tbl)
-			}
-			return err
-		})
-		*total++
-		m.gauge.mu.Lock()
-		m.gauge.counts.ListPages++
-		m.gauge.mu.Unlock()
-		if err != nil || !m.current(gen) {
-			return stopFailed, err
-		}
-		if !m.safeIngest(tbl) {
-			// A page that cannot be read fails its folder, as an error of
-			// its own does (review N4).
-			return stopFailed, errInternal
-		}
-		next, hasRange := rangeIn(tbl, f)
-		oldestKey, oldestAt, rows := oldest(tbl)
-		if !hasRange {
-			if rows == 0 {
-				return stopComplete, nil
-			}
-			next = folderRange{minKey: oldestKey, minAt: oldestAt, more: true}
-		}
-		if kept {
-			m.keepFolderRange(f, next)
+		next, oldestAt, stop, err := m.listPage(ctx, gen, cli, f, ref, kept, total)
+		if stop != "" {
+			return stop, err
 		}
 		if reach && oldestAt > 0 && oldestAt < yearAgo {
 			return stopYear, nil
@@ -290,6 +252,56 @@ func (m *Messenger) listFolder(ctx context.Context, gen int, cli msgrClient, f f
 		ref = next
 	}
 	return stopCapped, nil
+}
+
+// listPage lists one page of folder f from ref, through the pace: the
+// range it reaches on to (kept, when kept), and its oldest thread's last
+// activity. stop is set when the page ends the folder's listing by itself
+// (complete: nothing listed; failed, with err).
+func (m *Messenger) listPage(ctx context.Context, gen int, cli msgrClient, f folderKey, ref folderRange, kept bool, total *int) (next folderRange, oldestAt int64, stop string, err error) {
+	task := &socket.FetchThreadsTask{
+		ParentThreadKey:            f.parent,
+		ReferenceThreadKey:         ref.minKey,
+		ReferenceActivityTimestamp: ref.minAt,
+		SyncGroup:                  int(f.group),
+	}
+	if f.group == 1 {
+		// As the library's own page of sync group 1 does.
+		task.Cursor = cli.GetCursor(1)
+	}
+	var tbl *table.LSTable
+	err = m.request(ctx, gen, func(ctx context.Context) (err error) {
+		if tbl, err = cli.ExecuteTasks(ctx, task); err == nil && tbl != nil {
+			// The sync cursors a page carries, as FetchMoreThreads hands
+			// them on (review M5).
+			cli.PostHandlePublishResponse(tbl)
+		}
+		return err
+	})
+	*total++
+	m.gauge.mu.Lock()
+	m.gauge.counts.ListPages++
+	m.gauge.mu.Unlock()
+	if err != nil || !m.current(gen) {
+		return folderRange{}, 0, stopFailed, err
+	}
+	if !m.safeIngest(tbl) {
+		// A page that cannot be read fails its folder, as an error of
+		// its own does (review N4).
+		return folderRange{}, 0, stopFailed, errInternal
+	}
+	next, hasRange := rangeIn(tbl, f)
+	oldestKey, oldestAt, rows := oldest(tbl)
+	if !hasRange {
+		if rows == 0 {
+			return folderRange{}, 0, stopComplete, nil
+		}
+		next = folderRange{minKey: oldestKey, minAt: oldestAt, more: true}
+	}
+	if kept {
+		m.keepFolderRange(f, next)
+	}
+	return next, oldestAt, "", nil
 }
 
 // rangeIn is the range a page gives for folder f.

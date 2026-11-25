@@ -536,6 +536,11 @@ func (l *LinkedIn) listFolder(ctx context.Context, gen int, cli liClient, folder
 			return nil
 		}
 		if !oldest.IsZero() && (first && oldest.Before(stopAt) || !first && !oldest.After(stopAt)) {
+			if first {
+				// Where the history queue's listing of older
+				// conversations goes on (list.go).
+				_ = l.keep("olderCursor."+folder, next)
+			}
 			return nil
 		}
 		cursor = next
