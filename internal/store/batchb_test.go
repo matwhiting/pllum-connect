@@ -3,6 +3,7 @@ package store
 import (
 	"database/sql"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -73,8 +74,8 @@ func TestOldStoreGainsTheLineIDIndex(t *testing.T) {
 		t.Fatalf("messages_id: %d, %v", n, err)
 	}
 	var v string
-	if err := s.db.QueryRow(`SELECT value FROM meta WHERE key = 'schema'`).Scan(&v); err != nil || v != "11" {
-		t.Fatalf("schema = %q, %v; want 11", v, err)
+	if err := s.db.QueryRow(`SELECT value FROM meta WHERE key = 'schema'`).Scan(&v); err != nil || v != strconv.Itoa(schemaVersion) {
+		t.Fatalf("schema = %q, %v; want %d", v, err, schemaVersion)
 	}
 	if chat, ok := s.ChatOfLine(net, "3EB0L0001"); !ok || chat != phoneChat {
 		t.Fatalf("ChatOfLine = %q, %v", chat, ok)

@@ -31,6 +31,7 @@ type Batch struct {
 	err     error            // the first write that failed in SQLite: the batch is lost
 	newest  map[string]int64 // each touched chat → the newest time a line written in it showed at
 	order   []string         // the touched chats, in the order first touched
+	oldest  map[string]int64 // each chat a line was written to → its oldest line of the network's own before the batch (0: none)
 }
 
 // Batch runs fn's writes for network in one write transaction, then
@@ -41,7 +42,7 @@ func (s *Store) Batch(network string, fn func(b *Batch) error) error {
 		return errBadRequest
 	}
 	return s.write(func(tx *sql.Tx) error {
-		b := &Batch{tx: tx, network: network, newest: map[string]int64{}}
+		b := &Batch{tx: tx, network: network, newest: map[string]int64{}, oldest: map[string]int64{}}
 		defer func() { b.tx = nil }() // a Batch kept past fn writes nothing
 		if err := fn(b); err != nil {
 			return err
@@ -102,9 +103,25 @@ func (b *Batch) PutMessage(m Message) (added bool, err error) {
 	if err := b.ready(); err != nil {
 		return false, err
 	}
+	floor, err := b.oldestHeld(m.ChatID)
+	if err != nil {
+		return false, b.fail(err)
+	}
 	chat, added, err := putMessage(b.tx, b.network, m)
 	if err != nil {
 		return false, b.fail(err)
+	}
+	// A line older than every line of the network's own the chat held
+	// before this batch came from an older-history page (the history
+	// queue, a scroll-back, a backfill's older pages): history, never
+	// unread. Only lines newer than what the chat held can be unread; a
+	// chat that held none takes its first page as it always has.
+	if floor > 0 {
+		if _, err := b.tx.Exec(`UPDATE messages SET older = 1
+				WHERE network = ? AND chat_id = ? AND msg_id = ? AND early = 0 AND ts_ms > 0 AND ts_ms < ?`,
+			b.network, chat, m.ID, floor); err != nil {
+			return false, b.fail(err)
+		}
 	}
 	// Writing one line can make only that line's row show (a new line, an
 	// early row become a line, a Beeper line it took over), so the newest
@@ -119,6 +136,27 @@ func (b *Batch) PutMessage(m Message) (added bool, err error) {
 	}
 	b.touch(chat, shownMs)
 	return added, nil
+}
+
+// oldestHeld is the time of the oldest line of the network's own (not
+// Beeper's copy, not copied, not early) that chat held when the batch first
+// wrote a line to it; 0 when it held none.
+func (b *Batch) oldestHeld(chatID string) (int64, error) {
+	chat, err := resolve(b.tx, b.network, chatID)
+	if err != nil {
+		return 0, err
+	}
+	if ms, ok := b.oldest[chat]; ok {
+		return ms, nil
+	}
+	var ms sql.NullInt64
+	if err := b.tx.QueryRow(`SELECT MIN(ts_ms) FROM messages
+			WHERE network = ? AND chat_id = ? AND early = 0 AND copied = 0 AND source <> 'beeper' AND ts_ms > 0`,
+		b.network, chat).Scan(&ms); err != nil {
+		return 0, err
+	}
+	b.oldest[chat] = ms.Int64
+	return ms.Int64, nil
 }
 
 // Put stores one line, as PutMessage does, and reports what it did, change

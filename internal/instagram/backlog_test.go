@@ -519,3 +519,28 @@ func TestAQueueRequestNeverGoesBesideAnother(t *testing.T) {
 		t.Fatalf("the queue asked %v once quiet, want one page", got)
 	}
 }
+
+// A chat Meta lists without his read marker: what it already holds may be
+// unread, but the queue's older lines never add to it.
+func TestAQueuePageAddsNoUnreadWithoutAReadMarker(t *testing.T) {
+	h := newQueueHarness(t, t.TempDir()+"/connect")
+	c := oldChat{key: 1000331, thread: "340282366841710300000000000000331", active: start.Add(-100 * 24 * time.Hour), pages: 3}
+	serve(h.m, c)
+	h.m.mailbox.ThreadsByFolder.Edges[0].Node.AsIGDirectThread.SlideReadReceipts = nil
+	h.login(validSession())
+	if err := h.m.dispatch(delta(c.thread, &slidetypes.NewMessageEvent{Message: textMsg("mid.$invented-q331-new", aliceFBI, start, "invented new")})); err != nil {
+		t.Fatal(err)
+	}
+	if u := h.chat(c.chat()).Unread; u != 1 {
+		t.Fatalf("unread = %d before the queue, want the new line", u)
+	}
+	n := h.m.mark()
+	h.goLive()
+	h.advance(5*time.Minute, time.Second)
+	if pages := h.m.pagesSince(n); len(pages) != c.pages {
+		t.Fatalf("the queue asked %v, want the chat's %d pages", pages, c.pages)
+	}
+	if got := h.chat(c.chat()); got.Unread != 1 || !got.HistoryComplete {
+		t.Errorf("after the queue: unread %d, complete %v; want 1, true", got.Unread, got.HistoryComplete)
+	}
+}

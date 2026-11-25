@@ -2,7 +2,7 @@ package store
 
 // schemaVersion is the version written to meta. An older store is brought up
 // to it; a store from a newer helper is refused rather than guessed at.
-const schemaVersion = 11 // 2 added beeper_ids; 3 messages.early; 4 messages.copied; 5 the outbox's write; 6 one row per transaction; 7 the caller's send key; 8 chats.mute_end_ms; 9 stored exact-time twins folded; 10 outgoing.line_id; 11 participants.handle
+const schemaVersion = 11 // 2 added beeper_ids; 3 messages.early; 4 messages.copied; 5 the outbox's write; 6 one row per transaction; 7 the caller's send key; 8 chats.mute_end_ms; 9 stored exact-time twins folded; 10 outgoing.line_id; 11 participants.handle and messages.older
 
 // schema makes every table. Every key starts with network, so each network
 // keeps to its own rows. Chats and messages have an integer rid, stable for
@@ -82,6 +82,9 @@ var schema = []string{
 	// row Beeper's copy has filled: it shows, at Beeper's time and side, but
 	// it is copied history (never unread) until the network's own whole
 	// copy lands. Only a line under a beeper: ID has source 'beeper'.
+	// older is 1 for a line an older-history page brought: older than every
+	// line of the network's own the chat held before that page's batch
+	// (Batch.PutMessage). It is history, and never counts as unread.
 	`CREATE TABLE IF NOT EXISTS messages (
 		rid         INTEGER PRIMARY KEY,
 		network     TEXT    NOT NULL,
@@ -105,6 +108,7 @@ var schema = []string{
 		seen_ms     INTEGER,
 		early       INTEGER NOT NULL DEFAULT 0,
 		copied      INTEGER NOT NULL DEFAULT 0,
+		older       INTEGER NOT NULL DEFAULT 0,
 		UNIQUE (network, chat_id, msg_id)
 	)`,
 	`CREATE INDEX IF NOT EXISTS messages_time ON messages (network, chat_id, ts_ms)`,
@@ -239,6 +243,7 @@ var addedColumns = []struct{ table, column, definition string }{
 	{"chats", "mute_end_ms", "INTEGER NOT NULL DEFAULT 0"}, // 8
 	{"outgoing", "line_id", "TEXT"},                        // 10
 	{"participants", "handle", "TEXT"},                     // 11
+	{"messages", "older", "INTEGER NOT NULL DEFAULT 0"},    // 11: every line held before stays as it counted
 }
 
 // lateSchema runs after addedColumns, on every open: what needs a column an

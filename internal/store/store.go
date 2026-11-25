@@ -1460,8 +1460,9 @@ func setReaction(tx *sql.Tx, network, chatID, msgID string, r Reaction) error {
 
 // refresh recomputes a chat's derived values: its last visible line, its
 // unread count and the oldest line it holds. Activity only moves forward.
-// Lines only in Beeper's copy, or shown only through it (copied), are
-// history, and never count as unread. Early
+// Lines only in Beeper's copy, or shown only through it (copied), or brought
+// by an older-history page (older), are history, and never count as
+// unread. Early
 // rows are not lines yet, and count for none of these.
 func refresh(tx *sql.Tx, network, chat string) error {
 	return refreshAt(tx, network, chat, 0)
@@ -1483,7 +1484,7 @@ func refreshAt(tx *sql.Tx, network, chat string, shownMs int64) error {
 	var unread int
 	if err := tx.QueryRow(`SELECT count(*) FROM messages
 			WHERE network = ? AND chat_id = ? AND `+visible+` AND from_me = 0 AND source <> 'beeper' AND copied = 0
-			AND ts_ms > (SELECT read_through_ms FROM chats WHERE network = ? AND chat_id = ?)`,
+			AND older = 0 AND ts_ms > (SELECT read_through_ms FROM chats WHERE network = ? AND chat_id = ?)`,
 		network, chat, network, chat).Scan(&unread); err != nil {
 		return err
 	}
