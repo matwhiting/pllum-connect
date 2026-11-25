@@ -1209,3 +1209,34 @@ func TestARepeatedClientIDIsAnsweredWhileTheConnectionIsDown(t *testing.T) {
 	}
 	close(release)
 }
+
+// A chat whose only lines after his marker came by an older page: nothing
+// is unread, and MarkRead sends no receipt.
+func TestMarkReadAsksNothingForAnOlderPagesLines(t *testing.T) {
+	r, c := withAlice(t)
+	g := groupJID.String()
+	r.send(textMine(groupJID, "3EB0O0000000000000009", base+9000, "invented mine"))
+	if err := r.st.Batch(Name, func(b *store.Batch) error {
+		for i, id := range []string{"3EB0O0000000000000001", "3EB0O0000000000000002"} {
+			if _, err := b.PutMessage(store.Message{ID: id, ChatID: g, SenderID: aliceJID.String(), TimeMs: base + int64(i+1)*1000,
+				Text: "invented old", Kind: "text", Source: store.SourceSync}); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if u := r.chat(g).Unread; u != 0 {
+		t.Fatalf("unread = %d, want 0", u)
+	}
+	before := len(c.marks)
+	for _, through := range []string{"3EB0O0000000000000002", ""} {
+		if err := r.w.MarkRead(context.Background(), g, through); err != nil {
+			t.Fatalf("MarkRead(%q) = %v", through, err)
+		}
+	}
+	if got := c.marks[before:]; len(got) != 0 {
+		t.Errorf("MarkRead sent receipts %+v for lines nothing counts as unread", got)
+	}
+}

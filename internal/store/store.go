@@ -1483,8 +1483,8 @@ func refreshAt(tx *sql.Tx, network, chat string, shownMs int64) error {
 	}
 	var unread int
 	if err := tx.QueryRow(`SELECT count(*) FROM messages
-			WHERE network = ? AND chat_id = ? AND `+visible+` AND from_me = 0 AND source <> 'beeper' AND copied = 0
-			AND older = 0 AND ts_ms > (SELECT read_through_ms FROM chats WHERE network = ? AND chat_id = ?)`,
+			WHERE network = ? AND chat_id = ? AND `+unreadLine+`
+			AND ts_ms > (SELECT read_through_ms FROM chats WHERE network = ? AND chat_id = ?)`,
 		network, chat, network, chat).Scan(&unread); err != nil {
 		return err
 	}

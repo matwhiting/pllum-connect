@@ -89,11 +89,16 @@ func (g *Instagram) backlogNext(ctx context.Context, passed func(string) bool) n
 	if chat == "" {
 		return network.Step{Outcome: network.StepNothing}
 	}
-	before := g.value("cursor." + chat)
+	before, asked := g.value("cursor."+chat), g.traffic.BacklogAsked()
 	_, complete, err := g.fetchPages(ctx, gen, cli, chat, igChatID, 1, false)
 	switch {
 	case err != nil:
 		return network.Step{Outcome: network.StepPassed, Chat: chat, Err: err}
+	case g.traffic.BacklogAsked() == asked:
+		// Nothing was asked: a scroll-back finished the chat while this
+		// step waited for it (fetchPages found it complete). Not a page,
+		// and no fault.
+		return network.Step{Outcome: network.StepPassed, Chat: chat}
 	case complete:
 		g.changed()
 		return network.Step{Outcome: network.StepStart, Chat: chat}

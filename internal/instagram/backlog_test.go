@@ -544,3 +544,66 @@ func TestAQueuePageAddsNoUnreadWithoutAReadMarker(t *testing.T) {
 		t.Errorf("after the queue: unread %d, complete %v; want 1, true", got.Unread, got.HistoryComplete)
 	}
 }
+
+// A scroll-back that reaches a chat's start while a queue step waits for
+// the chat is no fault: the step asked nothing, and says so, so the engine
+// neither counts a page nor stops.
+func TestAChatFinishedByScrollBackIsNoFault(t *testing.T) {
+	h := newHarness(t)
+	h.g.WithHistoryQueue()
+	c := oldChat{key: 1000341, thread: "340282366841710300000000000000341", active: start.Add(-100 * 24 * time.Hour), pages: 3}
+	serve(h.m, c)
+	h.login(validSession()) // not live: no Run of the queue, the step is called here
+	n := h.m.mark()
+	asked := h.g.traffic.BacklogAsked()
+
+	lock := h.g.chatLock(c.chat())
+	lock.Lock() // a scroll-back holds the chat
+	got := make(chan network.Step, 1)
+	go func() {
+		got <- h.g.backlogNext(network.WithBacklog(context.Background()), func(string) bool { return false })
+	}()
+	time.Sleep(50 * time.Millisecond)
+	complete := true
+	if err := h.st.PutChat(Name, store.ChatInfo{ID: c.chat(), HistoryComplete: &complete}); err != nil {
+		t.Fatal(err)
+	}
+	lock.Unlock() // and has reached the start
+
+	s := <-got
+	if s.Err != nil || s.Outcome == network.StepMoved || s.Outcome == network.StepStart {
+		t.Errorf("the step is %+v, want one that asked nothing", s)
+	}
+	if h.g.traffic.BacklogAsked() != asked || len(h.m.pagesSince(n)) != 0 {
+		t.Errorf("the step asked Meta")
+	}
+}
+
+// A scroll-back that began while the queue's request waited its turn in
+// the pace goes first: the queue's request is not made.
+func TestAQueueRequestYieldsAtItsTurn(t *testing.T) {
+	h := newHarness(t)
+	h.g.WithHistoryQueue()
+	serve(h.m, queueChats...)
+	h.login(validSession()) // not live: no Run of the queue, the request is made here
+	h.clock.Advance(network.BacklogQuiet)
+	gen, cli, _ := h.g.running()
+	ask := func() error {
+		return h.g.request(network.WithBacklog(context.Background()), gen, func(ctx context.Context) error {
+			_, err := cli.PaginateMessages(ctx, &slidetypes.PaginateMessagesRequest{ThreadID: queueChats[0].thread})
+			return err
+		})
+	}
+	n := h.m.mark()
+	h.g.ScrolledBack()
+	if err := ask(); wire.KindOf(err) != wire.NotConnected {
+		t.Errorf("a queue request during a scroll-back = %v, want notConnected", err)
+	}
+	if got := h.m.pagesSince(n); len(got) != 0 {
+		t.Fatalf("the queue asked %v during a scroll-back", got)
+	}
+	h.clock.Advance(network.BacklogYield)
+	if err := ask(); err != nil {
+		t.Errorf("a queue request after the yield = %v", err)
+	}
+}

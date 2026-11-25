@@ -208,10 +208,15 @@ func (s *Store) Line(network, chatID, msgID string) (Line, bool, error) {
 }
 
 // unreadLine is the SQL test for a line that counts as unread once it is
-// after the read marker: an incoming line that shows and arrived directly.
-const unreadLine = visible + ` AND from_me = 0 AND source <> 'beeper' AND copied = 0`
+// after the read marker: an incoming line that shows, arrived directly, and
+// is not one an older-history page brought. It is the one rule: the unread
+// count (refreshAt), Unread (what a MarkRead marks) and NewestIncoming use
+// it.
+const unreadLine = visible + ` AND from_me = 0 AND source <> 'beeper' AND copied = 0 AND older = 0`
 
-// NewestIncoming is the chat's newest incoming line that shows.
+// NewestIncoming is the chat's newest incoming line that shows and is not
+// one an older-history page brought (it could never be unread), Beeper's
+// copies included.
 func (s *Store) NewestIncoming(network, chatID string) (Line, bool, error) {
 	if err := s.ready(); err != nil {
 		return Line{}, false, err
@@ -221,7 +226,7 @@ func (s *Store) NewestIncoming(network, chatID string) (Line, bool, error) {
 		return Line{}, false, dbErr(err)
 	}
 	l, err := scanLine(s.db.QueryRow(`SELECT `+lineColumns+` FROM messages
-			WHERE network = ? AND chat_id = ? AND `+visible+` AND from_me = 0
+			WHERE network = ? AND chat_id = ? AND `+visible+` AND from_me = 0 AND older = 0
 			ORDER BY ts_ms DESC, rid DESC LIMIT 1`, network, chat))
 	if errors.Is(err, sql.ErrNoRows) {
 		return Line{}, false, nil

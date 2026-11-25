@@ -558,13 +558,16 @@ func (g *Instagram) signInFailed(gen int, kind wire.Kind) {
 //
 // The history queue's request (ctx from network.WithBacklog) goes only if,
 // once its turn in the pace has come, no other request is in flight or
-// ended within network.BacklogQuiet: a send that took the pace while it
-// waited goes alone. Otherwise it is not made (notConnected), and the
+// ended within network.BacklogQuiet, and the queue may still ask (not
+// held, stopped or yielding to a scroll-back): a send or a scroll-back
+// that began while it waited goes alone. Otherwise it is not made (notConnected), and the
 // queue asks again after its gap.
 func (g *Instagram) request(ctx context.Context, gen int, fn func(ctx context.Context) error) error {
 	live := func() bool { return g.current(gen) }
 	if network.IsBacklog(ctx) {
-		live = func() bool { return g.current(gen) && g.traffic.Quiet(g.clock.Now(), network.BacklogQuiet) }
+		live = func() bool {
+			return g.current(gen) && g.traffic.Quiet(g.clock.Now(), network.BacklogQuiet) && (g.bq == nil || g.bq.MayAsk())
+		}
 	}
 	return g.sess.Request(ctx, live, func(ctx context.Context) error {
 		end := g.traffic.Begin(ctx, g.clock.Now())

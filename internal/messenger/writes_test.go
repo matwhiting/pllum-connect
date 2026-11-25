@@ -1384,3 +1384,39 @@ func TestASendWhoseAskingCannotBeKeptAsksNothing(t *testing.T) {
 		t.Errorf("%d messages were asked", n)
 	}
 }
+
+// A chat whose only lines after his marker came by an older page: nothing
+// is unread, and MarkRead sends no receipt and no task.
+func TestMarkReadAsksNothingForAnOlderPagesLines(t *testing.T) {
+	h := newHarness(t)
+	h.signIn(t)
+	at := h.f.clock.Now().Add(-time.Hour)
+	encChat := keyID(encGroup) + groupSuffix
+	aliceJID := watypes.NewJID(keyID(aliceFBID), watypes.MessengerServer).String()
+	if _, err := h.st.PutMessage(Name, store.Message{ID: "WAINVENTEDH1", ChatID: encChat, SenderID: "his", FromMe: true,
+		TimeMs: at.UnixMilli(), Text: canary, Kind: "text", Source: store.SourceLive}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.st.Batch(Name, func(b *store.Batch) error {
+		for i, id := range []string{"WAINVENTEDO1", "WAINVENTEDO2"} {
+			if _, err := b.PutMessage(store.Message{ID: id, ChatID: encChat, SenderID: aliceJID,
+				TimeMs: at.Add(-time.Duration(i+1) * time.Hour).UnixMilli(), Text: canary, Kind: "text", Source: store.SourceSync}); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if c := h.chat(t, encChat); c.Unread != 0 {
+		t.Fatalf("unread = %d, want 0", c.Unread)
+	}
+	h.markRead(t, encChat, "WAINVENTEDO1")
+	h.markRead(t, encChat, "")
+	if got := h.f.receipts(); len(got) != 0 {
+		t.Errorf("MarkRead sent receipts %+v for lines nothing counts as unread", got)
+	}
+	if n := len(tasksOf[*socket.ThreadMarkReadTask](h.f)); n != 0 {
+		t.Errorf("MarkRead sent %d ThreadMarkReadTasks", n)
+	}
+}

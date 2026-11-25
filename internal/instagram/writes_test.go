@@ -638,3 +638,36 @@ func TestOnlyTheAllowedWritesExist(t *testing.T) {
 		}
 	}
 }
+
+// A chat whose only lines after his marker came by an older page: nothing
+// is unread, and MarkRead asks Meta nothing (by its line or to the newest).
+func TestMarkReadAsksNothingForAnOlderPagesLines(t *testing.T) {
+	h := signedIn(t)
+	if _, err := h.st.PutMessage(Name, store.Message{ID: "mid.$invented-his", ChatID: aliceChat, SenderID: "his", FromMe: true,
+		TimeMs: start.UnixMilli(), Text: "invented his", Kind: "text", Source: store.SourceLive}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.st.Batch(Name, func(b *store.Batch) error {
+		for i, id := range []string{"mid.$invented-old1", "mid.$invented-old2"} {
+			if _, err := b.PutMessage(store.Message{ID: id, ChatID: aliceChat, SenderID: "alice", TimeMs: start.Add(-time.Duration(i+1) * time.Hour).UnixMilli(),
+				Text: "invented old", Kind: "text", Source: store.SourceSync}); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if u := h.chat(aliceChat).Unread; u != 0 {
+		t.Fatalf("unread = %d, want 0", u)
+	}
+	from := h.m.mark()
+	for _, through := range []string{"mid.$invented-old1", ""} {
+		if err := h.g.MarkRead(context.Background(), aliceChat, through); err != nil {
+			t.Fatalf("MarkRead(%q) = %v", through, err)
+		}
+	}
+	if got := h.m.namesSince(from); len(got) != 0 {
+		t.Errorf("MarkRead asked Meta %v for lines nothing counts as unread", got)
+	}
+}

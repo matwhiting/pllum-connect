@@ -181,6 +181,24 @@ func (b *Backlog) Yield() {
 	}
 }
 
+// MayAsk reports whether, as far as the queue's own state goes, a request
+// of its may go now: it is not stopped, not held, and not yielding to an
+// older read. A network checks it again once the queue's request has its
+// turn in the pace, so a scroll-back that began meanwhile goes first.
+func (b *Backlog) MayAsk() bool {
+	clock := b.Clock
+	if clock == nil {
+		return false
+	}
+	now := clock.Now()
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.stopped != "" || now.Before(b.holdUntil) {
+		return false
+	}
+	return b.yieldAt.IsZero() || !now.Before(b.yieldAt.Add(BacklogYield))
+}
+
 // PushedBack is any pushback on the network (kind is why: a rate limit,
 // a pause, a checkpoint, an ended session): the queue asks nothing for
 // BacklogHold. The hold is kept at once, in memory and in the network's

@@ -823,3 +823,27 @@ func TestBacklogHoldsNoMoreThanADay(t *testing.T) {
 		t.Fatalf("calls %v, want one a day and %v on", calls, BacklogMinGap)
 	}
 }
+
+func TestBacklogMayAskOnlyWhenNotHeldStoppedOrYielding(t *testing.T) {
+	q := newQueue(t)
+	if !q.b.MayAsk() {
+		t.Fatalf("a new queue may not ask")
+	}
+	q.b.Yield()
+	if q.b.MayAsk() {
+		t.Errorf("it may ask just after an older read")
+	}
+	q.clock.Advance(BacklogYield)
+	if !q.b.MayAsk() {
+		t.Errorf("it may not ask once the yield is over")
+	}
+	q.b.PushedBack(wire.RateLimited)
+	if q.b.MayAsk() {
+		t.Errorf("it may ask while held")
+	}
+	q = newQueue(t)
+	q.b.stop(wire.Internal)
+	if q.b.MayAsk() {
+		t.Errorf("it may ask once stopped")
+	}
+}

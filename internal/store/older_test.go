@@ -113,3 +113,37 @@ func TestUnreadSurvivesTheUpgradeToOlderLines(t *testing.T) {
 		t.Errorf("an older page after the upgrade made unread %d, want 2", u)
 	}
 }
+
+// Unread (what a MarkRead marks) and the unread count are one rule: an
+// older page's lines are in neither.
+func TestUnreadListsOnlyWhatTheCountCounts(t *testing.T) {
+	s := openTest(t)
+	put(t, s, mine(phoneChat, "m-9", base+9000, "his"))
+	page(t, s, text(phoneChat, "o-2", base+2000, "two"), text(phoneChat, "o-1", base+1000, "one"))
+	if u := chatOf(t, s, phoneChat).Unread; u != 0 {
+		t.Fatalf("unread = %d, want 0", u)
+	}
+	lines, err := s.Unread(net, phoneChat, base+9000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(lines) != 0 {
+		t.Errorf("Unread lists %v, want none: the count counts none", ids(linesAsMessages(lines)))
+	}
+	if in, ok, err := s.NewestIncoming(net, phoneChat); err != nil || ok {
+		t.Errorf("NewestIncoming = %q, %v, %v; want none that can be unread", in.ID, ok, err)
+	}
+	put(t, s, text(phoneChat, "n-10", base+10000, "new"))
+	lines, _ = s.Unread(net, phoneChat, base+10000)
+	if len(lines) != 1 || lines[0].ID != "n-10" || chatOf(t, s, phoneChat).Unread != 1 {
+		t.Errorf("after a new line Unread lists %d lines, want the new one", len(lines))
+	}
+}
+
+func linesAsMessages(ls []Line) []Message {
+	var out []Message
+	for _, l := range ls {
+		out = append(out, Message{ID: l.ID})
+	}
+	return out
+}
