@@ -573,3 +573,78 @@ func dayLines(t *testing.T, r *rig) []string {
 	}
 	return out
 }
+
+// A listing page never rewrites a conversation the store holds: its
+// activity stays what the next catch-up compares the listing with.
+func TestAListingPageLeavesHeldChatsAlone(t *testing.T) {
+	r := listingRig(t)
+	r.firstSignIn()
+	before := r.chat(convURN(1)).LastActivityMs
+	// An older version's store: the walk starts at the top, where the
+	// listing now shows conversation 1 newer than the store holds (a
+	// message the stream missed).
+	_ = r.l.keep("olderCursor.INBOX", "")
+	feed := r.f.cursorPage
+	r.f.cursorPage = func(cursor string) *linkedingo.CollectionResponse[linkedingo.ConversationCursorMetadata, linkedingo.Conversation] {
+		if cursor == "" {
+			return cursorPageOf("list-invented-1", conv(1, start.Add(-24*time.Hour)))
+		}
+		return feed(cursor)
+	}
+	r.startQueue()
+	r.advance(30*time.Minute, time.Second)
+	if got := r.chat(convURN(1)).LastActivityMs; got != before {
+		t.Errorf("the held conversation's activity moved from %v to %v", time.UnixMilli(before), time.UnixMilli(got))
+	}
+	if r.value("histDone."+convURN(1)) == histQueue {
+		t.Errorf("a held conversation was made the queue's")
+	}
+}
+
+// The end of the walk: a page past the year that brings no conversation
+// the store did not hold ends the folder's listing.
+func TestAListingPagePastTheYearWithNothingNewEndsIt(t *testing.T) {
+	r := listingRig(t)
+	r.firstSignIn()
+	held := r.heldChat(3) // conversation 3 is already held
+	_ = r.l.keep("histDone."+held, histGone)
+	i := len(r.f.callsNow())
+	r.startQueue()
+	r.advance(30*time.Minute, time.Second)
+	for _, c := range r.listCalls(i) {
+		if strings.HasSuffix(c, "list-invented-3") {
+			t.Errorf("the queue listed past a page with nothing new")
+		}
+	}
+	if _, ok, _ := r.st.Chat(Name, convURN(4)); ok {
+		t.Errorf("a page past the end was listed")
+	}
+	if r.value("listedOlder.INBOX") == "" {
+		t.Errorf("the inbox's listing is not done")
+	}
+}
+
+// Ruling 10's count of 5xx in a row moves on only with LinkedIn's answers:
+// a request never made (refused at its turn) or never answered leaves it.
+func TestOnlyLinkedInsAnswersStartThe500CountOver(t *testing.T) {
+	r := newQueueRig(t)
+	for _, tc := range []struct {
+		between error
+		stop    bool
+	}{
+		{errNotConnected, true},
+		{&wire.Error{Kind: wire.Timeout}, true},
+		{&wire.Error{Kind: wire.Offline}, true},
+		{nil, false},
+		{errGone, false},
+	} {
+		r.l.bq500s = 0
+		if wait, _ := r.l.queueServerError(errServer); !wait {
+			t.Fatalf("the first 500 is not a wait")
+		}
+		r.l.queueServerError(tc.between)
+		if _, stop := r.l.queueServerError(errServer); stop != tc.stop {
+			t.Errorf("500, %v, 500: stop %v, want %v", tc.between, stop, tc.stop)
+		}
+	}
+}

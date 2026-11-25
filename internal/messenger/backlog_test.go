@@ -820,3 +820,24 @@ func TestListingObeysPushback(t *testing.T) {
 		}
 	}
 }
+
+// The end of the walk: a page past the year that brings no chat the store
+// did not hold ends the folder's listing.
+func TestAListingPagePastTheYearWithNothingNewEndsIt(t *testing.T) {
+	f := listingFake()
+	h := newListingHarness(t, "", f)
+	h.signIn(t)
+	at := f.clock.Now().Add(-500 * 24 * time.Hour).UnixMilli()
+	complete := true
+	if err := h.st.PutChat(Name, store.ChatInfo{ID: keyID(listOld), Kind: "group", LastActivityMs: at, HistoryComplete: &complete}); err != nil {
+		t.Fatal(err)
+	}
+	h.startQueue(t)
+	h.advance(t, 30*time.Minute, time.Second)
+	if _, ok, _ := h.st.Chat(Name, keyID(listOlder)); ok {
+		t.Errorf("a page past the end was listed")
+	}
+	if h.m.value("listedOlder."+(folderKey{1, -1}).name()) == "" {
+		t.Errorf("the inbox's listing is not done")
+	}
+}

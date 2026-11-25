@@ -800,3 +800,95 @@ func TestListingObeysPushback(t *testing.T) {
 		t.Errorf("the queue asked %v within the day", got)
 	}
 }
+
+// holdChat puts c in the store as a sync left it: listed, its thread known,
+// last active at at.
+func (h *harness) holdChat(c oldChat, at time.Time) {
+	h.t.Helper()
+	if err := h.st.PutChat(Name, store.ChatInfo{ID: c.chat(), Kind: "single", LastActivityMs: at.UnixMilli()}); err != nil {
+		h.t.Fatal(err)
+	}
+	_ = h.g.keep("igid."+c.chat(), c.thread)
+}
+
+// A store listed before the queue kept where its listing stopped (his):
+// the queue's listing goes on from the first page the sign-in loaded, as
+// the first listing paged it, and never asks with an empty cursor.
+func TestAnOldStoresListingGoesOnFromTheSignInsFirstPage(t *testing.T) {
+	h := listingHarness(t, t.TempDir()+"/connect")
+	_ = h.g.keep("backfilled", "1") // listed by an older version: no place kept
+	n := h.m.mark()
+	h.login(validSession())
+	if got := h.g.value("olderCursor"); got != "inbox-1" {
+		t.Fatalf("the sign-in kept %q, want the first page's cursor", got)
+	}
+	h.goLive()
+	h.advance(5*time.Minute, time.Second)
+	got := h.m.listPagesSince(n)
+	if len(got) == 0 || got[0] != "inbox-1" {
+		t.Fatalf("the queue listed %v, want the first page's cursor first, as the first listing asks", got)
+	}
+	for _, c := range got {
+		if c == "" {
+			t.Fatalf("a listing request went with an empty cursor")
+		}
+	}
+
+	// With no place known (a run that resumed without loading the inbox),
+	// nothing is listed.
+	h2 := listingHarness(t, t.TempDir()+"/connect")
+	h2.login(validSession())
+	_ = h2.g.keep("olderCursor", "")
+	m := h2.m.mark()
+	h2.goLive()
+	h2.advance(10*time.Minute, time.Second)
+	if got := h2.m.listPagesSince(m); len(got) != 0 {
+		t.Errorf("with no place known the queue listed %v", got)
+	}
+}
+
+// A listing page never rewrites a chat the store holds: its activity and
+// its mark that newer lines are still to fetch stay as they were.
+func TestAListingPageLeavesHeldChatsAlone(t *testing.T) {
+	mid := oldChat{key: 1000405, thread: "340282366841710300000000000000405", active: start.Add(-200 * 24 * time.Hour), pages: 1}
+	h := newQueueHarness(t, t.TempDir()+"/connect")
+	serveListing(h.m, []oldChat{listNew}, []oldChat{mid}, []oldChat{listYear}, []oldChat{listOld}, []oldChat{listOlder})
+	_ = h.g.keep("backfilled", "1") // an older version's store: the walk starts at the top
+	h.login(validSession())
+	// mid is held, with a line the socket missed: older activity than the
+	// listing shows, and still marked behind.
+	held := mid.active.Add(-time.Hour)
+	h.holdChat(mid, held)
+	_ = h.g.keep("behind."+mid.chat(), "1")
+	h.goLive()
+	h.advance(30*time.Minute, time.Second)
+	if c := h.chat(mid.chat()); c.LastActivityMs != held.UnixMilli() {
+		t.Errorf("the held chat's activity moved to %v", time.UnixMilli(c.LastActivityMs))
+	}
+	if h.g.value("behind."+mid.chat()) == "" {
+		t.Errorf("the held chat lost its mark that newer lines are still to fetch")
+	}
+	if _, ok, _ := h.st.Chat(Name, listOld.chat()); !ok {
+		t.Errorf("a new old chat was not stored")
+	}
+}
+
+// The end of the walk: a page past the year that brings no chat the store
+// did not hold ends the listing.
+func TestAListingPagePastTheYearWithNothingNewEndsIt(t *testing.T) {
+	h := listingHarness(t, t.TempDir()+"/connect")
+	h.login(validSession())
+	h.holdChat(listOld, listOld.active)
+	n := h.m.mark()
+	h.goLive()
+	h.advance(30*time.Minute, time.Second)
+	if got := h.m.listPagesSince(n); strings.Join(got, " ") != "inbox-2" {
+		t.Errorf("the queue listed %v, want to stop after the page with nothing new", got)
+	}
+	if !h.g.olderListed() {
+		t.Errorf("the listing is not done")
+	}
+	if _, ok, _ := h.st.Chat(Name, listOlder.chat()); ok {
+		t.Errorf("a page past the end was listed")
+	}
+}

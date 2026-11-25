@@ -628,7 +628,11 @@ func (l *LinkedIn) probeRequest(ctx context.Context, pg int, session network.Ses
 	if err := gate(); err != nil {
 		return err
 	}
-	err := fn(ctx)
+	err := func() error {
+		end := l.traffic.Begin(ctx, l.clock.Now())
+		defer func() { end(l.clock.Now()) }()
+		return fn(ctx)
+	}()
 	if err == nil {
 		return nil
 	}

@@ -14,10 +14,11 @@ import (
 // time, by the cursor the first listing pages it by, from where that
 // listing stopped ("olderCursor.<folder>"; from the top for a store listed
 // before it was kept), until each folder is listed to its end
-// ("listedOlder.<folder>", then "olderListed"). A conversation a page
-// brings that the store did not hold is the queue's alone (ruling 9): it is
-// stored without the fresh mark and marked histDone "queue", so the worker
-// (at its 2 to 4 s pace) never asks for it, and only the queue pages it.
+// ("listedOlder.<folder>", then "olderListed"). Only a conversation a page
+// brings that the store did not hold is stored, and it is the queue's alone
+// (ruling 9): stored without the fresh mark and marked histDone "queue", so
+// the worker (at its 2 to 4 s pace) never asks for it, and only the queue
+// pages it. A conversation the store holds is left as it is.
 
 // olderListed reports whether every folder has been listed to its end.
 func (l *LinkedIn) olderListed() bool { return l.value("olderListed") != "" }
@@ -47,14 +48,14 @@ func (l *LinkedIn) listOlder(ctx context.Context) network.Step {
 			page, err = cli.GetConversationsWithNextCursor(ctx, folder, cursor)
 			return err
 		})
-		if settled(err) {
-			_ = l.keep(done, "1")
-			return network.Step{Outcome: network.StepPassed}
-		}
 		if wait, stop := l.queueServerError(err); wait {
 			return network.Step{Outcome: network.StepPassed}
 		} else if stop {
 			return network.Step{Outcome: network.StepPassed, Err: err}
+		}
+		if settled(err) {
+			_ = l.keep(done, "1")
+			return network.Step{Outcome: network.StepPassed}
 		}
 		if err != nil {
 			return network.Step{Outcome: network.StepPassed, Err: err}
@@ -74,12 +75,15 @@ func (l *LinkedIn) listOlder(ctx context.Context) network.Step {
 			if err != nil {
 				continue
 			}
-			if !had {
-				// The queue's: marked before it is stored, so the worker
-				// never sees it unmarked.
-				_ = l.keep("histDone."+id, histQueue)
+			if had {
+				// Held: left as it is (its activity is what the next
+				// catch-up compares the listing with).
+				continue
 			}
-			if l.storeConversation(c) && !had {
+			// The queue's: marked before it is stored, so the worker never
+			// sees it unmarked.
+			_ = l.keep("histDone."+id, histQueue)
+			if l.storeConversation(c) {
 				fresh = true
 			}
 		}

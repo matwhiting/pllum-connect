@@ -141,11 +141,17 @@ func (l *LinkedIn) backlogNext(ctx context.Context, passed func(string) bool) ne
 // queueServerError reads a queue request's error for a plain 5xx LinkedIn
 // gave (ruling 10): the first is a wait, as a 502 to 504 is (wait: the
 // step passes its chat over, with no error); a second in a row stops the
-// queue (stop: the error goes to the engine as internal). Any other outcome
-// starts the count over. Only the queue's Run calls it.
+// queue (stop: the error goes to the engine as internal). Only an answer
+// LinkedIn gave starts the count over: a request never made (refused at
+// its turn, the run ended, a pause in force) or one that never came back
+// (no connection, a timeout) leaves it. Only the queue's Run calls it.
 func (l *LinkedIn) queueServerError(err error) (wait, stop bool) {
 	if !errors.Is(err, errServer) {
-		l.bq500s = 0
+		switch wire.KindOf(err) {
+		case wire.NotConnected, wire.Offline, wire.Timeout, wire.RateLimited:
+		default:
+			l.bq500s = 0 // LinkedIn answered
+		}
 		return false, false
 	}
 	l.bq500s++

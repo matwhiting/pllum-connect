@@ -702,8 +702,11 @@ func (l *LinkedIn) pageHistory(ctx context.Context, gen int, cli liClient, chat 
 			return pageGone, nil
 		}
 		// A passing failure settles nothing: the chat is set aside, for
-		// longer each time in a row (pass).
-		l.pass(gen, chat)
+		// longer each time in a row (pass). A queue request refused at its
+		// turn was never made: nothing to set aside for.
+		if !network.IsBacklog(ctx) || !errors.Is(err, errNotConnected) {
+			l.pass(gen, chat)
+		}
 		return pageFailed, err
 	}
 	l.answered(chat)

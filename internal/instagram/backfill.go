@@ -44,6 +44,12 @@ func (g *Instagram) backfill(ctx context.Context, gen int, cli igClient, first *
 	done := g.value("backfilled") != ""
 	threads := g.storeListing(first.ThreadsByFolder.Edges, done)
 	g.changed()
+	if done && g.value("olderCursor") == "" && !g.olderListed() {
+		// A store listed before the history queue kept where its listing
+		// stopped: the queue's listing walks on from this first page, as
+		// the first listing paged it, never from an empty cursor.
+		g.keepOlderListing(first.ThreadsByFolder.PageInfo)
+	}
 
 	if !done {
 		page := first.ThreadsByFolder.PageInfo
