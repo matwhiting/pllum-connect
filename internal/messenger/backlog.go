@@ -2,6 +2,8 @@ package messenger
 
 import (
 	"context"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/matwhiting/pllum-connect/internal/meta"
@@ -86,6 +88,44 @@ func (m *Messenger) queuePushedBack(kind wire.Kind) {
 	}
 }
 
+// queueBackupPages is the most pages of his backup the history queue reads
+// in a local day (ruling 8), within the queue's own BacklogDayCap: once
+// they are spent it pages only threads that day. Kept in hq.ebp as
+// <YYYY-MM-DD>\n<pages>.
+const queueBackupPages = 300
+
+// backupDay is the local day the queue's backup pages are counted in, and
+// how many it has had.
+func (m *Messenger) backupDay() (day string, n int) {
+	day = m.clock.Now().Local().Format(time.DateOnly)
+	d, c, ok := strings.Cut(m.value("hq.ebp"), "\n")
+	if !ok || d != day {
+		return day, 0
+	}
+	n, err := strconv.Atoi(c)
+	if err != nil || n < 0 {
+		return day, queueBackupPages // unreadable: none left today
+	}
+	return day, n
+}
+
+// takeBackupPage takes one of the day's backup pages for the queue: false
+// when they are spent, or the count can't be kept (then nothing is asked).
+// giveBackupPage puts back one not asked.
+func (m *Messenger) takeBackupPage() bool {
+	day, n := m.backupDay()
+	if n >= queueBackupPages {
+		return false
+	}
+	return m.keep("hq.ebp", day+"\n"+strconv.Itoa(n+1)) == nil
+}
+
+func (m *Messenger) giveBackupPage() {
+	if day, n := m.backupDay(); n > 0 {
+		_ = m.keep("hq.ebp", day+"\n"+strconv.Itoa(n-1))
+	}
+}
+
 // backlogNext pages the newest open chat the queue has not passed over and
 // can ask now by one page, under ctx (the queue's, so its request is
 // counted as the queue's). A step that asked nothing (the chat finished or
@@ -103,7 +143,14 @@ func (m *Messenger) backlogNext(ctx context.Context, passed func(string) bool) n
 	if chat == "" {
 		return network.Step{Outcome: network.StepNothing}
 	}
-	_, out, _, err := m.olderStep(ctx, gen, cli, chat, false)
+	backup := m.encPaging(chat)
+	if backup && !m.takeBackupPage() {
+		return network.Step{Outcome: network.StepPassed, Chat: chat}
+	}
+	_, out, asked, err := m.olderStep(ctx, gen, cli, chat, false)
+	if backup && !asked {
+		m.giveBackupPage()
+	}
 	switch {
 	case err != nil:
 		return network.Step{Outcome: network.StepPassed, Chat: chat, Err: err}
@@ -145,7 +192,8 @@ func (m *Messenger) nextQueueChat(passed func(string) bool) (string, error) {
 // its unencrypted thread (not done, not held, with a line to anchor on).
 func (m *Messenger) askable(chat string) bool {
 	if m.encPaging(chat) {
-		return !m.encHeld(chat) && !m.encPaused()
+		_, n := m.backupDay()
+		return !m.encHeld(chat) && !m.encPaused() && n < queueBackupPages
 	}
 	if _, ok := m.threadOfChat(chat); !ok || m.value("olderDone."+chat) != "" || m.held(chat) {
 		return false

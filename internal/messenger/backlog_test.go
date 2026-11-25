@@ -627,3 +627,40 @@ func TestAStepReportsWhatItDid(t *testing.T) {
 		t.Errorf("an uncounted page is %+v, want StepMoved for the engine to judge", s)
 	}
 }
+
+// Ruling 8: at most queueBackupPages pages of his backup a local day from
+// the queue; once they are spent it pages only threads that day, and the
+// backup again the next.
+func TestTheQueueReadsAtMost300BackupPagesADay(t *testing.T) {
+	f := newFakeMeta()
+	withGroupLines(f)
+	olderPages(f, groupOne, 3)
+	f.history.script("invented-none")
+	f.history.endless = true
+	h := newQueueHarness(t, "", f)
+	restored(t, h)
+	today := f.clock.Now().Local().Format(time.DateOnly)
+	_ = h.m.keep("hq.ebp", today+"\n"+strconv.Itoa(queueBackupPages-1))
+	before, n := f.history.total(), f.taskMark()
+	h.startQueue(t)
+	h.advance(t, 10*time.Minute, time.Second)
+	if got := f.history.total() - before; got != 1 {
+		t.Errorf("the queue asked %d pages of the backup with 1 left today, want 1", got)
+	}
+	if v := h.m.value("hq.ebp"); v != today+"\n"+strconv.Itoa(queueBackupPages) {
+		t.Errorf("hq.ebp is %q", v)
+	}
+	if p := f.pagesOf(groupOne, n); p == 0 {
+		t.Errorf("with the backup's pages spent the queue paged no thread")
+	}
+
+	// The next local day it reads the backup again.
+	y, mo, d := f.clock.Now().Local().Date()
+	midnight := time.Date(y, mo, d+1, 0, 0, 0, 0, time.Local)
+	h.advance(t, midnight.Sub(f.clock.Now()), 10*time.Minute)
+	before = f.history.total()
+	h.advance(t, 10*time.Minute, time.Second)
+	if got := f.history.total() - before; got == 0 {
+		t.Errorf("the next day the queue asked no page of the backup")
+	}
+}
