@@ -761,9 +761,11 @@ func (l *LinkedIn) request(ctx context.Context, gen int, background bool, fn fun
 			return err
 		}
 	}
-	end := l.traffic.Begin(ctx, l.clock.Now())
-	err := fn(ctx)
-	end(l.clock.Now())
+	err := func() error {
+		end := l.traffic.Begin(ctx, l.clock.Now())
+		defer func() { end(l.clock.Now()) }()
+		return fn(ctx)
+	}()
 	if err == nil {
 		l.afterSuccess(gen)
 		return nil
