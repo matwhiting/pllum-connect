@@ -60,7 +60,12 @@ func (l *LinkedIn) listOlder(ctx context.Context) network.Step {
 		if err != nil {
 			return network.Step{Outcome: network.StepPassed, Err: err}
 		}
-		if page == nil || !l.current(gen) {
+		if !l.current(gen) {
+			// The run ended while the page was on its way: nothing of it
+			// is taken, and a later run lists on from the same place.
+			return network.Step{Outcome: network.StepPassed, Err: errNotConnected}
+		}
+		if page == nil {
 			_ = l.keep(done, "1")
 			return network.Step{Outcome: network.StepMoved}
 		}

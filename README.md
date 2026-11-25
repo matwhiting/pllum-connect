@@ -20,7 +20,7 @@ pllum-connect --data <folder>
 
 The data folder is made with mode 0700. Only one copy runs per folder: a second exits with code 3. The helper exits 0 at the end of its input.
 
-`--history-queue` turns on the background history queue, which is off without it: on Instagram, Messenger and LinkedIn it pages each chat back to its start, and lists chats older than the first sign-in's year, one request at a time. It asks only while the network is live and quiet, 15 to 25 s after its last request, at most 1,500 times a day; any pushback holds it for a day, and an error it does not know stops it until the next start (PROTOCOL.md, Background history).
+`--history-queue` turns on the background history queue, which is off without it: on Instagram, Messenger and LinkedIn it pages each chat back to its start, and lists chats older than the first sign-in's year, one request at a time. It asks only while the network is live and quiet, 15 to 25 s after its last request, at most 1,500 times a day; any pushback holds it for a day, a pushback on Instagram or Messenger holds both, and an error it does not know stops it for the rest of the run (after a restart, until the day ends) (PROTOCOL.md, Background history).
 
 `--gate` adds one hidden method, `gateCounts` (counts only), for Messenger's gate: the one sitting in which a Debug Pllum checks whether its encrypted chats can be read before Messenger is built out. With it, every Messenger sign-in lists every folder afresh (with no 365-day reach, so the counts include the oldest threads) and fetches no history. Pllum's own copy never passes it.
 

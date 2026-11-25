@@ -648,3 +648,30 @@ func TestOnlyLinkedInsAnswersStartThe500CountOver(t *testing.T) {
 		}
 	}
 }
+
+// A listing page that comes back after its run ended marks nothing: the
+// folder is listed on from the same place by a later run.
+func TestALateListingAnswerMarksNothing(t *testing.T) {
+	r := listingRig(t)
+	r.firstSignIn()
+	r.clock.Advance(network.BacklogQuiet)
+	feed := r.f.cursorPage
+	r.f.cursorPage = func(cursor string) *linkedingo.CollectionResponse[linkedingo.ConversationCursorMetadata, linkedingo.Conversation] {
+		if cursor == "list-invented-2" {
+			// The run ends while this page is on its way.
+			r.l.mu.Lock()
+			gen := r.l.runs.Gen
+			r.l.mu.Unlock()
+			r.l.endSession(gen)
+			return cursorPageOf("", conv(3, start.Add(-500*24*time.Hour)))
+		}
+		return feed(cursor)
+	}
+	s := r.l.listOlder(network.WithBacklog(context.Background()))
+	if s.Err == nil {
+		t.Errorf("a late answer was taken: %+v", s)
+	}
+	if r.value("listedOlder.INBOX") != "" || r.value("olderCursor.INBOX") != "list-invented-2" {
+		t.Errorf("a late answer moved the listing: listed %q, cursor %q", r.value("listedOlder.INBOX"), r.value("olderCursor.INBOX"))
+	}
+}
