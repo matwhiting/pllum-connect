@@ -2,6 +2,7 @@ package network
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -48,6 +49,7 @@ type queue struct {
 	blocked  wire.Kind
 	chats    []string // the chats Next pages, first not passed over first
 	took     time.Duration
+	blind    bool   // Next pages without the queue's context: no request is counted
 	script   []Step // what each call returns (Chat filled in when empty); then StepMoved
 	calls    []asked
 	busy     int
@@ -120,13 +122,16 @@ func (q *queue) next(ctx context.Context, passed func(chat string) bool) Step {
 		step.Chat = a.chat
 	}
 	a.chat = step.Chat
-	took, onNext := q.took, q.onNext
+	took, onNext, blind := q.took, q.onNext, q.blind
 	q.mu.Unlock()
 
 	// One request through the network's request, as a real step makes,
 	// unless the step never reached it (nothing to page, no connection).
 	k := wire.KindOf(step.Err)
 	if step.Outcome != StepNothing && k != wire.NotConnected && k != wire.Offline {
+		if blind {
+			ctx = context.Background()
+		}
 		end := q.traffic.Begin(ctx, q.clock.Now())
 		q.clock.Advance(took)
 		end(q.clock.Now())
@@ -662,5 +667,159 @@ func TestBacklogWritesADayLineWhenItAskedNothing(t *testing.T) {
 	lines := q.dayLines()
 	if len(lines) != 1 || !strings.HasSuffix(lines[0], "history queue on "+day1+": pages 0, chats finished 0, chats left 7, minutes running 0, paused no, stopped no") {
 		t.Fatalf("lines %q, want one for %s with nothing asked", lines, day1)
+	}
+}
+
+func TestBacklogHoldsADayAfterPushbackItDidNotSee(t *testing.T) {
+	// Pushed back with no Run (the run had ended, as a LinkedIn pause ends
+	// it): kept at once, and the next Run waits it out.
+	q := newQueue(t)
+	q.b.PushedBack(wire.RateLimited)
+	until, kind := q.keptHold()
+	if !until.Equal(queueStart.Add(BacklogHold)) || kind != wire.RateLimited {
+		t.Fatalf("hq.hold is %v %s, want a day from now, rateLimited", until, kind)
+	}
+	q.run(48*time.Hour, 1)
+	if calls := q.asked(); len(calls) != 1 || !calls[0].at.Equal(until.Add(BacklogMinGap)) {
+		t.Fatalf("calls %v, want the first %v after the hold", calls, BacklogMinGap)
+	}
+
+	// A relaunch inside it waits too.
+	q = newQueue(t)
+	q.b.PushedBack(wire.Checkpoint)
+	q.relaunch()
+	q.run(48*time.Hour, 1)
+	if calls := q.asked(); len(calls) != 1 || calls[0].at.Before(queueStart.Add(BacklogHold)) {
+		t.Fatalf("after a relaunch calls %v, want none inside the hold", calls)
+	}
+
+	// Pushed back while the queue sleeps out a hold: the hold runs a day
+	// from the new pushback.
+	q = newQueue(t)
+	q.script = []Step{{Outcome: StepPassed, Err: errOf(wire.RateLimited)}}
+	again := queueStart.Add(23 * time.Hour)
+	q.clock.AfterFunc(23*time.Hour, func() { q.b.PushedBack(wire.Checkpoint) })
+	q.run(72*time.Hour, 2)
+	calls := q.asked()
+	if len(calls) != 2 || calls[1].at.Before(again.Add(BacklogHold)) {
+		t.Fatalf("calls %v, want the second a day after the later pushback", calls)
+	}
+	if until, kind := q.keptHold(); !until.Equal(again.Add(BacklogHold)) || kind != wire.Checkpoint {
+		t.Errorf("hq.hold is %v %s, want %v checkpoint", until, kind, again.Add(BacklogHold))
+	}
+}
+
+func TestBacklogStopsWhenAPushbackCannotBeKept(t *testing.T) {
+	q := newQueue(t)
+	q.b.Values.Get("hq.hold")
+	q.st.Close()
+	q.b.PushedBack(wire.RateLimited)
+	if q.b.stopped != wire.Internal {
+		t.Fatalf("a pushback that could not be kept left the queue %q, want stopped internal", q.b.stopped)
+	}
+	q.run(7*24*time.Hour, 0)
+	if n := len(q.asked()); n != 0 || q.b.stopped != wire.Internal {
+		t.Fatalf("%d calls, stopped %q; want none, stopped internal", n, q.b.stopped)
+	}
+}
+
+func TestBacklogStopsWhenItCannotKeepItsDay(t *testing.T) {
+	q := newQueue(t)
+	q.onNext = func(_ context.Context, n int) {
+		if n == 1 {
+			q.st.Close()
+		}
+	}
+	q.run(7*24*time.Hour, 0)
+	if n := len(q.asked()); n != 1 || q.b.stopped != wire.Internal {
+		t.Fatalf("%d calls, stopped %q; want 1, stopped internal", n, q.b.stopped)
+	}
+}
+
+func TestBacklogStopsWhenAStepWasNotCounted(t *testing.T) {
+	for _, out := range []StepOutcome{StepMoved, StepStart} {
+		q := newQueue(t)
+		q.blind = true
+		q.script = []Step{{Outcome: out}}
+		q.run(7*24*time.Hour, 0)
+		if n := len(q.asked()); n != 1 || q.b.stopped != wire.Internal {
+			t.Fatalf("outcome %d with no request counted: %d calls, stopped %q; want 1, internal", out, n, q.b.stopped)
+		}
+	}
+}
+
+func TestBacklogStopsOnAnErrorWithNoKind(t *testing.T) {
+	q := newQueue(t)
+	q.b.Kind = func(error) wire.Kind { return "" }
+	q.script = []Step{{Outcome: StepPassed, Err: errors.New("invented failure")}}
+	q.run(7*24*time.Hour, 0)
+	if n := len(q.asked()); n != 1 || q.b.stopped != wire.Internal {
+		t.Fatalf("%d calls, stopped %q; want 1, internal", n, q.b.stopped)
+	}
+}
+
+func TestBacklogWaitsForTheRunBeforeIt(t *testing.T) {
+	q := newQueue(t)
+	entered, release := make(chan struct{}), make(chan struct{})
+	q.onNext = func(_ context.Context, n int) {
+		if n == 1 {
+			close(entered)
+			<-release
+		}
+	}
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	first := make(chan struct{})
+	go func() {
+		defer close(first)
+		q.b.Run(ctx1)
+	}()
+	<-entered
+	cancel1() // the run ends while its step is still out
+
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	defer cancel2()
+	q.set(func() { q.stopAt, q.stopping, q.cancel = 2, false, cancel2 })
+	second := make(chan struct{})
+	go func() {
+		defer close(second)
+		q.b.Run(ctx2)
+	}()
+	time.Sleep(20 * time.Millisecond)
+	close(release)
+	for _, done := range []chan struct{}{first, second} {
+		select {
+		case <-done:
+		case <-time.After(time.Minute):
+			t.Fatalf("a Run did not return")
+		}
+	}
+	if n := len(q.asked()); n != 2 {
+		t.Fatalf("%d calls, want the next run to go on once the one before it returned", n)
+	}
+}
+
+func TestBacklogKeepsCountingWhenTheDateGoesBack(t *testing.T) {
+	q := newQueue(t)
+	if err := q.st.PutNetworkValue("instagram", "hq.day", "2026-06-11\n5\n0\n3\n\n"); err != nil {
+		t.Fatal(err)
+	}
+	q.run(time.Hour, 1)
+	if q.b.today.date != "2026-06-11" || q.b.today.pages != 6 {
+		t.Errorf("the day is %s with %d pages, want 2026-06-11 with 6", q.b.today.date, q.b.today.pages)
+	}
+	if lines := q.dayLines(); len(lines) != 0 {
+		t.Errorf("lines %q, want none", lines)
+	}
+}
+
+func TestBacklogHoldsNoMoreThanADay(t *testing.T) {
+	q := newQueue(t)
+	far := queueStart.Add(30 * 24 * time.Hour).UnixMilli()
+	if err := q.st.PutNetworkValue("instagram", "hq.hold", strconv.FormatInt(far, 10)+"\nrateLimited"); err != nil {
+		t.Fatal(err)
+	}
+	q.run(48*time.Hour, 1)
+	if calls := q.asked(); len(calls) != 1 || !calls[0].at.Equal(queueStart.Add(BacklogHold+BacklogMinGap)) {
+		t.Fatalf("calls %v, want one a day and %v on", calls, BacklogMinGap)
 	}
 }

@@ -7,7 +7,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/matwhiting/pllum-connect/internal/diag"
@@ -62,7 +61,9 @@ const (
 // paging and keeps each chat's progress.
 //
 // A network makes one Backlog for the helper's life and calls Run once per
-// run. Fill in the fields before the first Run; Rand may be nil.
+// run, and PushedBack whenever the network is pushed back (a rate limit, a
+// pause, a checkpoint, an ended session), whether or not Run is running.
+// Fill in the fields before the first Run or PushedBack; Rand may be nil.
 type Backlog struct {
 	Name    string // the network, for the diagnostics file
 	Dir     string // the data folder (diag.For)
@@ -81,16 +82,17 @@ type Backlog struct {
 	Next func(ctx context.Context, passed func(chat string) bool) Step
 	Left func() (int, bool) // chats whose history is open, for the day line
 
-	running atomic.Bool
+	turnOnce sync.Once
+	turn     chan struct{} // held by the Run running: one at a time
 
-	mu      sync.Mutex
-	yieldAt time.Time       // the last older read
-	passed  map[string]bool // chats passed over, until no chat has more
+	mu        sync.Mutex
+	yieldAt   time.Time       // the last older read
+	passed    map[string]bool // chats passed over, until no chat has more
+	holdUntil time.Time       // no request before this (a pushback's day)
+	holdKind  wire.Kind
+	stopped   wire.Kind // why it stopped for the helper's life; "" while it goes
 
 	// The rest is Run's alone: one Run at a time touches it.
-	holdUntil  time.Time // no request before this (a pushback's day)
-	holdKind   wire.Kind
-	stopped    wire.Kind // why it stopped for the helper's life; "" while it goes
 	stalls     int       // chats passed over with an error, in a row
 	emptyUntil time.Time // no chat had more: it looks again then
 	today      queueDay
@@ -106,16 +108,20 @@ type queueDay struct {
 	paused, stopped wire.Kind
 }
 
-// Run runs the queue until ctx ends: one call per network run. A second
-// Run while one runs returns at once.
+// Run runs the queue until ctx ends: one call per network run. A Run that
+// starts while the one before it is still returning (its step still out)
+// waits for it.
 func (b *Backlog) Run(ctx context.Context) {
 	if b.Clock == nil || b.Values == nil || b.Traffic == nil || b.Next == nil {
 		return
 	}
-	if !b.running.CompareAndSwap(false, true) {
+	b.turnOnce.Do(func() { b.turn = make(chan struct{}, 1) })
+	select {
+	case b.turn <- struct{}{}:
+	case <-ctx.Done():
 		return
 	}
-	defer b.running.Store(false)
+	defer func() { <-b.turn }()
 
 	now := b.Clock.Now()
 	b.since = time.Time{}
@@ -175,8 +181,26 @@ func (b *Backlog) Yield() {
 	}
 }
 
+// PushedBack is any pushback on the network (kind is why: a rate limit,
+// a pause, a checkpoint, an ended session): the queue asks nothing for
+// BacklogHold. The hold is kept at once, in memory and in the network's
+// values, so it holds whether or not Run is running, and across a
+// relaunch. A hold that can't be kept stops the queue for the helper's
+// life.
+func (b *Backlog) PushedBack(kind wire.Kind) {
+	clock := b.Clock
+	if clock == nil {
+		clock = RealClock{}
+	}
+	if kind == "" {
+		kind = wire.Internal
+	}
+	b.hold(clock.Now(), kind)
+}
+
 // begin takes up a hold kept by this or an earlier helper, before the
-// run's first request.
+// run's first request. A kept end more than BacklogHold ahead (a clock set
+// back) holds BacklogHold from now.
 func (b *Backlog) begin(now time.Time) {
 	v, err := b.Values.Lookup(holdKey)
 	if err != nil {
@@ -193,29 +217,48 @@ func (b *Backlog) begin(now time.Time) {
 		b.hold(now, wire.Internal)
 		return
 	}
-	if until := time.UnixMilli(n); until.After(b.holdUntil) {
+	until := time.UnixMilli(n)
+	if most := now.Add(BacklogHold); until.After(most) {
+		until = most
+	}
+	b.mu.Lock()
+	if until.After(b.holdUntil) {
 		b.holdUntil, b.holdKind = until, wire.Kind(kind)
 	}
-	if now.Before(b.holdUntil) && b.today.paused == "" {
-		b.today.paused = b.holdKind
+	b.mu.Unlock()
+}
+
+// state is the hold in force and the stop, as PushedBack may have changed
+// them; today's counts are marked with them.
+func (b *Backlog) state(now time.Time) (holdUntil time.Time, stopped wire.Kind) {
+	b.mu.Lock()
+	holdUntil, kind, stopped := b.holdUntil, b.holdKind, b.stopped
+	b.mu.Unlock()
+	if now.Before(holdUntil) && b.today.paused == "" {
+		b.today.paused = kind
 	}
+	if stopped != "" && b.today.stopped == "" {
+		b.today.stopped = stopped
+	}
+	return holdUntil, stopped
 }
 
 // mayAsk reports whether the queue may ask now, and if not, how long to
 // wait before it looks again. A block on the network keeps a hold.
 func (b *Backlog) mayAsk(now time.Time) (wait time.Duration, ok bool) {
+	holdUntil, stopped := b.state(now)
 	switch {
-	case b.stopped != "":
+	case stopped != "":
 		return BacklogHold, false
-	case now.Before(b.holdUntil):
-		return b.holdUntil.Sub(now), false
+	case now.Before(holdUntil):
+		return holdUntil.Sub(now), false
 	case b.today.pages >= BacklogDayCap:
 		return BacklogHold, false // until the local midnight (sleep)
 	}
 	if b.Blocked != nil {
 		if kind, blocked := b.Blocked(); blocked {
 			b.hold(now, kind)
-			return b.holdUntil.Sub(now), false
+			return b.mayAsk(now)
 		}
 	}
 	if b.Live == nil || !b.Live() || b.Ready == nil || !b.Ready() {
@@ -253,16 +296,26 @@ func (b *Backlog) step(ctx context.Context) {
 	b.roll(now)
 	b.today.pages += int(n)
 	defer b.keepDay()
+	defer b.state(now)
 	if n > 1 {
 		// A step makes one request at most: this one is a bug, and
 		// may be a burst.
 		b.stop(wire.Internal)
 		return
 	}
+	if n == 0 && s.Err == nil && (s.Outcome == StepMoved || s.Outcome == StepStart) {
+		// A page came back and no queue request was counted: Next asked
+		// outside the queue's context, so the counts, the cap, the guard
+		// above and the network's quiet are all blind.
+		b.stop(wire.Internal)
+		return
+	}
 
 	var kind wire.Kind
 	if s.Err != nil {
-		kind = b.kindOf(s.Err)
+		if kind = b.kindOf(s.Err); kind == "" {
+			kind = wire.Internal
+		}
 	}
 	if kind == wire.RateLimited || kind == wire.Checkpoint {
 		b.hold(now, kind)
@@ -309,29 +362,39 @@ func (b *Backlog) step(ctx context.Context) {
 
 // hold keeps the queue from asking for BacklogHold from now, in memory and
 // in the network's values (so a relaunch keeps it too).
+// Safe from any goroutine: today's counts are marked by Run (state).
 func (b *Backlog) hold(now time.Time, kind wire.Kind) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	if until := now.Add(BacklogHold); until.After(b.holdUntil) {
 		b.holdUntil = until
 	}
 	b.holdKind = kind
-	if b.today.paused == "" {
-		b.today.paused = kind
+	if b.Values == nil {
+		b.stopLocked(wire.Internal)
+		return
 	}
 	v := strconv.FormatInt(b.holdUntil.UnixMilli(), 10) + "\n" + string(kind)
 	if err := b.Values.Keep(holdKey, v); err != nil {
 		// A hold a relaunch would not see: stop for this helper's life
 		// as well.
-		b.stop(wire.Internal)
+		b.stopLocked(wire.Internal)
 	}
 }
 
-// stop stops the queue for the helper's life.
+// stop stops the queue for the helper's life (Run's: it marks today too).
 func (b *Backlog) stop(kind wire.Kind) {
-	if b.stopped == "" {
-		b.stopped = kind
-	}
+	b.mu.Lock()
+	b.stopLocked(kind)
+	b.mu.Unlock()
 	if b.today.stopped == "" {
 		b.today.stopped = kind
+	}
+}
+
+func (b *Backlog) stopLocked(kind wire.Kind) {
+	if b.stopped == "" {
+		b.stopped = kind
 	}
 }
 
@@ -341,26 +404,26 @@ func (b *Backlog) stop(kind wire.Kind) {
 // is written. A day the helper never ran has no line.
 func (b *Backlog) roll(now time.Time) {
 	date := now.Local().Format(time.DateOnly)
-	if b.today.date == date {
+	if b.today.date == date || (b.today.date != "" && date < b.today.date) {
+		// A date that went back (the clock, or the zone) goes on counting
+		// in the later day, so the cap never starts over.
 		return
 	}
 	prev := b.today
 	if prev.date == "" {
 		if kept, ok := b.keptDay(); ok {
-			if kept.date == date {
+			if kept.date >= date {
 				b.today = kept
 				return
 			}
 			prev = kept
 		}
 	}
-	if prev.date != "" && prev.date < date {
+	if prev.date != "" {
 		b.writeLine(now, prev)
 	}
-	b.today = queueDay{date: date, stopped: b.stopped}
-	if now.Before(b.holdUntil) {
-		b.today.paused = b.holdKind
-	}
+	b.today = queueDay{date: date}
+	b.state(now)
 }
 
 // account counts the time since b.since, while it was allowed to ask, in
@@ -390,12 +453,16 @@ func (b *Backlog) writeLine(now time.Time, d queueDay) {
 		int(d.running/time.Minute), yesKind(d.paused), yesKind(d.stopped)))
 }
 
-// keepDay keeps today's counts (written only when they change).
+// keepDay keeps today's counts (written only when they change). Counts
+// that can't be kept stop the queue: a relaunch would start the day cap
+// over.
 func (b *Backlog) keepDay() {
 	d := b.today
 	v := strings.Join([]string{d.date, strconv.Itoa(d.pages), strconv.Itoa(d.finished),
 		strconv.Itoa(int(d.running / time.Minute)), string(d.paused), string(d.stopped)}, "\n")
-	_ = b.Values.Keep(dayKey, v)
+	if err := b.Values.Keep(dayKey, v); err != nil {
+		b.stop(wire.Internal)
+	}
 }
 
 // keptDay is the day kept in dayKey; ok is false when none can be read.
