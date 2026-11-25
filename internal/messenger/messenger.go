@@ -208,6 +208,7 @@ type Messenger struct {
 	memo     runMemo
 	values   *network.Values // the network's own store values, as read or written
 	changes  network.Changed // the changed events (backfill.go)
+	traffic  network.Traffic // the requests that reach Meta, for the history queue
 	sends    sends
 
 	// the media folder every network shares (media.go)

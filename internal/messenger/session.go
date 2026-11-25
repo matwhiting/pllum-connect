@@ -19,8 +19,11 @@ import (
 // caller that expects an answer Meta gives as an error (no backup, a wrong
 // PIN) catches it inside fn and returns nil: Meta answered.
 func (m *Messenger) request(ctx context.Context, gen int, fn func(ctx context.Context) error) error {
-	return m.sess.Request(ctx, func() bool { return m.current(gen) }, fn,
-		func() { m.checkSession(gen) }, func(kind wire.Kind) { m.pushedBack(gen, kind) })
+	return m.sess.Request(ctx, func() bool { return m.current(gen) }, func(ctx context.Context) error {
+		end := m.traffic.Begin(ctx, m.clock.Now())
+		defer func() { end(m.clock.Now()) }()
+		return fn(ctx)
+	}, func() { m.checkSession(gen) }, func(kind wire.Kind) { m.pushedBack(gen, kind) })
 }
 
 // blocked is the error for a request now, when the pace forbids one.

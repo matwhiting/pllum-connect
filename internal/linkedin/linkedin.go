@@ -184,6 +184,7 @@ type LinkedIn struct {
 	nextBg time.Time // the earliest the next background request may go
 
 	changes network.Changed
+	traffic network.Traffic // the requests that reach LinkedIn, for the history queue
 
 	// The sends in line (writes.go): one goroutine sends them, in order.
 	outbox network.Outbox
@@ -760,7 +761,9 @@ func (l *LinkedIn) request(ctx context.Context, gen int, background bool, fn fun
 			return err
 		}
 	}
+	end := l.traffic.Begin(ctx, l.clock.Now())
 	err := fn(ctx)
+	end(l.clock.Now())
 	if err == nil {
 		l.afterSuccess(gen)
 		return nil

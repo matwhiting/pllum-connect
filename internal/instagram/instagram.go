@@ -122,6 +122,7 @@ type Instagram struct {
 	work        sync.WaitGroup
 	busy        atomic.Int32 // sign-ins, inbox reloads and sends still running
 	changes     network.Changed
+	traffic     network.Traffic // the requests that reach Meta, for the history queue
 
 	values *network.Values // the network's own store values, as read or written
 
@@ -548,8 +549,11 @@ func (g *Instagram) signInFailed(gen int, kind wire.Kind) {
 // may carry rotated cookies to Pllum; Meta pushing back blocks the pace
 // and, for a checkpoint, an ended session or a suspension, ends the run.
 func (g *Instagram) request(ctx context.Context, gen int, fn func(ctx context.Context) error) error {
-	return g.sess.Request(ctx, func() bool { return g.current(gen) }, fn,
-		func() { g.checkSession(gen) }, func(kind wire.Kind) { g.pushedBack(gen, kind) })
+	return g.sess.Request(ctx, func() bool { return g.current(gen) }, func(ctx context.Context) error {
+		end := g.traffic.Begin(ctx, g.clock.Now())
+		defer func() { end(g.clock.Now()) }()
+		return fn(ctx)
+	}, func() { g.checkSession(gen) }, func(kind wire.Kind) { g.pushedBack(gen, kind) })
 }
 
 // gate is the error for a request now, when the pace forbids one.
