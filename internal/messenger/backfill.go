@@ -357,7 +357,7 @@ func (m *Messenger) backfill(ctx context.Context, gen int, cli msgrClient) {
 		}
 		n, _ := strconv.Atoi(m.value("bf." + chat))
 		for n < threadHistoryPages {
-			_, out, err := m.fetchPage(ctx, gen, cli, chat, key)
+			_, out, _, err := m.fetchPage(ctx, gen, cli, chat, key)
 			if err != nil {
 				if k := kindOf(err); !m.current(gen) || k != wire.Internal && k != wire.Timeout {
 					return // carried on at the next sign-in
@@ -427,28 +427,37 @@ func (m *Messenger) FetchOlder(ctx context.Context, chatID string) (int, error) 
 	ctx2, cancel := context.WithCancel(runCtx)
 	defer cancel()
 	defer context.AfterFunc(ctx, cancel)()
+	added, _, _, err := m.olderStep(ctx2, gen, cli, chat, true)
+	return added, err
+}
+
+// olderStep pages one chat once: its backup while the backup has more,
+// else its unencrypted thread. onDemand spends FetchOlder's day's pages
+// for a backup page; the queue passes false. asked reports whether a
+// request reached Meta.
+func (m *Messenger) olderStep(ctx context.Context, gen int, cli msgrClient, chat string, onDemand bool) (added int, out pageOutcome, asked bool, err error) {
 	if m.encPaging(chat) {
 		m.mu.Lock()
 		fbid := m.fbid
 		m.mu.Unlock()
-		if !m.onDemand() {
-			return 0, nil // the day's pages are spent (review M10)
+		if onDemand && !m.onDemand() {
+			return 0, pageHeld, false, nil // the day's pages are spent (review M10)
 		}
-		added, _, asked, err := m.fetchEncPage(ctx2, gen, cli, fbid, chat)
-		if !asked {
+		added, out, asked, err = m.fetchEncPage(ctx, gen, cli, fbid, chat)
+		if onDemand && !asked {
 			m.giveOnDemand()
 		}
-		return added, err
+		return added, out, asked, err
 	}
 	key, ok := m.threadOfChat(chat)
 	if !ok {
-		return 0, nil
+		return 0, pageHeld, false, nil
 	}
-	added, _, err := m.fetchPage(ctx2, gen, cli, chat, key)
+	added, out, asked, err = m.fetchPage(ctx, gen, cli, chat, key)
 	if added > 0 {
 		m.changed()
 	}
-	return added, err
+	return added, out, asked, err
 }
 
 // What one page of history did.
@@ -462,23 +471,24 @@ const (
 )
 
 // fetchPage fetches one page of a thread's history older than the chat's
-// cursor (else its oldest line of the thread held) and stores it.
-func (m *Messenger) fetchPage(ctx context.Context, gen int, cli msgrClient, chat string, key int64) (added int, out pageOutcome, err error) {
+// cursor (else its oldest line of the thread held) and stores it. asked
+// reports whether the request reached Meta.
+func (m *Messenger) fetchPage(ctx context.Context, gen int, cli msgrClient, chat string, key int64) (added int, out pageOutcome, asked bool, err error) {
 	if m.encryptedEnded() {
-		return 0, pageHeld, errNotConnected
+		return 0, pageHeld, false, errNotConnected
 	}
 	lock := m.chatLock(chat)
 	lock.Lock()
 	defer lock.Unlock()
 	if m.value("olderDone."+chat) != "" || m.held(chat) {
-		return 0, pageHeld, nil
+		return 0, pageHeld, false, nil
 	}
 	ms, id, ok := m.cursorOf(chat)
 	if !ok {
 		// As the library's connector: anchor on the oldest line held, or
 		// ask nothing (review I1).
 		if ms, id, ok = m.st.OldestLine(Name, chat, metaLinePrefix); !ok {
-			return 0, pageHeld, nil
+			return 0, pageHeld, false, nil
 		}
 	}
 	task := &socket.FetchMessagesTask{ThreadKey: key, ReferenceTimestampMs: ms, ReferenceMessageId: id, SyncGroup: 1}
@@ -486,6 +496,7 @@ func (m *Messenger) fetchPage(ctx context.Context, gen int, cli msgrClient, chat
 	defer m.unawait(key, ch)
 	var resp *table.LSTable
 	err = m.request(ctx, gen, func(ctx context.Context) (err error) {
+		asked = true
 		task.Cursor = cli.GetCursor(1)
 		resp, err = cli.ExecuteTasks(ctx, task)
 		return err
@@ -499,19 +510,19 @@ func (m *Messenger) fetchPage(ctx context.Context, gen int, cli msgrClient, chat
 		if k := kindOf(err); ctx.Err() == nil && (k == wire.Internal || k == wire.Timeout) {
 			m.stall(chat)
 		}
-		return 0, pageHeld, err
+		return 0, pageHeld, asked, err
 	}
 	if !m.safeIngest(resp) {
 		m.stall(chat)
-		return 0, pageStall, errInternal
+		return 0, pageStall, true, errInternal
 	}
 	note, got := m.wait(ctx, ch)
 	switch {
 	case !got && ctx.Err() != nil:
-		return 0, pageHeld, errNotConnected
+		return 0, pageHeld, true, errNotConnected
 	case !got:
 		m.stall(chat)
-		return 0, pageStall, &wire.Error{Kind: wire.Timeout}
+		return 0, pageStall, true, &wire.Error{Kind: wire.Timeout}
 	case note.existing:
 		// The library's connector ends its fetch on an existing range
 		// either way: the start of the history when it gave no lines or
@@ -519,20 +530,20 @@ func (m *Messenger) fetchPage(ctx context.Context, gen int, cli msgrClient, chat
 		// another reference is not this page's answer (review M2).
 		if note.ts == ms && (note.lines == 0 || note.b2 && !note.b3) {
 			m.olderDone(chat)
-			return note.added, pageDone, nil
+			return note.added, pageDone, true, nil
 		}
 		m.stall(chat)
-		return note.added, pageStall, nil
+		return note.added, pageStall, true, nil
 	case !note.more:
 		m.olderDone(chat)
-		return note.added, pageDone, nil
+		return note.added, pageDone, true, nil
 	case note.minMs <= 0 || note.minMs >= ms:
 		// It moved only if it reached back past what is held, as the
 		// cursor moves (review N2).
 		m.stall(chat)
-		return note.added, pageStall, nil
+		return note.added, pageStall, true, nil
 	}
-	return note.added, pageMoved, nil
+	return note.added, pageMoved, true, nil
 }
 
 // safeIngest ingests a page's answer, and reports false when ingesting it
