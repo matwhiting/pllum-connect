@@ -994,3 +994,39 @@ func TestBacklogGoesOnWhenAListStepFinishesTheListing(t *testing.T) {
 		t.Errorf("after the listing was finished the next step came %v later, want the gap", calls[2].at.Sub(calls[1].end))
 	}
 }
+
+// Only an empty queue waits: a list step that asks nothing in its 1-in-5
+// slot yields to the chat steps after the gap; one that asks nothing when
+// no chat had more waits BacklogEmpty.
+func TestOnlyAnEmptyQueueWaitsTenMinutes(t *testing.T) {
+	q := newQueue(t)
+	q.chats = []string{"c1", "c2", "c3", "c4", "c5", "c6", "c7", "c8"}
+	q.script = []Step{{Outcome: StepMoved}, {Outcome: StepMoved}, {Outcome: StepMoved}, {Outcome: StepMoved}, {Outcome: StepMoved},
+		{Outcome: StepNothing}}
+	q.b.List = func(ctx context.Context) Step {
+		q.mu.Lock()
+		q.calls = append(q.calls, asked{at: q.clock.Now(), end: q.clock.Now(), chat: "list"})
+		if q.stopAt > 0 && len(q.calls) >= q.stopAt {
+			q.stopping = true
+		}
+		q.mu.Unlock()
+		return Step{Outcome: StepPassed} // no place to go on from yet
+	}
+	q.b.Listed = func() bool { return false }
+	q.run(2*time.Hour, 9)
+	calls := q.asked()
+	if len(calls) != 9 {
+		t.Fatalf("%d calls", len(calls))
+	}
+	// 5 chat steps, a list step in its slot, a chat step after the gap
+	// (nothing left), a list step at once (due), then the empty wait.
+	if calls[5].chat != "list" || calls[6].chat == "list" || calls[7].chat != "list" {
+		t.Fatalf("steps %v", calls)
+	}
+	if d := calls[6].at.Sub(calls[5].end); d >= BacklogEmpty {
+		t.Errorf("after a list step in its slot asked nothing the next step came %v later, want the gap", d)
+	}
+	if d := calls[8].at.Sub(calls[7].end); d < BacklogEmpty {
+		t.Errorf("after nothing was left and the listing asked nothing the next step came %v later, want %v", d, BacklogEmpty)
+	}
+}

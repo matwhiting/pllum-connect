@@ -328,6 +328,7 @@ func (b *Backlog) step(ctx context.Context) {
 	listing := b.List != nil && b.Listed != nil && !b.Listed()
 	var s Step
 	listStep := listing && (b.listDue || b.chatSteps >= BacklogListEvery)
+	empty := listStep && b.listDue // no chat had more: this list step is all there is to do
 	if listStep {
 		b.chatSteps, b.listDue = 0, false
 		s = b.List(WithBacklog(ctx))
@@ -346,9 +347,11 @@ func (b *Backlog) step(ctx context.Context) {
 	}
 	now := b.Clock.Now()
 	n := b.Traffic.BacklogAsked() - before
-	if listStep && n == 0 && s.Err == nil && s.Outcome == StepPassed && !b.Listed() {
-		// The listing could ask nothing now either (it has no place to go
-		// on from yet, and is not done): wait as when no chat has more.
+	if empty && n == 0 && s.Err == nil && s.Outcome == StepPassed && !b.Listed() {
+		// No chat had more, and the listing could ask nothing either (it
+		// has no place to go on from yet, and is not done): the queue is
+		// empty, and waits as when no chat has more. A list step that asks
+		// nothing in its 1-in-BacklogListEvery slot only yields its turn.
 		s.Outcome = StepNothing
 	}
 	b.account(now)
