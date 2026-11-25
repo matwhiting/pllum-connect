@@ -782,3 +782,41 @@ func TestADroppedTokensGapIsListedBack(t *testing.T) {
 		}
 	}
 }
+
+// histDone says why the worker stopped paging a chat: past 730 days
+// (reach), LinkedIn's settled answer (gone), or a cursor that did not move
+// (stuck).
+func TestHistoryPagedKeepsWhyItStopped(t *testing.T) {
+	t.Run("reach", func(t *testing.T) {
+		r := newRig(t)
+		historyFeed(r, 2000)
+		r.live()
+		if got := r.value("histDone." + convURN(1)); got != histReach {
+			t.Errorf("histDone = %q, want %q", got, histReach)
+		}
+		if r.value("cursor."+convURN(1)) == "" {
+			t.Errorf("no cursor kept at the reach")
+		}
+	})
+	t.Run("gone", func(t *testing.T) {
+		r := newRig(t)
+		historyFeed(r, 400)
+		r.f.setErr("GetMessagesWithPrevCursor", statusErr(404))
+		r.live()
+		if got := r.value("histDone." + convURN(1)); got != histGone {
+			t.Errorf("histDone = %q, want %q", got, histGone)
+		}
+	})
+	t.Run("stuck", func(t *testing.T) {
+		r := newRig(t)
+		historyFeed(r, 400)
+		alice := person(aliceID, "Alice", "Invented")
+		r.f.prev = func(_, cursor string, _ int) *linkedingo.CollectionResponse[linkedingo.MessageMetadata, linkedingo.Message] {
+			return messagePage(cursor, text(1, 5900, alice, start.Add(-30*24*time.Hour), "invented stuck"))
+		}
+		r.live()
+		if got := r.value("histDone." + convURN(1)); got != histStuck {
+			t.Errorf("histDone = %q, want %q", got, histStuck)
+		}
+	})
+}

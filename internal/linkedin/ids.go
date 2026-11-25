@@ -28,7 +28,9 @@ import (
 // folders, INBOX then ARCHIVE: done, done over both folders (listedFolders,
 // "2"; an account listed before it lists them once more), or where it got
 // to, as "<folder>:<cursor>"), "cursor.<chat>" (where that chat's history goes
-// on), "histDone.<chat>" (its history reached 730 days), "fresh.<chat>"
+// on), "histDone.<chat>" (the worker stopped paging it, and why: "reach" past 730 days,
+// "gone" LinkedIn's settled answer, "stuck" a cursor that did not move; an
+// older store's "1" is done too), "fresh.<chat>"
 // (what came in it is still to fetch), "pause" (the back-off) and "block"
 // (the session LinkedIn ended, by its hash). His Disconnect forgets all but
 // the pause (forgetAccount).

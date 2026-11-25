@@ -609,7 +609,7 @@ func (l *LinkedIn) catchUpChat(ctx context.Context, gen int, cli liClient, conv 
 	l.changed()
 	if !had {
 		if l.value("cursor."+chat) == "" {
-			l.historyPaged(chat, "", page)
+			l.historyPaged(chat, "", page, true)
 		}
 		return nil
 	}
@@ -634,13 +634,40 @@ func (l *LinkedIn) catchUpChat(ctx context.Context, gen int, cli liClient, conv 
 }
 
 // historyStep pages the history of the newest chat that has more to page,
-// by one page: back from the cursor kept for it, or from its oldest line (or
-// now) when none is kept. did is false when no chat has more.
+// by one page (pageHistory, stopping at historyReach). did is false when no
+// chat has more.
 func (l *LinkedIn) historyStep(ctx context.Context, gen int, cli liClient) (did bool, err error) {
 	chat, ok := l.nextHistoryChat()
 	if !ok {
 		return false, nil
 	}
+	_, err = l.pageHistory(ctx, gen, cli, chat, true)
+	return true, err
+}
+
+// What one page of a chat's history did.
+type pageOutcome int
+
+const (
+	pageMoved  pageOutcome = iota // it reached further back
+	pageDone                      // the chat's start: historyComplete
+	pageReach                     // past historyReach: the worker stops there ("reach")
+	pageGone                      // LinkedIn says there is nothing to page there ("gone")
+	pageStuck                     // the cursor did not move ("stuck")
+	pageFailed                    // a passing failure, or the store lost the page: err says which
+)
+
+// The reasons histDone.<chat> keeps for a chat the worker no longer pages.
+// An older store's "1" still means done to the worker.
+const (
+	histReach = "reach" // past 730 days, its cursor kept
+	histGone  = "gone"  // LinkedIn's settled answer
+	histStuck = "stuck" // the cursor did not move
+)
+
+// pageHistory pages one chat's history by one page, back from its kept
+// cursor (or its oldest line, or now). reach stops it at historyReach.
+func (l *LinkedIn) pageHistory(ctx context.Context, gen int, cli liClient, chat string, reach bool) (out pageOutcome, err error) {
 	conv := linkedingo.NewURN(chat)
 	cursor := l.value("cursor." + chat)
 	var page *linkedingo.CollectionResponse[linkedingo.MessageMetadata, linkedingo.Message]
@@ -664,13 +691,13 @@ func (l *LinkedIn) historyStep(ctx context.Context, gen int, cli liClient) (did 
 			// LinkedIn says there is nothing to page there: the chat is
 			// passed over for good, not asked again and again.
 			l.answered(chat)
-			_ = l.keep("histDone."+chat, "1")
-			return true, nil
+			_ = l.keep("histDone."+chat, histGone)
+			return pageGone, nil
 		}
 		// A passing failure settles nothing: the chat is set aside, for
 		// longer each time in a row (pass).
 		l.pass(gen, chat)
-		return true, err
+		return pageFailed, err
 	}
 	l.answered(chat)
 	if _, err := l.storeMessages(page.Elements, store.SourceSync); err != nil {
@@ -678,35 +705,41 @@ func (l *LinkedIn) historyStep(ctx context.Context, gen int, cli liClient) (did 
 		// is asked again, after the chat's turn aside, as for a passing
 		// failure.
 		l.pass(gen, chat)
-		return true, err
+		return pageFailed, err
 	}
 	l.changed()
-	l.historyPaged(chat, cursor, page)
-	return true, nil
+	return l.historyPaged(chat, cursor, page, reach), nil
 }
 
 // historyPaged keeps where a chat's history goes on after page (asked from
 // cursor): a page with nothing before it is the chat's start (it is
-// historyComplete), and one reaching past 730 days ends its paging.
-func (l *LinkedIn) historyPaged(chat, cursor string, page *linkedingo.CollectionResponse[linkedingo.MessageMetadata, linkedingo.Message]) {
+// historyComplete); one whose cursor did not move is stuck; with reach, one
+// reaching past 730 days ends the worker's paging.
+func (l *LinkedIn) historyPaged(chat, cursor string, page *linkedingo.CollectionResponse[linkedingo.MessageMetadata, linkedingo.Message], reach bool) pageOutcome {
 	if page == nil || len(page.Elements) == 0 || page.Metadata.PrevCursor == "" {
 		complete := true
 		_ = l.st.PutChat(Name, store.ChatInfo{ID: chat, HistoryComplete: &complete})
 		_ = l.keep("cursor."+chat, "")
 		l.changed()
-		return
+		return pageDone
 	}
 	prev := page.Metadata.PrevCursor
 	_ = l.keep("cursor."+chat, prev)
+	if prev == cursor {
+		_ = l.keep("histDone."+chat, histStuck)
+		return pageStuck
+	}
 	oldest := time.Time{}
 	for _, m := range page.Elements {
 		if at := m.DeliveredAt.Time; !at.IsZero() && (oldest.IsZero() || at.Before(oldest)) {
 			oldest = at
 		}
 	}
-	if prev == cursor || !oldest.IsZero() && oldest.Before(l.clock.Now().Add(-historyReach)) {
-		_ = l.keep("histDone."+chat, "1")
+	if reach && !oldest.IsZero() && oldest.Before(l.clock.Now().Add(-historyReach)) {
+		_ = l.keep("histDone."+chat, histReach)
+		return pageReach
 	}
+	return pageMoved
 }
 
 // nextHistoryChat is the newest LinkedIn conversation whose history has more
