@@ -105,8 +105,8 @@ func TestAStoreFromSchemaTenGainsHandles(t *testing.T) {
 	}
 	defer s.Close()
 	var version string
-	if err := s.db.QueryRow(`SELECT value FROM meta WHERE key = 'schema'`).Scan(&version); err != nil || version != "11" {
-		t.Fatalf("schema = %q, %v; want 11", version, err)
+	if err := s.db.QueryRow(`SELECT value FROM meta WHERE key = 'schema'`).Scan(&version); err != nil || version != "12" {
+		t.Fatalf("schema = %q, %v; want 12 (through 11)", version, err)
 	}
 	rows, err := s.db.Query(`SELECT handle FROM participants`)
 	if err != nil {

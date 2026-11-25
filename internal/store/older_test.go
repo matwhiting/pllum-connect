@@ -1,6 +1,7 @@
 package store
 
 import (
+	"database/sql"
 	"path/filepath"
 	"testing"
 )
@@ -82,35 +83,59 @@ func TestAnOlderPageTakingOverACopyAddsNoUnread(t *testing.T) {
 }
 
 func TestUnreadSurvivesTheUpgradeToOlderLines(t *testing.T) {
-	dir := filepath.Join(t.TempDir(), "connect")
-	s, err := Open(dir, testKey)
-	if err != nil {
-		t.Fatal(err)
-	}
-	put(t, s, text(phoneChat, "u-1", base+1000, "one"))
-	put(t, s, text(phoneChat, "u-2", base+2000, "two"))
-	// A schema-10 store: no messages.older column.
-	for _, q := range []string{
-		`ALTER TABLE messages DROP COLUMN older`,
-		`UPDATE meta SET value = '10' WHERE key = 'schema'`,
+	for _, tc := range []struct {
+		from string
+		drop []string
+	}{
+		// A schema-10 store gains participants.handle (11), then
+		// messages.older (12).
+		{"10", []string{`ALTER TABLE messages DROP COLUMN older`, `ALTER TABLE participants DROP COLUMN handle`}},
+		// A schema-11 store (participants.handle already there) gains
+		// only messages.older.
+		{"11", []string{`ALTER TABLE messages DROP COLUMN older`}},
 	} {
-		if _, err := s.db.Exec(q); err != nil {
-			t.Fatalf("%s: %v", q, err)
-		}
-	}
-	s.Close()
-	s, err = Open(dir, testKey)
-	if err != nil {
-		t.Fatalf("reopening a schema-10 store: %v", err)
-	}
-	defer s.Close()
-	if u := chatOf(t, s, phoneChat).Unread; u != 2 {
-		t.Errorf("after the upgrade unread = %d, want the 2 it had", u)
-	}
-	// And the rule holds from then on.
-	page(t, s, text(phoneChat, "u-0", base, "older"))
-	if u := chatOf(t, s, phoneChat).Unread; u != 2 {
-		t.Errorf("an older page after the upgrade made unread %d, want 2", u)
+		t.Run(tc.from, func(t *testing.T) {
+			dir := filepath.Join(t.TempDir(), "connect")
+			s, err := Open(dir, testKey)
+			if err != nil {
+				t.Fatal(err)
+			}
+			put(t, s, text(phoneChat, "u-1", base+1000, "one"))
+			put(t, s, text(phoneChat, "u-2", base+2000, "two"))
+			if err := s.PutChat(net, ChatInfo{ID: phoneChat, Participants: []Participant{{ID: otherChat, Name: "Ana", Handle: "ana.invented"}}}); err != nil {
+				t.Fatal(err)
+			}
+			for _, q := range append(tc.drop, `UPDATE meta SET value = '`+tc.from+`' WHERE key = 'schema'`) {
+				if _, err := s.db.Exec(q); err != nil {
+					t.Fatalf("%s: %v", q, err)
+				}
+			}
+			s.Close()
+			s, err = Open(dir, testKey)
+			if err != nil {
+				t.Fatalf("reopening a schema-%s store: %v", tc.from, err)
+			}
+			defer s.Close()
+			var version string
+			if err := s.db.QueryRow(`SELECT value FROM meta WHERE key = 'schema'`).Scan(&version); err != nil || version != "12" {
+				t.Fatalf("schema = %q, %v; want 12", version, err)
+			}
+			var handle sql.NullString
+			if err := s.db.QueryRow(`SELECT handle FROM participants WHERE participant_id = ?`, otherChat).Scan(&handle); err != nil {
+				t.Fatalf("participants.handle: %v", err)
+			}
+			if tc.from == "11" && handle.String != "ana.invented" {
+				t.Errorf("a schema-11 store lost its handle: %q", handle.String)
+			}
+			if u := chatOf(t, s, phoneChat).Unread; u != 2 {
+				t.Errorf("after the upgrade unread = %d, want the 2 it had", u)
+			}
+			// And the rule holds from then on.
+			page(t, s, text(phoneChat, "u-0", base, "older"))
+			if u := chatOf(t, s, phoneChat).Unread; u != 2 {
+				t.Errorf("an older page after the upgrade made unread %d, want 2", u)
+			}
+		})
 	}
 }
 
