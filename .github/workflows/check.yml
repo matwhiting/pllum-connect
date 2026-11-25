@@ -40,6 +40,9 @@ jobs:
         run: go vet ./...
       - name: Test
         run: go test -race ./...
+      # THIRD_PARTY_NOTICES lists the licences of every module in the binary; it must match the modules as they are now
+      - name: Third-party notices are current
+        run: scripts/notices.sh --check
       # pinned by version; the Go checksum database checks the module's contents
       - name: govulncheck
         run: go run golang.org/x/vuln/cmd/govulncheck@v1.10.0 ./...
