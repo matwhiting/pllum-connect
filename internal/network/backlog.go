@@ -346,9 +346,9 @@ func (b *Backlog) step(ctx context.Context) {
 	}
 	now := b.Clock.Now()
 	n := b.Traffic.BacklogAsked() - before
-	if listStep && n == 0 && s.Err == nil && s.Outcome == StepPassed {
+	if listStep && n == 0 && s.Err == nil && s.Outcome == StepPassed && !b.Listed() {
 		// The listing could ask nothing now either (it has no place to go
-		// on from yet): wait as when no chat has more.
+		// on from yet, and is not done): wait as when no chat has more.
 		s.Outcome = StepNothing
 	}
 	b.account(now)

@@ -973,3 +973,24 @@ func TestBacklogWaitsWhenNeitherChatNorListCanAsk(t *testing.T) {
 		t.Errorf("the passed-over set was kept: %v", calls[3].passed)
 	}
 }
+
+// A list step that finishes the listing without a request (nothing left
+// to list) does not wait: the next chat step comes after the gap.
+func TestBacklogGoesOnWhenAListStepFinishesTheListing(t *testing.T) {
+	q := newQueue(t)
+	q.script = []Step{{Outcome: StepNothing}}
+	listed := false
+	q.b.List = func(ctx context.Context) Step {
+		q.mu.Lock()
+		q.calls = append(q.calls, asked{at: q.clock.Now(), end: q.clock.Now(), chat: "list"})
+		listed = true
+		q.mu.Unlock()
+		return Step{Outcome: StepPassed}
+	}
+	q.b.Listed = func() bool { q.mu.Lock(); defer q.mu.Unlock(); return listed }
+	q.run(time.Hour, 3)
+	calls := q.asked()
+	if len(calls) != 3 || calls[1].chat != "list" || calls[2].at.Sub(calls[1].end) >= BacklogEmpty {
+		t.Errorf("after the listing was finished the next step came %v later, want the gap", calls[2].at.Sub(calls[1].end))
+	}
+}
