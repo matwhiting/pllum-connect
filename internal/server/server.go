@@ -712,21 +712,22 @@ func (s *server) readMethod(name string) (handler, bool) {
 	}, true
 }
 
-// messagesPage reads one page of a chat's lines, and says which chat it is.
-func messagesPage(st *store.Store, network string, params json.RawMessage) (store.MessagePage, string, error) {
+// messagesPage reads one page of a chat's lines, and says which chat it is
+// and the before it was asked with ("" for the newest page).
+func messagesPage(st *store.Store, network string, params json.RawMessage) (page store.MessagePage, chatID, before string, err error) {
 	var p struct {
 		ChatID string `json:"chatID"`
 		Before string `json:"before"`
 		Limit  int    `json:"limit"`
 	}
 	if err := decode(params, &p); err != nil {
-		return store.MessagePage{}, "", err
+		return store.MessagePage{}, "", "", err
 	}
 	if p.ChatID == "" {
-		return store.MessagePage{}, "", badRequest
+		return store.MessagePage{}, "", "", badRequest
 	}
-	page, err := st.Messages(network, p.ChatID, p.Before, p.Limit)
-	return page, p.ChatID, err
+	page, err = st.Messages(network, p.ChatID, p.Before, p.Limit)
+	return page, p.ChatID, p.Before, err
 }
 
 func messagesResult(page store.MessagePage) map[string]any {

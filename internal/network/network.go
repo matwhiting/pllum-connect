@@ -151,6 +151,14 @@ type OlderPages interface {
 	FetchOlder(ctx context.Context, chatID string) (added int, err error)
 }
 
+// ScrollBack is a network that wants to know when Pllum reads older lines
+// of a chat (a messages page with before, or one that reached the oldest
+// stored line), so its history queue can step aside. It carries no chat:
+// the queue yields for the whole network.
+type ScrollBack interface {
+	ScrolledBack()
+}
+
 // EncryptedHistory is a network whose end-to-end encrypted history is
 // restored with a PIN. HistoryState is "noBackup", "needsPIN", "restored" or
 // "skipped". RestoreHistory takes the PIN as typed; an empty pin skips the

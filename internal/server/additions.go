@@ -85,15 +85,28 @@ func (s *server) sendStatus(ctx context.Context, n network.Network, params json.
 // messages answers messages from the store, and, when the page reaches the
 // oldest stored line of a chat whose history is not complete, asks the
 // network (if it can) to fetch older lines. The answer does not wait for it.
+// A page with before is Pllum reading older lines: a network that wants to
+// know (network.ScrollBack) is told.
 func (s *server) messages(ctx context.Context, n network.Network, params json.RawMessage) (any, error) {
-	page, chatID, err := messagesPage(s.store, n.Name(), params)
+	page, chatID, before, err := messagesPage(s.store, n.Name(), params)
 	if err != nil {
 		return nil, err
 	}
+	told := false
 	if !page.HasMore {
-		s.askOlder(n, chatID)
+		told = s.askOlder(n, chatID)
+	}
+	if before != "" && !told {
+		scrolledBack(n)
 	}
 	return messagesResult(page), nil
+}
+
+// scrolledBack tells n, if it wants to know, that Pllum read older lines.
+func scrolledBack(n network.Network) {
+	if sb, ok := n.(network.ScrollBack); ok {
+		sb.ScrolledBack()
+	}
 }
 
 // olderState is what the server remembers of a chat's FetchOlder calls.
@@ -111,15 +124,16 @@ func (s *server) now() time.Time {
 
 // askOlder calls the network's FetchOlder for the chat unless the network
 // has none, the chat's history is complete, one is already running, or the
-// last was under olderEvery ago.
-func (s *server) askOlder(n network.Network, chatID string) {
+// last was under olderEvery ago. Before it starts one, it tells the network
+// Pllum is reading older lines (scrolledBack), and reports that it did.
+func (s *server) askOlder(n network.Network, chatID string) (told bool) {
 	op, ok := n.(network.OlderPages)
 	if !ok {
-		return
+		return false
 	}
 	c, ok, err := s.store.Chat(n.Name(), chatID)
 	if err != nil || !ok || c.HistoryComplete {
-		return
+		return false
 	}
 	key := n.Name() + "\x00" + c.ID
 	now := s.now()
@@ -127,10 +141,12 @@ func (s *server) askOlder(n network.Network, chatID string) {
 	st := s.older[key]
 	if st.running || (!st.at.IsZero() && now.Sub(st.at) < olderEvery) {
 		s.olderMu.Unlock()
-		return
+		return false
 	}
 	s.older[key] = olderState{at: now, running: true}
 	s.olderMu.Unlock()
+
+	scrolledBack(n)
 
 	s.inFlight.Add(1)
 	go func() {
@@ -145,6 +161,7 @@ func (s *server) askOlder(n network.Network, chatID string) {
 		}()
 		_, _ = op.FetchOlder(s.ctx, c.ID)
 	}()
+	return true
 }
 
 // signIn answers a network's sign-in page. The cookie lists go out as lists,

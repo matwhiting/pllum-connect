@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -98,6 +99,13 @@ func (c *testClock) advance(d time.Duration) {
 // interface and a plain whatsapp network with none, and a real store.
 func startMeta(t *testing.T, ig *metaNetwork, clock *testClock) (*harness, *store.Store) {
 	t.Helper()
+	return startMetaAs(t, ig, ig, clock)
+}
+
+// startMetaAs is startMeta with the instagram network served as as (ig, or
+// a network wrapping it).
+func startMetaAs(t *testing.T, ig *metaNetwork, as network.Network, clock *testClock) (*harness, *store.Store) {
+	t.Helper()
 	plain := &fakeNetwork{name: "whatsapp"}
 	stores := make(chan *store.Store, 1)
 	var now func() time.Time
@@ -107,7 +115,7 @@ func startMeta(t *testing.T, ig *metaNetwork, clock *testClock) (*harness, *stor
 	h := startNets(t, func(emit network.Emit) []network.Network {
 		plain.rawEmit, plain.emit = emit, emit.For("whatsapp")
 		ig.rawEmit, ig.emit = emit, emit.For("instagram")
-		return []network.Network{plain, ig}
+		return []network.Network{plain, as}
 	}, func(dir string, key [32]byte) (*store.Store, error) {
 		st, err := store.Open(dir, key)
 		if err == nil {
@@ -461,5 +469,107 @@ func TestContactsIsWhatsAppOnly(t *testing.T) {
 
 	if k := kindOf(t, igCall(h, "k3", "contacts", nil)); k != string(wire.Unsupported) {
 		t.Errorf("contacts on instagram gave %s, want unsupported", k)
+	}
+}
+
+// scrollNetwork is a metaNetwork that wants to know when Pllum reads older
+// lines.
+type scrollNetwork struct {
+	*metaNetwork
+	scrolled atomic.Int32
+	// first is whether ScrolledBack had been called when FetchOlder was
+	// first called.
+	first atomic.Int32
+}
+
+func (s *scrollNetwork) ScrolledBack() { s.scrolled.Add(1) }
+
+func (s *scrollNetwork) FetchOlder(ctx context.Context, chatID string) (int, error) {
+	s.first.CompareAndSwap(0, 1+s.scrolled.Load())
+	return s.metaNetwork.FetchOlder(ctx, chatID)
+}
+
+// putLines stores n lines of chat, a minute apart.
+func putLines(t *testing.T, st *store.Store, chat string, n int) {
+	t.Helper()
+	for i := range n {
+		if _, err := st.PutMessage("instagram", store.Message{ID: chat + "-" + string(rune('a'+i)), ChatID: chat, SenderID: "ig-1001",
+			TimeMs: 1767225600000 + int64(i)*60000, Text: "hello", Kind: "text", Source: store.SourceLive}); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestMessagesWithBeforeTellsTheNetwork(t *testing.T) {
+	ig := newMetaNetwork()
+	sn := &scrollNetwork{metaNetwork: ig}
+	h, st := startMetaAs(t, ig, sn, nil)
+	const chat = "ig-chat-scroll"
+	putLines(t, st, chat, 5)
+
+	first := result(t, igCall(h, "m1", "messages", map[string]any{"chatID": chat, "limit": 2}))
+	if first["hasMore"] != true {
+		t.Fatalf("the first page = %v, want more", first)
+	}
+	if n := sn.scrolled.Load(); n != 0 {
+		t.Fatalf("a page without before told the network %d times", n)
+	}
+	older := result(t, igCall(h, "m2", "messages", map[string]any{"chatID": chat, "limit": 2, "before": first["oldestCursor"]}))
+	if older["hasMore"] != true {
+		t.Fatalf("the older page = %v, want more", older)
+	}
+	if n := sn.scrolled.Load(); n != 1 {
+		t.Errorf("a page with before told the network %d times, want 1", n)
+	}
+	if calls := ig.olderCalls(); len(calls) != 0 {
+		t.Errorf("FetchOlder was called %v on a page with more", calls)
+	}
+}
+
+func TestReachingTheOldestLineTellsTheNetwork(t *testing.T) {
+	ig := newMetaNetwork()
+	ig.olderCh = make(chan string, 8)
+	sn := &scrollNetwork{metaNetwork: ig}
+	h, st := startMetaAs(t, ig, sn, nil)
+	const chat = "ig-chat-open"
+	putLines(t, st, chat, 3)
+
+	if r := result(t, igCall(h, "m1", "messages", map[string]any{"chatID": chat, "limit": 50})); r["hasMore"] != false {
+		t.Fatalf("hasMore = %v, want false", r["hasMore"])
+	}
+	select {
+	case got := <-ig.olderCh:
+		if got != chat {
+			t.Fatalf("FetchOlder was called for %q, want %q", got, chat)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatalf("FetchOlder was not called")
+	}
+	if n := sn.scrolled.Load(); n != 1 {
+		t.Errorf("reaching the oldest line told the network %d times, want 1", n)
+	}
+	if sn.first.Load() != 2 {
+		t.Errorf("FetchOlder began before the network was told")
+	}
+}
+
+func TestANetworkWithoutScrollBackIsUnchanged(t *testing.T) {
+	ig := newMetaNetwork()
+	if _, ok := any(ig).(network.ScrollBack); ok {
+		t.Fatalf("the plain fake network has ScrollBack")
+	}
+	ig.olderCh = make(chan string, 8)
+	h, st := startMeta(t, ig, nil)
+	const chat = "ig-chat-plain"
+	putLines(t, st, chat, 3)
+	first := result(t, igCall(h, "m1", "messages", map[string]any{"chatID": chat, "limit": 2}))
+	r := result(t, igCall(h, "m2", "messages", map[string]any{"chatID": chat, "limit": 2, "before": first["oldestCursor"]}))
+	if r["hasMore"] != false {
+		t.Fatalf("the oldest page = %v", r)
+	}
+	select {
+	case <-ig.olderCh:
+	case <-time.After(3 * time.Second):
+		t.Fatalf("FetchOlder was not called at the oldest line")
 	}
 }
