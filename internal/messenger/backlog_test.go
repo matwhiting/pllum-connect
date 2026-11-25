@@ -714,8 +714,19 @@ func TestTheQueueListsChatsPastTheYear(t *testing.T) {
 	if _, ok, _ := h.st.Chat(Name, keyID(listOld)); ok {
 		t.Fatalf("a chat past the year was listed at the first sign-in")
 	}
+	n, asked := f.mark(), h.m.traffic.BacklogAsked()
 	h.startQueue(t)
 	h.advance(t, 30*time.Minute, time.Second)
+	// Ruling 9: every page asked since is the queue's.
+	pages := 0
+	for _, name := range f.since(n) {
+		if name == "FetchThreadsTask" || name == "FetchMessagesTask" || name == "FetchMessages" {
+			pages++
+		}
+	}
+	if int64(pages) != h.m.traffic.BacklogAsked()-asked {
+		t.Errorf("%d pages since, %d of them the queue's", pages, h.m.traffic.BacklogAsked()-asked)
+	}
 	for _, key := range []int64{listOld, listOlder} {
 		if _, ok, _ := h.st.Chat(Name, keyID(key)); !ok {
 			t.Errorf("chat %d past the year was not listed", key)

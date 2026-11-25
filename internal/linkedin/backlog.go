@@ -2,6 +2,7 @@ package linkedin
 
 import (
 	"context"
+	"errors"
 	"io"
 	"time"
 
@@ -109,7 +110,7 @@ func (l *LinkedIn) backlogNext(ctx context.Context, passed func(string) bool) ne
 			return false
 		}
 		switch l.value("histDone." + chat) {
-		case histReach:
+		case histReach, histQueue:
 			return true
 		case "1":
 			return l.value("cursor."+chat) != ""
@@ -120,6 +121,11 @@ func (l *LinkedIn) backlogNext(ctx context.Context, passed func(string) bool) ne
 		return network.Step{Outcome: network.StepNothing}
 	}
 	out, err := l.pageHistory(ctx, gen, cli, chat, false)
+	if wait, stop := l.queueServerError(err); wait {
+		return network.Step{Outcome: network.StepPassed, Chat: chat}
+	} else if stop {
+		return network.Step{Outcome: network.StepPassed, Chat: chat, Err: err}
+	}
 	switch {
 	case err != nil:
 		return network.Step{Outcome: network.StepPassed, Chat: chat, Err: err}
@@ -130,6 +136,20 @@ func (l *LinkedIn) backlogNext(ctx context.Context, passed func(string) bool) ne
 	}
 	// gone or stuck: marked, never asked again.
 	return network.Step{Outcome: network.StepPassed, Chat: chat}
+}
+
+// queueServerError reads a queue request's error for a plain 5xx LinkedIn
+// gave (ruling 10): the first is a wait, as a 502 to 504 is (wait: the
+// step passes its chat over, with no error); a second in a row stops the
+// queue (stop: the error goes to the engine as internal). Any other outcome
+// starts the count over. Only the queue's Run calls it.
+func (l *LinkedIn) queueServerError(err error) (wait, stop bool) {
+	if !errors.Is(err, errServer) {
+		l.bq500s = 0
+		return false, false
+	}
+	l.bq500s++
+	return l.bq500s < 2, l.bq500s >= 2
 }
 
 // openChats is how many conversations' history is open, for the queue's

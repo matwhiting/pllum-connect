@@ -669,6 +669,7 @@ const (
 	histReach = "reach" // past 730 days, its cursor kept
 	histGone  = "gone"  // LinkedIn's settled answer
 	histStuck = "stuck" // the cursor did not move
+	histQueue = "queue" // listed past the year by the history queue: its alone (ruling 9)
 )
 
 // pageHistory pages one chat's history by one page, back from its kept

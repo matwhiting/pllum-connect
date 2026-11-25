@@ -53,6 +53,10 @@ var (
 	// that the thing asked about is not to be had (gone): only it settles
 	// background work for good. Its kind is internal.
 	errGone = &wire.Error{Kind: wire.Internal}
+	// errServer is a plain 5xx (500, 501, 505 and the rest a 502 to 504
+	// is not): internal, as before, but the history queue reads it as a
+	// wait the first time (ruling 10).
+	errServer = &wire.Error{Kind: wire.Internal}
 )
 
 // liClient is every LinkedIn call the helper may make, and nothing else:
@@ -195,6 +199,7 @@ type LinkedIn struct {
 	bq     *network.Backlog
 	bqGen  int
 	bqRuns atomic.Int32
+	bq500s int // plain 5xx in a row on the queue's requests (queueServerError); the queue's Run only
 
 	// The sends in line (writes.go): one goroutine sends them, in order.
 	outbox network.Outbox
@@ -810,6 +815,9 @@ func (l *LinkedIn) request(ctx context.Context, gen int, background bool, fn fun
 	}
 	if gone(err) {
 		return errGone
+	}
+	if s := statusOf(err); kind == wire.Internal && s >= 500 && s < 600 {
+		return errServer
 	}
 	return &wire.Error{Kind: kind}
 }

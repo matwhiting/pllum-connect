@@ -702,8 +702,13 @@ func TestTheQueueListsChatsPastTheYear(t *testing.T) {
 		t.Fatalf("a chat past the year was listed at the first sign-in")
 	}
 	n := h.m.mark()
+	asked := h.g.traffic.BacklogAsked()
 	h.goLive()
 	h.advance(30*time.Minute, time.Second)
+	// Ruling 9: every request since is the queue's, at its pace.
+	if got := append(h.m.namesSince(n), h.m.listPagesSince(n)...); int64(len(got)) != h.g.traffic.BacklogAsked()-asked {
+		t.Errorf("requests %v, of them %d the queue's", got, h.g.traffic.BacklogAsked()-asked)
+	}
 	if got := h.m.listPagesSince(n); strings.Join(got, " ") != "inbox-2 inbox-3" {
 		t.Errorf("the queue listed %v, want the two pages past the first listing", got)
 	}

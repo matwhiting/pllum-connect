@@ -3,6 +3,8 @@ package linkedin
 import (
 	"context"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -11,6 +13,7 @@ import (
 
 	"go.mau.fi/mautrix-linkedin/pkg/linkedingo"
 
+	"github.com/matwhiting/pllum-connect/internal/diag"
 	"github.com/matwhiting/pllum-connect/internal/network"
 	"github.com/matwhiting/pllum-connect/internal/wire"
 )
@@ -487,4 +490,86 @@ func TestListingObeysPushback(t *testing.T) {
 	if r.l.traffic.BacklogAsked() != asked {
 		t.Errorf("the queue asked within the day")
 	}
+}
+
+// Ruling 9: conversations the queue lists past the year are the queue's
+// alone: no worker request (its 2 to 4 s pace) is ever made for them, and
+// the queue pages them one request per gap.
+func TestOldListedConversationsArePagedOnlyByTheQueue(t *testing.T) {
+	r := listingRig(t)
+	r.firstSignIn()
+	i := len(r.f.callsNow())
+	r.startQueue()
+	r.advance(30*time.Minute, time.Second)
+	if !r.chat(convURN(3)).HistoryComplete || !r.chat(convURN(4)).HistoryComplete {
+		t.Fatalf("the old conversations were not paged")
+	}
+	var last time.Time
+	n := 0
+	for _, c := range r.f.callsNow()[i:] {
+		switch c.name {
+		case "GetMessagesBefore", "GetMessagesWithPrevCursor", "GetConversationsWithNextCursor":
+		default:
+			continue
+		}
+		n++
+		if !last.IsZero() && c.at.Sub(last) < network.BacklogMinGap {
+			t.Errorf("%s %s went %v after the request before: not at the queue's pace", c.name, c.arg, c.at.Sub(last))
+		}
+		last = c.at
+	}
+	if int64(n) != r.l.traffic.BacklogAsked() {
+		t.Errorf("%d requests, %d of them the queue's: the worker asked for old conversations", n, r.l.traffic.BacklogAsked())
+	}
+}
+
+// Ruling 10: a plain 500 on a queue page is a wait (the chat passed over
+// for now), as a 502 to 504 is; two in a row stop the queue.
+func TestAQueue500IsAWaitAndTwoInARowStopIt(t *testing.T) {
+	t.Run("one", func(t *testing.T) {
+		r := newQueueRig(t)
+		historyFeed(r, 800)
+		r.live()
+		r.f.failOnce("GetMessagesWithPrevCursor", statusErr(500))
+		r.startQueue()
+		r.advance(30*time.Minute, time.Second)
+		if !r.chat(convURN(1)).HistoryComplete {
+			t.Errorf("after one 500 the queue did not go on to page the chat")
+		}
+	})
+	t.Run("two", func(t *testing.T) {
+		r := newQueueRig(t)
+		historyFeed(r, 800)
+		r.live()
+		r.f.setErr("GetMessagesWithPrevCursor", statusErr(500))
+		r.startQueue()
+		r.advance(30*time.Minute, time.Second)
+		if n := r.l.traffic.BacklogAsked(); n < 2 {
+			t.Fatalf("the queue asked %d pages, want a second after the first 500", n)
+		}
+		asked := r.l.traffic.BacklogAsked()
+		r.advance(5*time.Hour, time.Minute)
+		if r.l.traffic.BacklogAsked() != asked {
+			t.Errorf("the queue went on after two 500s in a row")
+		}
+		r.clock.Advance(24 * time.Hour)
+		r.parked()
+		r.advance(time.Minute, time.Minute)
+		lines := dayLines(t, r)
+		if len(lines) == 0 || !strings.Contains(lines[0], "stopped yes internal") {
+			t.Errorf("the day line is %q, want stopped yes internal", lines)
+		}
+	})
+}
+
+func dayLines(t *testing.T, r *rig) []string {
+	t.Helper()
+	b, _ := os.ReadFile(filepath.Join(r.dir, Name, diag.FileName))
+	var out []string
+	for _, l := range strings.Split(string(b), "\n") {
+		if strings.Contains(l, "history queue") {
+			out = append(out, l)
+		}
+	}
+	return out
 }

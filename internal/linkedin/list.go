@@ -14,9 +14,10 @@ import (
 // time, by the cursor the first listing pages it by, from where that
 // listing stopped ("olderCursor.<folder>"; from the top for a store listed
 // before it was kept), until each folder is listed to its end
-// ("listedOlder.<folder>", then "olderListed"). What a page brings is
-// stored as the first listing stores it: a new conversation is marked
-// fresh, so the worker fetches its newest page and history.
+// ("listedOlder.<folder>", then "olderListed"). A conversation a page
+// brings that the store did not hold is the queue's alone (ruling 9): it is
+// stored without the fresh mark and marked histDone "queue", so the worker
+// (at its 2 to 4 s pace) never asks for it, and only the queue pages it.
 
 // olderListed reports whether every folder has been listed to its end.
 func (l *LinkedIn) olderListed() bool { return l.value("olderListed") != "" }
@@ -50,6 +51,11 @@ func (l *LinkedIn) listOlder(ctx context.Context) network.Step {
 			_ = l.keep(done, "1")
 			return network.Step{Outcome: network.StepPassed}
 		}
+		if wait, stop := l.queueServerError(err); wait {
+			return network.Step{Outcome: network.StepPassed}
+		} else if stop {
+			return network.Step{Outcome: network.StepPassed, Err: err}
+		}
 		if err != nil {
 			return network.Step{Outcome: network.StepPassed, Err: err}
 		}
@@ -63,13 +69,22 @@ func (l *LinkedIn) listOlder(ctx context.Context) network.Step {
 			if at := c.LastActivityAt.Time; !at.IsZero() && (oldest.IsZero() || at.Before(oldest)) {
 				oldest = at
 			}
-			if _, ok, err := l.st.Chat(Name, urnString(c.EntityURN)); err == nil && !ok {
+			id := urnString(c.EntityURN)
+			_, had, err := l.st.Chat(Name, id)
+			if err != nil {
+				continue
+			}
+			if !had {
+				// The queue's: marked before it is stored, so the worker
+				// never sees it unmarked.
+				_ = l.keep("histDone."+id, histQueue)
+			}
+			if l.storeConversation(c) && !had {
 				fresh = true
 			}
 		}
-		l.storeConversations(page.Elements)
-		if fresh {
-			l.signal() // the worker fetches what came in the new ones
+		if len(page.Elements) > 0 {
+			l.changed()
 		}
 		next := page.Metadata.NextCursor
 		pastYear := !oldest.IsZero() && oldest.Before(l.clock.Now().Add(-firstListing))
