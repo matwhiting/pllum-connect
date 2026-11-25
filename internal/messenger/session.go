@@ -18,8 +18,21 @@ import (
 // and, for a checkpoint, an ended session or a suspension, ends the run. A
 // caller that expects an answer Meta gives as an error (no backup, a wrong
 // PIN) catches it inside fn and returns nil: Meta answered.
+//
+// The history queue's request (ctx from network.WithBacklog) goes only if,
+// once its turn in the pace has come, no other request is in flight or
+// ended within network.BacklogQuiet, and the queue may still ask (not
+// held, stopped or yielding to a scroll-back): a send or a scroll-back
+// that began while it waited goes alone. Otherwise it is not made
+// (notConnected), and the queue asks again after its gap.
 func (m *Messenger) request(ctx context.Context, gen int, fn func(ctx context.Context) error) error {
-	return m.sess.Request(ctx, func() bool { return m.current(gen) }, func(ctx context.Context) error {
+	live := func() bool { return m.current(gen) }
+	if network.IsBacklog(ctx) {
+		live = func() bool {
+			return m.current(gen) && m.traffic.Quiet(m.clock.Now(), network.BacklogQuiet) && (m.bq == nil || m.bq.MayAsk())
+		}
+	}
+	return m.sess.Request(ctx, live, func(ctx context.Context) error {
 		end := m.traffic.Begin(ctx, m.clock.Now())
 		defer func() { end(m.clock.Now()) }()
 		return fn(ctx)
@@ -69,6 +82,9 @@ func paceKind(kind wire.Kind) wire.Kind {
 // suspended the account (the pace is already blocked). The run ends, its
 // encrypted socket too, and nothing is asked again until a new login.
 func (m *Messenger) pushedBack(gen int, kind wire.Kind) {
+	// The history queue holds a day after any pushback, whichever run's
+	// and whatever request's it was.
+	m.queuePushedBack(kind)
 	s, k, ok := stateFor(kind)
 	if !ok {
 		return

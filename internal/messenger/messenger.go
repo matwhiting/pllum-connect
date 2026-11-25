@@ -214,6 +214,13 @@ type Messenger struct {
 	// the media folder every network shares (media.go)
 	media *mediacache.Cache
 
+	// The history queue (backlog.go), with WithHistoryQueue only: nil
+	// without. bqGen is the run its Run was started for; bqRuns counts the
+	// Runs still running (tests settle on it).
+	bq     *network.Backlog
+	bqGen  int
+	bqRuns atomic.Int32
+
 	// testPrep, set only by tests, sees each encrypted message before it is
 	// worked out.
 	testPrep func(evt *events.FBMessage)
@@ -672,6 +679,7 @@ func (m *Messenger) socketUp(gen int, encrypted, up bool) {
 	switch {
 	case main && enc:
 		m.setState(network.Live, "")
+		m.startQueue(gen)
 	case main && (m.e2eeEverUp || m.e2eeFailed):
 		m.setState(network.Offline, wire.Unsupported)
 	case !main && (m.state == network.Live || m.state == network.Offline):

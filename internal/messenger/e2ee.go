@@ -447,6 +447,8 @@ func safeWrite(write func() (bool, error)) (wrote bool, err error, panicked bool
 // e2eeEnded records that Meta ended run gen's encrypted session: failed,
 // and no history asked, until a new sign-in.
 func (m *Messenger) e2eeEnded(gen int) {
+	// Meta ended the encrypted session: the history queue holds a day too.
+	m.queuePushedBack(wire.Unsupported)
 	m.gauge.mu.Lock()
 	m.gauge.counts.E2EEFailed = true
 	m.gauge.mu.Unlock()

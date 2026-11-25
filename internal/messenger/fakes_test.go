@@ -780,6 +780,10 @@ type harness struct {
 	st  *store.Store
 	dir string
 	log *testkit.Events
+	qc  *queueClock // the history queue's clock, with a queue (backlog_test.go)
+	// queueOn lets the queue be ready (with a queue): a test sets it once
+	// its fixtures are in place.
+	queueOn atomic.Bool
 }
 
 func newHarness(t *testing.T) *harness {
@@ -788,8 +792,9 @@ func newHarness(t *testing.T) *harness {
 }
 
 // newHarnessOver is a new network (a new helper process, as it were) over
-// an existing folder, on the given fakes.
-func newHarnessOver(t *testing.T, dir string, f *fakeMeta) *harness {
+// an existing folder, on the given fakes. Each opt is applied before the
+// network starts.
+func newHarnessOver(t *testing.T, dir string, f *fakeMeta, opts ...func(*harness)) *harness {
 	t.Helper()
 	h := &harness{f: f, dir: dir, log: &testkit.Events{}}
 	st, err := store.Open(h.dir, testKey)
@@ -805,6 +810,9 @@ func newHarnessOver(t *testing.T, dir string, f *fakeMeta) *harness {
 	h.m.clock = f.clock
 	h.m.pageWait = 2 * time.Second
 	st.SetClock(f.clock.Now)
+	for _, opt := range opts {
+		opt(h)
+	}
 	if err := h.m.Start(context.Background()); err != nil {
 		t.Fatal(err)
 	}
