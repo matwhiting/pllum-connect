@@ -232,17 +232,31 @@ func (h *harness) send(line string) {
 
 func (h *harness) next() map[string]any {
 	h.t.Helper()
+	return h.nextWithin(3 * time.Second)
+}
+
+// nextWithin is next with a deadline of its own: for an answer to a line
+// that takes long to read, as a 16 MiB one does under the race detector.
+// The deadline only catches a helper that never answers; what the answer
+// says is checked as with next.
+func (h *harness) nextWithin(d time.Duration) map[string]any {
+	h.t.Helper()
 	select {
 	case m, ok := <-h.lines:
 		if !ok {
 			h.t.Fatalf("the output ended")
 		}
 		return m
-	case <-time.After(3 * time.Second):
-		h.t.Fatalf("no output within 3 s")
+	case <-time.After(d):
+		h.t.Fatalf("no output within %v", d)
 	}
 	return nil
 }
+
+// bigLineWait is how long the answer to a MaxLine line may take: reading
+// and decoding 16 MiB is slow under the race detector, slower still beside
+// other packages' tests.
+const bigLineWait = time.Minute
 
 func (h *harness) hello() map[string]any {
 	h.t.Helper()
@@ -437,14 +451,14 @@ func TestALineOverTheLimitIsBadRequest(t *testing.T) {
 	head := `{"id":"fits","method":"status","params":{"network":"whatsapp","pad":"`
 	tail := `"}}`
 	h.send(head + strings.Repeat("x", wire.MaxLine-len(head)-len(tail)) + tail)
-	if m := h.next(); m["id"] != "fits" || m["result"] == nil {
+	if m := h.nextWithin(bigLineWait); m["id"] != "fits" || m["result"] == nil {
 		t.Fatalf("a line of exactly MaxLine bytes was not served: %v", m["error"])
 	}
 
 	// One byte more is a bad request, and the line after it is served.
 	head = `{"id":"over","method":"status","params":{"network":"whatsapp","pad":"`
 	h.send(head + strings.Repeat("x", wire.MaxLine+1-len(head)-len(tail)) + tail)
-	if m := h.next(); m["id"] != "" || kindOf(t, m) != string(wire.BadRequest) {
+	if m := h.nextWithin(bigLineWait); m["id"] != "" || kindOf(t, m) != string(wire.BadRequest) {
 		t.Fatalf("got %v, want badRequest", m["error"])
 	}
 	h.send(`{"id":"after","method":"status","params":{"network":"whatsapp"}}`)
