@@ -5,6 +5,7 @@
 # module are left out; the Go standard library's licence is Go's own, and this repository's is LICENSE.
 #   scripts/notices.sh          rewrites THIRD_PARTY_NOTICES
 #   scripts/notices.sh --check  fails if the committed THIRD_PARTY_NOTICES is out of date (CI runs this)
+# Licence files nested in the folders of linked packages are included too, labelled with their path in the module.
 # Fails, naming the module, if a linked module has no licence file, except the one named in borrowed_from below. A module replaced in go.mod (Beeper's req fork, the
 # patched mautrix-linkedin copy in third_party/) is listed as the module that is actually built, with its own licence files.
 set -euo pipefail
@@ -25,6 +26,20 @@ modules="$(go list -deps -f '{{with .Module}}{{if not .Main}}{{if .Replace}}{{.R
   || fail "go list failed (modules missing from the cache? run go mod download): $modules"
 modules="$(printf '%s\n' "$modules" | sed '/^$/d' | sort -u)"
 [[ -n "$modules" ]] || fail "no linked modules found"
+
+# Licences nested inside a linked package's own folder (a vendored or derived file, such as klauspost's zstd/internal/xxhash)
+# apply to that package, so they are listed too. For every linked package, each folder from the package up to, but not
+# including, its module's root: "module|folder relative to the module root", one line per folder.
+nested="$(go list -deps -f '{{with .Module}}{{if not .Main}}{{if .Replace}}{{.Replace.Path}}|{{.Replace.Dir}}{{else}}{{.Path}}|{{.Dir}}{{end}}{{end}}{{end}}|{{.Dir}}' ./cmd/pllum-connect 2>&1)" \
+  || fail "go list failed (modules missing from the cache? run go mod download): $nested"
+nested="$(printf '%s\n' "$nested" | while IFS='|' read -r mpath mdir pdir; do
+  [[ -n "$mpath" && -n "$mdir" ]] || continue
+  d="$pdir"
+  while [[ "$d" != "$mdir" && "$d" == "$mdir"/* ]]; do
+    echo "$mpath|${d#"$mdir"/}"
+    d="$(dirname "$d")"
+  done
+done | sort -u)"
 
 # github.com/beeper/poly1305 is a copy of golang.org/x/crypto's chacha20poly1305 and poly1305 packages and ships no licence
 # file of its own (nor does its repository); every one of its sources carries Go's "Copyright The Go Authors ... BSD-style
@@ -63,13 +78,22 @@ trap 'rm -f "$out.check"' EXIT
       (( ${#files[@]} > 0 )) || fail "$lender has no licence file to lend $path"
       note="$path ships no licence file. Its sources are copies of $lender's code and carry that project's \"Copyright The Go Authors\" BSD-style licence header, so $lender's licence files follow."
     fi
+    # then the licence files inside the folders of its linked packages, labelled by their path in the module
+    labels=()
+    for f in "${files[@]}"; do labels+=("$(basename "$f")"); done
+    while IFS='|' read -r npath rel; do
+      [[ "$npath" == "$path" ]] || continue
+      while IFS= read -r f; do files+=("$f"); labels+=("$rel/$(basename "$f")"); done < <(find_licences "$dir/$rel")
+    done <<< "$nested"
     echo
     echo "================================================================================"
     echo "${path} ${version:-(copy in this repository)}"
     [[ -z "$note" ]] || echo "$note"
+    i=0
     for f in "${files[@]}"; do
       echo "--------------------------------------------------------------------------------"
-      echo "$(basename "$f")"
+      echo "${labels[$i]}"
+      i=$((i + 1))
       echo "--------------------------------------------------------------------------------"
       cat "$f"
       [[ -z "$(tail -c1 "$f")" ]] || echo
