@@ -37,6 +37,10 @@ func (g *Instagram) WithHistoryQueue() *Instagram {
 	return g
 }
 
+// HistoryQueue reports whether the network runs the history queue
+// (--history-queue).
+func (g *Instagram) HistoryQueue() bool { return g.bq != nil }
+
 // ScrolledBack is Pllum reading older lines (network.ScrollBack): the queue
 // steps aside for a while.
 func (g *Instagram) ScrolledBack() {

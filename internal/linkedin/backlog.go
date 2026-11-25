@@ -40,6 +40,10 @@ func (l *LinkedIn) newBacklog() *network.Backlog {
 	}
 }
 
+// HistoryQueue reports whether the network runs the history queue
+// (--history-queue).
+func (l *LinkedIn) HistoryQueue() bool { return l.bq != nil }
+
 // ScrolledBack is Pllum reading older lines (network.ScrollBack): the queue
 // steps aside for a while.
 func (l *LinkedIn) ScrolledBack() {

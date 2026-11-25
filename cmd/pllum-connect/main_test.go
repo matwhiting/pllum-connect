@@ -11,6 +11,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/matwhiting/pllum-connect/internal/network"
+	"github.com/matwhiting/pllum-connect/internal/store"
 )
 
 const testKeyHex = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
@@ -173,6 +176,60 @@ func TestGateCountsOnlyWithTheGateFlag(t *testing.T) {
 		}
 		if errOut.Len() != 0 {
 			t.Errorf("gate %v: the helper wrote %d bytes to stderr, want none", gate, errOut.Len())
+		}
+	}
+}
+
+func TestTheHistoryQueueFlagIsAccepted(t *testing.T) {
+	bin := buildHelper(t)
+	cmd := exec.Command(bin, "--data", filepath.Join(t.TempDir(), "connect"), "--history-queue")
+	cmd.Stdin = strings.NewReader("")
+	var errOut bytes.Buffer
+	cmd.Stderr = &errOut
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("--history-queue ended with %v, want exit 0", err)
+	}
+	if errOut.Len() != 0 {
+		t.Errorf("the helper wrote %d bytes to stderr, want none", errOut.Len())
+	}
+	err := exec.Command(bin, "--data", filepath.Join(t.TempDir(), "connect"), "--history-queues").Run()
+	var exit *exec.ExitError
+	if !errors.As(err, &exit) || exit.ExitCode() != 2 {
+		t.Errorf("an unknown flag ended with %v, want exit code 2", err)
+	}
+}
+
+// historyQueuer is a network that may run the history queue.
+type historyQueuer interface{ HistoryQueue() bool }
+
+func TestTheHistoryQueueIsOffWithoutTheFlag(t *testing.T) {
+	dir := t.TempDir()
+	var key [32]byte
+	st, err := store.Open(dir, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	emit := network.Emit(func(map[string]any) {})
+	for _, on := range []bool{false, true} {
+		queues := map[string]bool{}
+		for _, n := range networks(st, dir, key, emit, false, on) {
+			if q, ok := n.(historyQueuer); ok {
+				queues[n.Name()] = q.HistoryQueue()
+			}
+			n.Stop()
+		}
+		for _, name := range []string{"instagram", "messenger", "linkedin"} {
+			got, ok := queues[name]
+			if !ok {
+				t.Fatalf("%s cannot say whether it runs the queue", name)
+			}
+			if got != on {
+				t.Errorf("with --history-queue %v, %s runs the queue: %v", on, name, got)
+			}
+		}
+		if _, ok := queues["whatsapp"]; ok {
+			t.Errorf("whatsapp has a history queue")
 		}
 	}
 }

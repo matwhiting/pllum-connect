@@ -41,6 +41,10 @@ func (m *Messenger) WithHistoryQueue() *Messenger {
 	return m
 }
 
+// HistoryQueue reports whether the network runs the history queue
+// (--history-queue).
+func (m *Messenger) HistoryQueue() bool { return m.bq != nil }
+
 // ScrolledBack is Pllum reading older lines (network.ScrollBack): the queue
 // steps aside for a while.
 func (m *Messenger) ScrolledBack() {

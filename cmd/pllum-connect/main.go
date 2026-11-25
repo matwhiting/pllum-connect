@@ -50,6 +50,9 @@ func run(args []string) int {
 	// --gate is Messenger's gate (step 3, Task B0), run by a Debug Pllum
 	// only: it adds the hidden method gateCounts.
 	gate := flags.Bool("gate", false, "answer gateCounts")
+	// --history-queue runs the background history queue on Instagram,
+	// Messenger and LinkedIn: off unless passed.
+	historyQueue := flags.Bool("history-queue", false, "run the background history queue")
 	if err := flags.Parse(args); err != nil || *data == "" || flags.NArg() != 0 {
 		return exitUsage
 	}
@@ -85,18 +88,7 @@ func run(args []string) int {
 			return store.Open(dir, key)
 		},
 		Networks: func(st *store.Store, dir string, key [32]byte, emit network.Emit) []network.Network {
-			// One media folder, counted once, for every network.
-			media := mediacache.New(dir, key)
-			m := messenger.New(st, dir, key, emit.For(messenger.Name)).WithMedia(media)
-			if *gate {
-				m.WithGate()
-			}
-			return []network.Network{
-				whatsapp.New(st, dir, key, emit.For(whatsapp.Name)).WithMedia(media),
-				instagram.New(st, dir, key, emit.For(instagram.Name)).WithMedia(media),
-				m,
-				linkedin.New(st, dir, key, emit.For(linkedin.Name), linkedin.Options{Media: media}),
-			}
+			return networks(st, dir, key, emit, *gate, *historyQueue)
 		},
 		Gate: *gate,
 	}
@@ -104,6 +96,29 @@ func run(args []string) int {
 		return exitFailed
 	}
 	return exitOK
+}
+
+// networks are the networks the helper runs. gate is --gate; historyQueue
+// (--history-queue) gives Instagram, Messenger and LinkedIn their
+// background history queue, which none runs without it.
+func networks(st *store.Store, dir string, key [32]byte, emit network.Emit, gate, historyQueue bool) []network.Network {
+	// One media folder, counted once, for every network.
+	media := mediacache.New(dir, key)
+	m := messenger.New(st, dir, key, emit.For(messenger.Name)).WithMedia(media)
+	if gate {
+		m.WithGate()
+	}
+	ig := instagram.New(st, dir, key, emit.For(instagram.Name)).WithMedia(media)
+	if historyQueue {
+		m.WithHistoryQueue()
+		ig.WithHistoryQueue()
+	}
+	return []network.Network{
+		whatsapp.New(st, dir, key, emit.For(whatsapp.Name)).WithMedia(media),
+		ig,
+		m,
+		linkedin.New(st, dir, key, emit.For(linkedin.Name), linkedin.Options{Media: media, HistoryQueue: historyQueue}),
+	}
 }
 
 var errLocked = errors.New("locked")
