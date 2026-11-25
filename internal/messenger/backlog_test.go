@@ -841,3 +841,58 @@ func TestAListingPagePastTheYearWithNothingNewEndsIt(t *testing.T) {
 		t.Errorf("the inbox's listing is not done")
 	}
 }
+
+type holdRecorder struct {
+	mu    sync.Mutex
+	kinds []wire.Kind
+}
+
+func (r *holdRecorder) HoldQueue(kind wire.Kind) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.kinds = append(r.kinds, kind)
+}
+
+func (r *holdRecorder) got() []wire.Kind {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]wire.Kind(nil), r.kinds...)
+}
+
+// A Meta pushback on Messenger holds Instagram's queue too, and
+// Instagram's holds Messenger's.
+func TestAMetaPushbackHoldsTheOtherMetaQueue(t *testing.T) {
+	peer := &holdRecorder{}
+	f := newFakeMeta()
+	withGroupLines(f)
+	h := newHarnessOver(t, t.TempDir()+"/connect", f, withQueue(true), func(h *harness) { h.m.HoldWith(peer) })
+	h.signIn(t)
+	f.mu.Lock()
+	f.writeErrs["SendMessageTask"] = httpclient.ErrCheckpointRequired
+	f.mu.Unlock()
+	if _, err := h.m.Send(context.Background(), network.Outgoing{ChatID: groupChat, Text: canary + " checked"}); err != nil {
+		t.Fatal(err)
+	}
+	h.sends(t)
+	if got := peer.got(); len(got) == 0 || got[len(got)-1] != wire.Checkpoint {
+		t.Errorf("Instagram's queue was held with %v, want a checkpoint", got)
+	}
+
+	// The other way: Instagram's pushback holds Messenger's queue a day.
+	f2 := newFakeMeta()
+	withGroupLines(f2)
+	olderPages(f2, groupOne, 5)
+	h2 := newQueueHarness(t, "", f2)
+	h2.signIn(t)
+	n := f2.taskMark()
+	h2.m.HoldQueue(wire.Checkpoint)
+	h2.startQueue(t)
+	h2.advance(t, 23*time.Hour, 10*time.Minute)
+	if p := f2.pagesOf(groupOne, n); p != 0 {
+		t.Errorf("Messenger's queue asked %d pages within the day after Instagram's pushback", p)
+	}
+	h2.advance(t, 2*time.Hour, time.Minute)
+	if p := f2.pagesOf(groupOne, n); p == 0 {
+		t.Errorf("Messenger's queue asked nothing once the day had passed")
+	}
+}

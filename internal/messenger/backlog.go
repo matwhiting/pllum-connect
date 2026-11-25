@@ -85,14 +85,33 @@ func (m *Messenger) startQueue(gen int) {
 // queuePushedBack tells the queue that Meta pushed back with kind, for live
 // work as for its own (a send, a restore, either socket): it holds a day.
 func (m *Messenger) queuePushedBack(kind wire.Kind) {
-	if m.bq == nil {
-		return
-	}
 	switch kind {
 	case wire.RateLimited, wire.Checkpoint, meta.ReconnectNeeded, meta.Banned, wire.RegistrationUnclear, wire.Unsupported:
+		m.HoldQueue(kind)
+		if m.metaPeer != nil {
+			// The other Meta network's queue holds too.
+			m.metaPeer.HoldQueue(kind)
+		}
+	}
+}
+
+// HoldQueue holds the network's history queue a day (network.QueueHolder):
+// for the other Meta network's pushback. It passes nothing on.
+func (m *Messenger) HoldQueue(kind wire.Kind) {
+	if m.bq != nil {
 		m.bq.PushedBack(kind)
 	}
 }
+
+// HoldWith makes every Meta pushback on this network hold peer's history
+// queue too (Instagram's). Call it before Start.
+func (m *Messenger) HoldWith(peer network.QueueHolder) *Messenger {
+	m.metaPeer = peer
+	return m
+}
+
+// HeldWith is the queue HoldWith named, nil for none (for tests).
+func (m *Messenger) HeldWith() network.QueueHolder { return m.metaPeer }
 
 // queueBackupPages is the most pages of his backup the history queue reads
 // in a local day (ruling 8), within the queue's own BacklogDayCap: once

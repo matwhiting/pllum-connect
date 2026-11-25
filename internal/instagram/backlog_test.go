@@ -892,3 +892,55 @@ func TestAListingPagePastTheYearWithNothingNewEndsIt(t *testing.T) {
 		t.Errorf("a page past the end was listed")
 	}
 }
+
+// holdRecorder is the other Meta network's queue, as far as a hold goes.
+type holdRecorder struct {
+	mu    sync.Mutex
+	kinds []wire.Kind
+}
+
+func (r *holdRecorder) HoldQueue(kind wire.Kind) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.kinds = append(r.kinds, kind)
+}
+
+func (r *holdRecorder) got() []wire.Kind {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]wire.Kind(nil), r.kinds...)
+}
+
+// A Meta pushback on Instagram holds Messenger's queue too (one account
+// provider, one Mac), and Messenger's holds Instagram's.
+func TestAMetaPushbackHoldsTheOtherMetaQueue(t *testing.T) {
+	peer := &holdRecorder{}
+	h := openHarness(t, t.TempDir()+"/connect", nil, withQueue, func(h *harness) { h.g.HoldWith(peer) })
+	serve(h.m, append([]oldChat{{key: aliceFBI, thread: aliceThread, active: start.Add(-100 * 24 * time.Hour), pages: 9}}, queueChats...)...)
+	h.login(validSession())
+	h.goLive()
+	h.m.setErr("SendMessage", httpclient.ErrCheckpointRequired)
+	if _, err := h.g.Send(context.Background(), network.Outgoing{ChatID: aliceChat, Text: "invented hello"}); err != nil {
+		t.Fatal(err)
+	}
+	h.settle()
+	if got := peer.got(); len(got) == 0 || got[len(got)-1] != wire.Checkpoint {
+		t.Errorf("Messenger's queue was held with %v, want a checkpoint", got)
+	}
+
+	// The other way: Messenger's pushback holds Instagram's queue a day.
+	h2 := newQueueHarness(t, t.TempDir()+"/connect")
+	serve(h2.m, queueChats...)
+	h2.login(validSession())
+	n := h2.m.mark()
+	h2.g.HoldQueue(wire.Checkpoint)
+	h2.goLive()
+	h2.advance(23*time.Hour, 10*time.Minute)
+	if got := h2.m.pagesSince(n); len(got) != 0 {
+		t.Errorf("Instagram's queue asked %v within the day after Messenger's pushback", got)
+	}
+	h2.advance(2*time.Hour, time.Minute)
+	if got := h2.m.pagesSince(n); len(got) == 0 {
+		t.Errorf("Instagram's queue asked nothing once the day had passed")
+	}
+}

@@ -12,6 +12,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/matwhiting/pllum-connect/internal/instagram"
+	"github.com/matwhiting/pllum-connect/internal/messenger"
 	"github.com/matwhiting/pllum-connect/internal/network"
 	"github.com/matwhiting/pllum-connect/internal/store"
 )
@@ -230,6 +232,33 @@ func TestTheHistoryQueueIsOffWithoutTheFlag(t *testing.T) {
 		}
 		if _, ok := queues["whatsapp"]; ok {
 			t.Errorf("whatsapp has a history queue")
+		}
+	}
+}
+
+// With the queue, a Meta pushback on Instagram holds Messenger's queue and
+// the other way round.
+func TestTheMetaQueuesHoldEachOther(t *testing.T) {
+	dir := t.TempDir()
+	var key [32]byte
+	st, err := store.Open(dir, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	emit := network.Emit(func(map[string]any) {})
+	for _, on := range []bool{false, true} {
+		byName := map[string]network.Network{}
+		for _, n := range networks(st, dir, key, emit, false, on) {
+			byName[n.Name()] = n
+			defer n.Stop()
+		}
+		ig, m := byName["instagram"].(*instagram.Instagram), byName["messenger"].(*messenger.Messenger)
+		switch {
+		case on && (ig.HeldWith() != network.QueueHolder(m) || m.HeldWith() != network.QueueHolder(ig)):
+			t.Errorf("with the queue, Instagram holds %v and Messenger %v, want each other", ig.HeldWith(), m.HeldWith())
+		case !on && (ig.HeldWith() != nil || m.HeldWith() != nil):
+			t.Errorf("without the queue, a Meta network holds another's")
 		}
 	}
 }

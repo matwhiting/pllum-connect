@@ -137,9 +137,10 @@ type Instagram struct {
 	// The history queue (backlog.go), with WithHistoryQueue only: nil
 	// without. bqGen is the run its Run was started for; bqRuns counts the
 	// Runs still running (tests settle on it).
-	bq     *network.Backlog
-	bqGen  int
-	bqRuns atomic.Int32
+	bq       *network.Backlog
+	bqGen    int
+	bqRuns   atomic.Int32
+	metaPeer network.QueueHolder // Messenger's queue, which Meta's pushback here holds too
 }
 
 var (

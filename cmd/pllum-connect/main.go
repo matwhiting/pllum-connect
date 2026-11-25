@@ -112,6 +112,9 @@ func networks(st *store.Store, dir string, key [32]byte, emit network.Emit, gate
 	if historyQueue {
 		m.WithHistoryQueue()
 		ig.WithHistoryQueue()
+		// Both are Meta's: a pushback on either holds both queues.
+		ig.HoldWith(m)
+		m.HoldWith(ig)
 	}
 	return []network.Network{
 		whatsapp.New(st, dir, key, emit.For(whatsapp.Name)).WithMedia(media),

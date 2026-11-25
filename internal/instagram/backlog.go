@@ -71,14 +71,33 @@ func (g *Instagram) startQueue(gen int) {
 // queuePushedBack tells the queue that Meta pushed back with kind, for
 // live work as for its own: it holds a day.
 func (g *Instagram) queuePushedBack(kind wire.Kind) {
-	if g.bq == nil {
-		return
-	}
 	switch kind {
 	case wire.RateLimited, wire.Checkpoint, meta.ReconnectNeeded, meta.Banned:
+		g.HoldQueue(kind)
+		if g.metaPeer != nil {
+			// The other Meta network's queue holds too.
+			g.metaPeer.HoldQueue(kind)
+		}
+	}
+}
+
+// HoldQueue holds the network's history queue a day (network.QueueHolder):
+// for the other Meta network's pushback. It passes nothing on.
+func (g *Instagram) HoldQueue(kind wire.Kind) {
+	if g.bq != nil {
 		g.bq.PushedBack(kind)
 	}
 }
+
+// HoldWith makes every Meta pushback on this network hold peer's history
+// queue too (Messenger's). Call it before Start.
+func (g *Instagram) HoldWith(peer network.QueueHolder) *Instagram {
+	g.metaPeer = peer
+	return g
+}
+
+// HeldWith is the queue HoldWith named, nil for none (for tests).
+func (g *Instagram) HeldWith() network.QueueHolder { return g.metaPeer }
 
 // backlogNext pages the newest open chat the queue has not passed over by
 // one page, older than what the store holds, under ctx (the queue's, so

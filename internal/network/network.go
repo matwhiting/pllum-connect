@@ -159,6 +159,14 @@ type ScrollBack interface {
 	ScrolledBack()
 }
 
+// QueueHolder is a network whose history queue another network's pushback
+// holds too: Instagram and Messenger are both Meta's (one account
+// provider, one Mac), so a pushback on either quiets both queues. Holding
+// one this way is the receiving end only: it never passes the hold on.
+type QueueHolder interface {
+	HoldQueue(kind wire.Kind)
+}
+
 // EncryptedHistory is a network whose end-to-end encrypted history is
 // restored with a PIN. HistoryState is "noBackup", "needsPIN", "restored" or
 // "skipped". RestoreHistory takes the PIN as typed; an empty pin skips the
