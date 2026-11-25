@@ -3,6 +3,8 @@ package whatsapp
 import (
 	"context"
 	"errors"
+	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -290,5 +292,41 @@ func TestContactsBeforeSignInIsNotConnected(t *testing.T) {
 		if !errors.As(err, &we) || we.Kind != wire.NotConnected {
 			t.Fatalf("Contacts %s = %#v, want a *wire.Error of kind notConnected", when, err)
 		}
+	}
+}
+
+// failingContacts is a contact store whose listing fails with err.
+type failingContacts struct {
+	wastore.ContactStore
+	err error
+}
+
+func (f failingContacts) GetAllContacts(context.Context) (map[types.JID]types.ContactInfo, error) {
+	return nil, f.err
+}
+
+func TestAContactStoreThatWillNotReadIsInternalAndKeepsItsCause(t *testing.T) {
+	r, trip := tripRig(t)
+	dev := r.w.device()
+	// The cause's text stands in for a database error that quotes a row.
+	cause := errors.New("invented cause naming 10000000001@s.whatsapp.net")
+	held := dev.Contacts
+	dev.Contacts = failingContacts{ContactStore: held, err: cause}
+	defer func() { dev.Contacts = held }()
+
+	trip.arm(true)
+	_, err := r.w.Contacts(context.Background())
+	trip.arm(false)
+	if kindOf(err) != wire.Internal {
+		t.Fatalf("Contacts = %v, want internal", err)
+	}
+	if !errors.Is(err, cause) {
+		t.Errorf("the error lost its cause: %#v", err)
+	}
+	if text := fmt.Sprint(err); strings.Contains(text, "10000000001") || strings.Contains(text, "invented cause") {
+		t.Errorf("the error's text carries the cause's: %q", text)
+	}
+	if calls := trip.calls(); len(calls) != 0 {
+		t.Errorf("Contacts called the WhatsApp client: %v", calls)
 	}
 }

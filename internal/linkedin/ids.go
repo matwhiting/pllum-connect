@@ -45,7 +45,9 @@ func profileID(u linkedingo.URN) string { return u.ID() }
 
 // publicID is the public profile ID in a member's profile URL
 // ("https://www.linkedin.com/in/<public ID>/", on linkedin.com or one of its
-// country hosts), decoded; "" for any other URL. It reads the URL only.
+// country hosts), decoded; "" for any other URL, and for one that names the
+// member by a member ID ("ACoAA…" or "ACwAA…"), which is never a public ID.
+// It reads the URL only.
 func publicID(profileURL string) string {
 	u, err := url.Parse(profileURL)
 	if err != nil || (u.Scheme != "https" && u.Scheme != "http") {
@@ -60,7 +62,16 @@ func publicID(profileURL string) string {
 		return ""
 	}
 	id, _, _ := strings.Cut(rest, "/")
+	if isMemberID(id) {
+		return ""
+	}
 	return id
+}
+
+// isMemberID reports whether id has the shape of a LinkedIn member ID (a
+// profile URN's last part) rather than a public profile ID.
+func isMemberID(id string) bool {
+	return strings.HasPrefix(id, "ACoAA") || strings.HasPrefix(id, "ACwAA")
 }
 
 // isConversation reports whether a chat ID is a LinkedIn conversation's.

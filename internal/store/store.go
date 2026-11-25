@@ -653,12 +653,13 @@ func mergeChat(tx *sql.Tx, network, from, into string) error {
 		`INSERT OR IGNORE INTO participants (network, chat_id, participant_id, name, phone, is_self, position, handle)
 			SELECT network, ?, participant_id, name, phone, is_self, position, handle FROM participants
 			WHERE network = ? AND chat_id = ?`,
-		// One the target already held keeps its own fields, and gains the
-		// later chat's handle if it had none.
+		// One the target already held keeps its own fields but takes the
+		// later chat's handle, when it has one: the chat merged in is the
+		// later one, so its handle is the newer name.
 		`UPDATE participants AS t SET handle = f.handle FROM participants AS f
 			WHERE t.network = f.network AND t.participant_id = f.participant_id
 			AND t.chat_id = ?1 AND t.network = ?2 AND f.chat_id = ?3
-			AND t.handle IS NULL AND f.handle IS NOT NULL`,
+			AND f.handle IS NOT NULL`,
 		`UPDATE outgoing SET chat_id = ? WHERE network = ? AND chat_id = ?`,
 	); err != nil {
 		return err

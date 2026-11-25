@@ -26,7 +26,7 @@ func (w *WhatsApp) Contacts(ctx context.Context) ([]network.Contact, error) {
 	}
 	all, err := dev.Contacts.GetAllContacts(ctx)
 	if err != nil {
-		return nil, errInternal
+		return nil, &contactsReadError{cause: err}
 	}
 	jids := make([]types.JID, 0, len(all))
 	for jid := range all {
@@ -88,3 +88,12 @@ func fill(field *string, v string) {
 		*field = v
 	}
 }
+
+// contactsReadError is a failed read of the device's contact store: kind
+// internal, with the database's error kept as its cause for errors.Is and
+// errors.As. Its text is fixed, never the cause's, which can quote a row.
+type contactsReadError struct{ cause error }
+
+func (e *contactsReadError) Error() string { return "internal: reading the device's contact store" }
+
+func (e *contactsReadError) Unwrap() []error { return []error{errInternal, e.cause} }

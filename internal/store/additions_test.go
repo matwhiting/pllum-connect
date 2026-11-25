@@ -137,11 +137,12 @@ func TestAChatMergeKeepsHandles(t *testing.T) {
 	const first, later = "340282366841710300000000000000001", "340282366841710300000000000000002"
 	s := openTest(t)
 	if err := s.PutChat(ig, ChatInfo{ID: first, Participants: []Participant{{ID: "17840000000000001", Name: "Pat Example"},
-		{ID: "17840000000000002", Name: "Sam Example"}}}); err != nil {
+		{ID: "17840000000000002", Name: "Sam Example"}, {ID: "17840000000000004", Handle: "invented.before"}}}); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.PutChat(ig, ChatInfo{ID: later, Participants: []Participant{
-		{ID: "17840000000000001", Handle: "pllum.test"}, {ID: "17840000000000003", Handle: "invented.user"}}}); err != nil {
+		{ID: "17840000000000001", Handle: "pllum.test"}, {ID: "17840000000000003", Handle: "invented.user"},
+		{ID: "17840000000000004", Handle: "invented.after"}}}); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.Alias(ig, later, first); err != nil {
@@ -152,7 +153,10 @@ func TestAChatMergeKeepsHandles(t *testing.T) {
 	for _, p := range c.Participants {
 		got[p.ID] = p.Handle
 	}
-	want := map[string]string{"17840000000000001": "pllum.test", "17840000000000002": "", "17840000000000003": "invented.user"}
+	// Where both chats hold a different handle, the chat merged in (the later
+	// one) wins: it is the newer name.
+	want := map[string]string{"17840000000000001": "pllum.test", "17840000000000002": "", "17840000000000003": "invented.user",
+		"17840000000000004": "invented.after"}
 	if len(got) != len(want) {
 		t.Fatalf("the merged chat's participants = %+v", c.Participants)
 	}

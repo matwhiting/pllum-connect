@@ -397,8 +397,11 @@ func TestPublicIDReadsOnlyAnInProfileURL(t *testing.T) {
 		{"https://linkedin.com/in/invented-person-12ab?trk=invented", "invented-person-12ab"},
 		{"https://www.linkedin.com/in/invented-person-12ab/?miniProfileUrn=x", "invented-person-12ab"},
 		{"https://www.linkedin.com/in/inv%C3%A9nted-person", "invénted-person"},
-		{"https://nz.linkedin.com/in/invented-person-12ab/", "invented-person-12ab"},
+		{"https://uk.linkedin.com/in/invented-person-12ab/", "invented-person-12ab"},
 		{"https://www.linkedin.com/company/x", ""},
+		// A member ID in a profile URL is never a public ID, in either form.
+		{"https://www.linkedin.com/in/ACoAAInventedMember01/", ""},
+		{"https://www.linkedin.com/in/ACwAAInventedMember02", ""},
 		{"https://www.linkedin.com/in/", ""},
 		{"https://www.linkedin.com/in", ""},
 		{"", ""},
