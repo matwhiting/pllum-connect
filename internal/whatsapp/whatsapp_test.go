@@ -818,9 +818,12 @@ func TestQRCodesBecomeEventsAndAPasskeyRequestStopsTheLogin(t *testing.T) {
 	if last := r.log.LastState(); last["kind"] != "unsupported" {
 		t.Fatalf("a passkey request ended the login with %v", last)
 	}
-	if _, d, _ := fc.counts(); d == 0 || fc.qrCtx.Err() == nil {
-		t.Fatalf("a passkey request left the login running (disconnects %d)", d)
-	}
+	// The state is told first; the QR wait's end and the disconnect follow
+	// it, outside the network's lock, so they are waited for.
+	eventually(t, "a passkey request to stop the login (its QR wait ended, the client disconnected)", func() bool {
+		_, d, _ := fc.counts()
+		return d > 0 && fc.qrCtx.Err() != nil
+	})
 
 	finals := []struct {
 		item  whatsmeow.QRChannelItem
