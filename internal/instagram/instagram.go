@@ -133,6 +133,13 @@ type Instagram struct {
 	rmu    sync.Mutex     // one resume of a failed send at a time (writes.go)
 
 	media *mediacache.Cache // the media folder every network shares (media.go)
+
+	// The history queue (backlog.go), with WithHistoryQueue only: nil
+	// without. bqGen is the run its Run was started for; bqRuns counts the
+	// Runs still running (tests settle on it).
+	bq     *network.Backlog
+	bqGen  int
+	bqRuns atomic.Int32
 }
 
 var (
@@ -548,8 +555,18 @@ func (g *Instagram) signInFailed(gen int, kind wire.Kind) {
 // while a block is in force, then a 2 to 4 s gap after the last. A success
 // may carry rotated cookies to Pllum; Meta pushing back blocks the pace
 // and, for a checkpoint, an ended session or a suspension, ends the run.
+//
+// The history queue's request (ctx from network.WithBacklog) goes only if,
+// once its turn in the pace has come, no other request is in flight or
+// ended within network.BacklogQuiet: a send that took the pace while it
+// waited goes alone. Otherwise it is not made (notConnected), and the
+// queue asks again after its gap.
 func (g *Instagram) request(ctx context.Context, gen int, fn func(ctx context.Context) error) error {
-	return g.sess.Request(ctx, func() bool { return g.current(gen) }, func(ctx context.Context) error {
+	live := func() bool { return g.current(gen) }
+	if network.IsBacklog(ctx) {
+		live = func() bool { return g.current(gen) && g.traffic.Quiet(g.clock.Now(), network.BacklogQuiet) }
+	}
+	return g.sess.Request(ctx, live, func(ctx context.Context) error {
 		end := g.traffic.Begin(ctx, g.clock.Now())
 		defer func() { end(g.clock.Now()) }()
 		return fn(ctx)
@@ -583,6 +600,9 @@ func stateFor(kind wire.Kind) (s network.State, k wire.Kind, ok bool) {
 // suspended the account (the pace is already blocked). The run ends, its
 // socket too, and nothing is asked again until a new login.
 func (g *Instagram) pushedBack(gen int, kind wire.Kind) {
+	// The history queue holds a day after any pushback, whichever run's
+	// and whatever request's it was.
+	g.queuePushedBack(kind)
 	s, k, ok := stateFor(kind)
 	if !ok {
 		return
@@ -741,6 +761,7 @@ func (g *Instagram) caughtUp(gen int) {
 	}
 	if g.state == network.CatchingUp {
 		g.setState(network.Live, "")
+		g.startQueue(gen)
 	}
 }
 

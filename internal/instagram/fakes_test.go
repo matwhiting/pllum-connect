@@ -106,6 +106,10 @@ type fakeMeta struct {
 	errs      map[string]error
 	files     map[string]fakeFile
 	olderThan []string
+
+	// hook, when set, runs inside every call once it is recorded (outside
+	// the fake's lock): a test can hold a request in flight with it.
+	hook func(name string)
 }
 
 // fakeFile is what a CDN address answers: the bytes, or an HTTP status.
@@ -149,8 +153,12 @@ func newFakeMeta(clock *fakeClock) *fakeMeta {
 
 func (m *fakeMeta) record(name, arg string) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	m.calls = append(m.calls, call{name: name, at: m.clock.Now(), arg: arg})
+	hook := m.hook
+	m.mu.Unlock()
+	if hook != nil {
+		hook(name)
+	}
 }
 
 // requests are the calls that reach Meta (not Connect's socket or the
@@ -470,6 +478,7 @@ type harness struct {
 	m     *fakeMeta
 	clock *fakeClock
 	log   *testkit.Events
+	qc    *queueClock // the history queue's clock, with WithHistoryQueue (backlog_test.go)
 }
 
 func newHarness(t *testing.T) *harness {
@@ -477,8 +486,9 @@ func newHarness(t *testing.T) *harness {
 }
 
 // openHarness opens the store in dir; m, when given, is the fake Meta to
-// sign in to again (a restart).
-func openHarness(t *testing.T, dir string, m *fakeMeta) *harness {
+// sign in to again (a restart). Each opt is applied to the network before
+// it starts.
+func openHarness(t *testing.T, dir string, m *fakeMeta, opts ...func(*harness)) *harness {
 	t.Helper()
 	st, err := store.Open(dir, testKey)
 	if err != nil {
@@ -494,6 +504,9 @@ func openHarness(t *testing.T, dir string, m *fakeMeta) *harness {
 	h.g = New(st, dir, testKey, network.Emit(h.log.Emit).For(Name))
 	h.g.clock = h.clock
 	h.g.newClient = m.newClient
+	for _, opt := range opts {
+		opt(h)
+	}
 	if err := h.g.Start(context.Background()); err != nil {
 		t.Fatal(err)
 	}
