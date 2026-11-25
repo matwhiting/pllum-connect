@@ -607,3 +607,24 @@ func TestAQueueRequestYieldsAtItsTurn(t *testing.T) {
 		t.Errorf("a queue request after the yield = %v", err)
 	}
 }
+
+// A page the queue's counter did not see (asked outside the queue's
+// context) is still reported as the page it was, so the engine's guard
+// sees a page with no counted request and stops the queue. Only a chat
+// already finished is passed over without a request.
+func TestAnUncountedPageIsNotPassedOver(t *testing.T) {
+	h := newHarness(t)
+	h.g.WithHistoryQueue()
+	c := oldChat{key: 1000351, thread: "340282366841710300000000000000351", active: start.Add(-100 * 24 * time.Hour), pages: 3}
+	serve(h.m, c)
+	h.login(validSession()) // not live: no Run of the queue, the step is called here
+	h.clock.Advance(network.BacklogQuiet)
+	asked := h.g.traffic.BacklogAsked()
+	s := h.g.backlogNext(context.Background(), func(string) bool { return false }) // no WithBacklog
+	if h.g.traffic.BacklogAsked() != asked {
+		t.Fatalf("a request outside the queue's context was counted as the queue's")
+	}
+	if s.Outcome != network.StepMoved || s.Err != nil {
+		t.Errorf("the uncounted page is %+v, want StepMoved for the engine to judge", s)
+	}
+}

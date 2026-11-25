@@ -94,10 +94,12 @@ func (g *Instagram) backlogNext(ctx context.Context, passed func(string) bool) n
 	switch {
 	case err != nil:
 		return network.Step{Outcome: network.StepPassed, Chat: chat, Err: err}
-	case g.traffic.BacklogAsked() == asked:
-		// Nothing was asked: a scroll-back finished the chat while this
-		// step waited for it (fetchPages found it complete). Not a page,
-		// and no fault.
+	case complete && g.traffic.BacklogAsked() == asked:
+		// The chat was already complete when this step got it (a
+		// scroll-back finished it while the step waited for its lock), so
+		// nothing was asked: not a page, and no fault. Any other step that
+		// counted no request goes to the engine as what it was, and its
+		// guard judges it.
 		return network.Step{Outcome: network.StepPassed, Chat: chat}
 	case complete:
 		g.changed()
