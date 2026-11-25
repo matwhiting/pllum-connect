@@ -99,6 +99,11 @@ type Backlog struct {
 	holdUntil time.Time       // no request before this (a pushback's day)
 	holdKind  wire.Kind
 	stopped   wire.Kind // why it stopped for the helper's life; "" while it goes
+	// dayStop is a stop the kept day (dayKey) says this or an earlier
+	// helper made on dayStopDate: it holds for the rest of that local day,
+	// after a relaunch too.
+	dayStop     wire.Kind
+	dayStopDate string
 
 	// The rest is Run's alone: one Run at a time touches it.
 	stalls     int       // chats passed over with an error, in a row
@@ -203,7 +208,7 @@ func (b *Backlog) MayAsk() bool {
 	now := clock.Now()
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if b.stopped != "" || now.Before(b.holdUntil) {
+	if b.stopped != "" || now.Before(b.holdUntil) || b.dayStop != "" && b.dayStopDate == now.Local().Format(time.DateOnly) {
 		return false
 	}
 	return b.yieldAt.IsZero() || !now.Before(b.yieldAt.Add(BacklogYield))
@@ -261,6 +266,9 @@ func (b *Backlog) begin(now time.Time) {
 func (b *Backlog) state(now time.Time) (holdUntil time.Time, stopped wire.Kind) {
 	b.mu.Lock()
 	holdUntil, kind, stopped := b.holdUntil, b.holdKind, b.stopped
+	if stopped == "" && b.dayStop != "" && b.dayStopDate == now.Local().Format(time.DateOnly) {
+		stopped = b.dayStop
+	}
 	b.mu.Unlock()
 	if now.Before(holdUntil) && b.today.paused == "" {
 		b.today.paused = kind
@@ -319,7 +327,8 @@ func (b *Backlog) step(ctx context.Context) {
 	before := b.Traffic.BacklogAsked()
 	listing := b.List != nil && b.Listed != nil && !b.Listed()
 	var s Step
-	if listing && (b.listDue || b.chatSteps >= BacklogListEvery) {
+	listStep := listing && (b.listDue || b.chatSteps >= BacklogListEvery)
+	if listStep {
 		b.chatSteps, b.listDue = 0, false
 		s = b.List(WithBacklog(ctx))
 		if s.Outcome == StepNothing || s.Outcome == StepStart {
@@ -337,6 +346,11 @@ func (b *Backlog) step(ctx context.Context) {
 	}
 	now := b.Clock.Now()
 	n := b.Traffic.BacklogAsked() - before
+	if listStep && n == 0 && s.Err == nil && s.Outcome == StepPassed {
+		// The listing could ask nothing now either (it has no place to go
+		// on from yet): wait as when no chat has more.
+		s.Outcome = StepNothing
+	}
 	b.account(now)
 	b.roll(now)
 	b.today.pages += int(n)
@@ -459,6 +473,13 @@ func (b *Backlog) roll(now time.Time) {
 		if kept, ok := b.keptDay(); ok {
 			if kept.date >= date {
 				b.today = kept
+				if kept.stopped != "" {
+					// Stopped earlier today (this helper or one before
+					// it): stopped for the rest of the day.
+					b.mu.Lock()
+					b.dayStop, b.dayStopDate = kept.stopped, kept.date
+					b.mu.Unlock()
+				}
 				return
 			}
 			prev = kept

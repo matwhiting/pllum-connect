@@ -923,3 +923,53 @@ func TestBacklogStopsListingOnceListed(t *testing.T) {
 		t.Errorf("%d list steps, want 1 then none once listed: %v", n, *order)
 	}
 }
+
+// A stop is kept for the rest of its local day: a relaunch that day stays
+// stopped (never asking the request that stopped it again), and the next
+// local day it goes on.
+func TestAStopSurvivesARelaunchUntilTheNextLocalDay(t *testing.T) {
+	q := newQueue(t)
+	q.script = []Step{{Outcome: StepPassed, Err: errOf(wire.Internal)}}
+	q.run(time.Hour, 1)
+	if q.b.stopped != wire.Internal {
+		t.Fatalf("not stopped: %q", q.b.stopped)
+	}
+	q.relaunch()
+	midnight := time.Date(2026, 6, 11, 0, 0, 0, 0, time.Local)
+	q.run(midnight.Sub(q.clock.Now())-time.Minute, 0)
+	if n := len(q.asked()); n != 1 {
+		t.Fatalf("a relaunch the same day asked %d times, want none after the stop", n-1)
+	}
+	q.run(time.Hour, 2)
+	calls := q.asked()
+	if len(calls) != 2 || calls[1].at.Before(midnight) {
+		t.Fatalf("after the local midnight calls %v, want the queue going on", calls)
+	}
+}
+
+// A list step that could ask nothing, with no chat left, waits as an
+// empty step does (and the passed-over set starts over).
+func TestBacklogWaitsWhenNeitherChatNorListCanAsk(t *testing.T) {
+	q := newQueue(t)
+	q.script = []Step{{Outcome: StepPassed}, {Outcome: StepNothing}}
+	q.b.List = func(ctx context.Context) Step {
+		q.mu.Lock()
+		q.calls = append(q.calls, asked{at: q.clock.Now(), end: q.clock.Now(), chat: "list"})
+		q.mu.Unlock()
+		return Step{Outcome: StepPassed} // nothing it can ask yet
+	}
+	q.b.Listed = func() bool { return false }
+	q.run(time.Hour, 0)
+	calls := q.asked()
+	if len(calls) < 4 {
+		t.Fatalf("calls %v", calls)
+	}
+	// chat (passes one), chat (nothing), list (asks nothing), then the next
+	// chat step only after the empty wait, with nothing passed over.
+	if calls[2].chat != "list" || calls[3].at.Sub(calls[2].end) < BacklogEmpty {
+		t.Errorf("after a list step that asked nothing the next step came %v later, want %v", calls[3].at.Sub(calls[2].end), BacklogEmpty)
+	}
+	if len(calls[3].passed) != 0 {
+		t.Errorf("the passed-over set was kept: %v", calls[3].passed)
+	}
+}
