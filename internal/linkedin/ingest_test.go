@@ -361,3 +361,56 @@ func TestSpamIsLeftOut(t *testing.T) {
 		t.Errorf("a spam conversation became a chat")
 	}
 }
+
+func TestALinkedInParticipantCarriesItsPublicID(t *testing.T) {
+	r, c := liveWith(t)
+	g := conv(2, start)
+	g.GroupChat = true
+	g.Title = "Invented Group"
+	bob := person(bobID, "Bob", "Invented")
+	bob.ParticipantType.Member.ProfileURL = "https://www.linkedin.com/in/invented-person-12ab/"
+	// A URL that names the member by their profile ID is not a public ID.
+	other := person(otherID, "Other", "Invented")
+	other.ParticipantType.Member.ProfileURL = "https://www.linkedin.com/in/" + otherID
+	g.ConversationParticipants = append(g.ConversationParticipants, bob, other, org(orgID, "Invented Org"))
+	c.dispatch(convEvent(g))
+
+	got := map[string]string{}
+	for _, p := range r.chat(convURN(2)).Participants {
+		got[p.ID] = p.Handle
+	}
+	want := map[string]string{selfID: "", aliceID: "", bobID: "invented-person-12ab", otherID: "", orgID: ""}
+	if len(got) != len(want) {
+		t.Fatalf("participants = %v", got)
+	}
+	for id, h := range want {
+		if got[id] != h {
+			t.Errorf("participant %s has handle %q, want %q", id, got[id], h)
+		}
+	}
+}
+
+func TestPublicIDReadsOnlyAnInProfileURL(t *testing.T) {
+	for _, c := range []struct{ url, want string }{
+		{"https://www.linkedin.com/in/invented-person-12ab/", "invented-person-12ab"},
+		{"https://www.linkedin.com/in/invented-person-12ab", "invented-person-12ab"},
+		{"https://linkedin.com/in/invented-person-12ab?trk=invented", "invented-person-12ab"},
+		{"https://www.linkedin.com/in/invented-person-12ab/?miniProfileUrn=x", "invented-person-12ab"},
+		{"https://www.linkedin.com/in/inv%C3%A9nted-person", "invénted-person"},
+		{"https://nz.linkedin.com/in/invented-person-12ab/", "invented-person-12ab"},
+		{"https://www.linkedin.com/company/x", ""},
+		{"https://www.linkedin.com/in/", ""},
+		{"https://www.linkedin.com/in", ""},
+		{"", ""},
+		{"https://www.example.com/in/invented-person-12ab/", ""},
+		{"https://notlinkedin.com/in/invented-person-12ab/", ""},
+		{"https://www.linkedin.com.example.com/in/invented-person-12ab/", ""},
+		{"ftp://www.linkedin.com/in/invented-person-12ab/", ""},
+		{"/in/invented-person-12ab/", ""},
+		{"not a url %zz", ""},
+	} {
+		if got := publicID(c.url); got != c.want {
+			t.Errorf("publicID(%q) = %q, want %q", c.url, got, c.want)
+		}
+	}
+}

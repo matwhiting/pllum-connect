@@ -73,8 +73,8 @@ func TestOldStoreGainsTheLineIDIndex(t *testing.T) {
 		t.Fatalf("messages_id: %d, %v", n, err)
 	}
 	var v string
-	if err := s.db.QueryRow(`SELECT value FROM meta WHERE key = 'schema'`).Scan(&v); err != nil || v != "10" {
-		t.Fatalf("schema = %q, %v; want 10", v, err)
+	if err := s.db.QueryRow(`SELECT value FROM meta WHERE key = 'schema'`).Scan(&v); err != nil || v != "11" {
+		t.Fatalf("schema = %q, %v; want 11", v, err)
 	}
 	if chat, ok := s.ChatOfLine(net, "3EB0L0001"); !ok || chat != phoneChat {
 		t.Fatalf("ChatOfLine = %q, %v", chat, ok)

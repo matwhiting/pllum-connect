@@ -127,7 +127,7 @@ func (g *Instagram) participants(t *slidetypes.ThreadInfo) []store.Participant {
 		if u == nil || u.ID == "" {
 			continue
 		}
-		out = append(out, store.Participant{ID: u.ID, Name: nameOf(u)})
+		out = append(out, store.Participant{ID: u.ID, Name: nameOf(u), Handle: u.Username})
 	}
 	self := g.self()
 	if t.Viewer != nil && t.Viewer.ID != "" {

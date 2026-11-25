@@ -1,6 +1,7 @@
 package linkedin
 
 import (
+	"net/url"
 	"strings"
 
 	"go.mau.fi/mautrix-linkedin/pkg/linkedingo"
@@ -41,6 +42,26 @@ const conversationPrefix = "urn:li:msg_conversation:"
 
 // profileID is a participant's (or a profile's) ID: the last part of its URN.
 func profileID(u linkedingo.URN) string { return u.ID() }
+
+// publicID is the public profile ID in a member's profile URL
+// ("https://www.linkedin.com/in/<public ID>/", on linkedin.com or one of its
+// country hosts), decoded; "" for any other URL. It reads the URL only.
+func publicID(profileURL string) string {
+	u, err := url.Parse(profileURL)
+	if err != nil || (u.Scheme != "https" && u.Scheme != "http") {
+		return ""
+	}
+	host := strings.ToLower(u.Hostname())
+	if host != "linkedin.com" && !strings.HasSuffix(host, ".linkedin.com") {
+		return ""
+	}
+	rest, ok := strings.CutPrefix(u.Path, "/in/")
+	if !ok {
+		return ""
+	}
+	id, _, _ := strings.Cut(rest, "/")
+	return id
+}
 
 // isConversation reports whether a chat ID is a LinkedIn conversation's.
 func isConversation(chatID string) bool { return strings.HasPrefix(chatID, conversationPrefix) }

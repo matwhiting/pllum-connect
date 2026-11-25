@@ -120,12 +120,16 @@ type Message struct {
 	Raw        []byte // what the network needs to fetch its media; never read back here
 }
 
-// Participant is one member of a chat.
+// Participant is one member of a chat. Handle is the name the network
+// shows them by, from what it already sends (an Instagram username, a
+// LinkedIn public profile ID), or empty; a write with none keeps the one
+// held.
 type Participant struct {
 	ID     string
 	Name   string
 	Phone  string
 	IsSelf bool
+	Handle string
 }
 
 // Chat is one conversation as the protocol sends it. HistoryFromMs is 0 when
@@ -646,9 +650,15 @@ func mergeChat(tx *sql.Tx, network, from, into string) error {
 		return err
 	}
 	if err := execAll(tx, []any{into, network, from},
-		`INSERT OR IGNORE INTO participants (network, chat_id, participant_id, name, phone, is_self, position)
-			SELECT network, ?, participant_id, name, phone, is_self, position FROM participants
+		`INSERT OR IGNORE INTO participants (network, chat_id, participant_id, name, phone, is_self, position, handle)
+			SELECT network, ?, participant_id, name, phone, is_self, position, handle FROM participants
 			WHERE network = ? AND chat_id = ?`,
+		// One the target already held keeps its own fields, and gains the
+		// later chat's handle if it had none.
+		`UPDATE participants AS t SET handle = f.handle FROM participants AS f
+			WHERE t.network = f.network AND t.participant_id = f.participant_id
+			AND t.chat_id = ?1 AND t.network = ?2 AND f.chat_id = ?3
+			AND t.handle IS NULL AND f.handle IS NOT NULL`,
 		`UPDATE outgoing SET chat_id = ? WHERE network = ? AND chat_id = ?`,
 	); err != nil {
 		return err
@@ -708,6 +718,25 @@ func resolveReplies(tx *sql.Tx, network, chat string) error {
 		WHERE m.network = ? AND m.chat_id = ? AND m.reply_to LIKE 'beeper:%'
 		AND EXISTS (`+carrier+` AND t.msg_id <> m.reply_to)`, network, chat)
 	return err
+}
+
+// heldHandles are the handles a chat's participants hold, by participant.
+func heldHandles(tx *sql.Tx, network, chat string) (map[string]string, error) {
+	rows, err := tx.Query(`SELECT participant_id, handle FROM participants
+		WHERE network = ? AND chat_id = ? AND handle IS NOT NULL`, network, chat)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]string{}
+	for rows.Next() {
+		var id, handle string
+		if err := rows.Scan(&id, &handle); err != nil {
+			return nil, err
+		}
+		out[id] = handle
+	}
+	return out, rows.Err()
 }
 
 // execAll runs each statement with the same arguments.
@@ -991,6 +1020,12 @@ func (s *Store) PutChat(network string, c ChatInfo) error {
 			return err
 		}
 		if c.Participants != nil {
+			// The handles held, so a write that names a person without one
+			// keeps it.
+			held, err := heldHandles(tx, network, chat)
+			if err != nil {
+				return err
+			}
 			if _, err := tx.Exec(`DELETE FROM participants WHERE network = ? AND chat_id = ?`, network, chat); err != nil {
 				return err
 			}
@@ -998,10 +1033,14 @@ func (s *Store) PutChat(network string, c ChatInfo) error {
 				if p.ID == "" {
 					continue
 				}
+				handle := p.Handle
+				if handle == "" {
+					handle = held[p.ID]
+				}
 				if _, err := tx.Exec(`INSERT OR REPLACE INTO participants
-						(network, chat_id, participant_id, name, phone, is_self, position)
-						VALUES (?, ?, ?, NULLIF(?, ''), NULLIF(?, ''), ?, ?)`,
-					network, chat, p.ID, p.Name, p.Phone, p.IsSelf, i); err != nil {
+						(network, chat_id, participant_id, name, phone, is_self, position, handle)
+						VALUES (?, ?, ?, NULLIF(?, ''), NULLIF(?, ''), ?, ?, NULLIF(?, ''))`,
+					network, chat, p.ID, p.Name, p.Phone, p.IsSelf, i, handle); err != nil {
 					return err
 				}
 			}

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -778,5 +779,22 @@ func TestARateLimitHoldsEveryRequestUntilItEnds(t *testing.T) {
 	_ = h.m.dispatch(delta("340282366841710300000000000000022", &slidetypes.NewMessageEvent{Message: textMsg("mid.$invented-l4", bobFBID, start, "new")}))
 	if h.m.count("GetThread") != 1 {
 		t.Errorf("a new thread was not fetched after the block")
+	}
+}
+
+func TestAnInstagramParticipantCarriesItsUsername(t *testing.T) {
+	h := newHarness(t)
+	named := &slidetypes.User{InteropMessagingUserFBID: aliceFBI, ID: aliceIG, FullName: "Alice Example", Username: "invented.user"}
+	nameOnly := &slidetypes.User{InteropMessagingUserFBID: bobFBID, ID: bobIG, FullName: "Bob Example"}
+	h.m.mailbox = mailboxOf(false,
+		threadWith(aliceFBI, aliceThread, named, start.Add(-time.Hour)),
+		threadWith(bobFBID, "340282366841710300000000000000022", nameOnly, start.Add(-2*time.Hour)))
+	h.login(validSession())
+
+	if p := h.chat(aliceChat).Participants; len(p) != 2 || p[0].ID != aliceIG || p[0].Handle != "invented.user" || p[1].Handle != "" {
+		t.Errorf("the participants with a username are %+v", p)
+	}
+	if p := h.chat(strconv.FormatInt(bobFBID, 10)).Participants; len(p) != 2 || p[0].ID != bobIG || p[0].Handle != "" {
+		t.Errorf("the participants with only a full name are %+v", p)
 	}
 }

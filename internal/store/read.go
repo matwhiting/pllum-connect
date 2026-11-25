@@ -104,7 +104,7 @@ func participantsOf(q querier, network string, chats []string) (map[string][]Par
 		for _, c := range chunk {
 			args = append(args, c)
 		}
-		rows, err := q.Query(`SELECT chat_id, participant_id, name, phone, is_self FROM participants
+		rows, err := q.Query(`SELECT chat_id, participant_id, name, phone, is_self, handle FROM participants
 				WHERE network = ? AND chat_id IN (?`+strings.Repeat(", ?", len(chunk)-1)+`)
 				ORDER BY chat_id, position, participant_id`, args...)
 		if err != nil {
@@ -113,12 +113,12 @@ func participantsOf(q querier, network string, chats []string) (map[string][]Par
 		for rows.Next() {
 			var chat string
 			var p Participant
-			var name, phone sql.NullString
-			if err := rows.Scan(&chat, &p.ID, &name, &phone, &p.IsSelf); err != nil {
+			var name, phone, handle sql.NullString
+			if err := rows.Scan(&chat, &p.ID, &name, &phone, &p.IsSelf, &handle); err != nil {
 				rows.Close()
 				return nil, err
 			}
-			p.Name, p.Phone = name.String, phone.String
+			p.Name, p.Phone, p.Handle = name.String, phone.String, handle.String
 			if len(out[chat]) < maxParticipants {
 				out[chat] = append(out[chat], p)
 			}
@@ -491,6 +491,7 @@ func (c Chat) MarshalJSON() ([]byte, error) {
 	for _, p := range c.Participants {
 		ps = append(ps, map[string]any{
 			"id": p.ID, "name": nullable(p.Name), "phone": nullable(p.Phone), "isSelf": p.IsSelf,
+			"handle": nullable(p.Handle),
 		})
 	}
 	return json.Marshal(map[string]any{

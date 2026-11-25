@@ -59,6 +59,21 @@ func nameOf(p linkedingo.MessagingParticipant) string {
 	return ""
 }
 
+// handleOf is a member's public profile ID, from the profile URL the
+// conversation already carries; an organisation has none. A URL that names
+// the member by their profile ID (id) instead gives none: that is an ID,
+// not a public one.
+func handleOf(p linkedingo.MessagingParticipant, id string) string {
+	m := p.ParticipantType.Member
+	if m == nil {
+		return ""
+	}
+	if h := publicID(m.ProfileURL); h != id {
+		return h
+	}
+	return ""
+}
+
 // chatInfo is what a conversation says of its chat. One without participants
 // (a realtime event's partial copy) says nothing of its kind, people or name.
 func (l *LinkedIn) chatInfo(c linkedingo.Conversation) store.ChatInfo {
@@ -81,7 +96,8 @@ func (l *LinkedIn) chatInfo(c linkedingo.Conversation) store.ChatInfo {
 			if id == "" {
 				continue
 			}
-			info.Participants = append(info.Participants, store.Participant{ID: id, Name: nameOf(p), IsSelf: id == self})
+			info.Participants = append(info.Participants, store.Participant{ID: id, Name: nameOf(p), IsSelf: id == self,
+				Handle: handleOf(p, id)})
 			if title == "" && !c.GroupChat && id != self {
 				title = nameOf(p)
 			}

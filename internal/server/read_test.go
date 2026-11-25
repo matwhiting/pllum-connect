@@ -183,3 +183,44 @@ func wantKeys(t *testing.T, what string, m map[string]any, keys ...string) {
 		t.Errorf("%s has %v, want %v", what, got, keys)
 	}
 }
+
+func TestChatsSendHandleOnlyWhenKnown(t *testing.T) {
+	// Every name, ID and handle here is invented.
+	const chat = "120000000000000001@g.us"
+	stores := make(chan *store.Store, 1)
+	h := startWith(t, &fakeNetwork{name: "whatsapp"}, func(dir string, key [32]byte) (*store.Store, error) {
+		st, err := store.Open(dir, key)
+		if err == nil {
+			stores <- st
+		}
+		return st, err
+	})
+	result(t, h.hello())
+	st := <-stores
+	if err := st.PutChat("whatsapp", store.ChatInfo{ID: chat, Kind: "group", LastActivityMs: 1767225600000, Participants: []store.Participant{
+		{ID: "17840000000000001", Name: "Pat Example", Handle: "pllum.test"}, {ID: "17840000000000002", Name: "Sam Example"}}}); err != nil {
+		t.Fatalf("PutChat: %v", err)
+	}
+	r := result(t, h.call("c1", "chats", map[string]any{"sinceMs": 0, "limit": 50}))
+	items, _ := r["items"].([]any)
+	if len(items) != 1 {
+		t.Fatalf("chats = %v", r)
+	}
+	ps, _ := items[0].(map[string]any)["participants"].([]any)
+	if len(ps) != 2 {
+		t.Fatalf("participants = %v", ps)
+	}
+	for i, p := range ps {
+		wantKeys(t, fmt.Sprintf("participant %d", i), p.(map[string]any), "id", "name", "phone", "isSelf", "handle")
+	}
+	if got := ps[0].(map[string]any)["handle"]; got != "pllum.test" {
+		t.Errorf("the first participant's handle = %v", got)
+	}
+	if got, ok := ps[1].(map[string]any)["handle"]; !ok || got != nil {
+		t.Errorf("the second participant's handle = %v, want null", got)
+	}
+	r = result(t, h.call("c2", "chat", map[string]any{"chatID": chat}))
+	if p := r["chat"].(map[string]any)["participants"].([]any)[0].(map[string]any); p["handle"] != "pllum.test" {
+		t.Errorf("chat's participant = %v", p)
+	}
+}
