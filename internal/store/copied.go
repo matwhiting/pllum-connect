@@ -28,7 +28,11 @@ type CopiedLine struct {
 // the chat written into.
 //
 // Tests only: outside a test binary it refuses (internal) and writes
-// nothing, so the helper itself never makes a copied line again.
+// nothing, so the helper itself never makes a copied line again. It lives
+// here, not in export_test.go, because the server and WhatsApp tests seed
+// copies too: an export_test.go file is built only into this package's own
+// tests, and a test-support package could not reach write, resolveReplies
+// or refresh without exporting them.
 func (s *Store) SeedCopied(network, chatID, beeperChatID string, lines []CopiedLine) (string, error) {
 	if !testing.Testing() {
 		return "", errInternal
