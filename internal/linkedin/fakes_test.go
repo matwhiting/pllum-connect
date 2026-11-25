@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -569,6 +570,12 @@ type rig struct {
 	st    *store.Store
 	dir   string
 	ev    *events
+
+	// queue makes each network with a history queue (backlog_test.go), on
+	// qc, ready only once queueOn is set.
+	queue   bool
+	qc      *queueClock
+	queueOn atomic.Bool
 }
 
 func newRig(t *testing.T) *rig {
@@ -593,7 +600,13 @@ func (r *rig) restart() {
 		r.l.Stop()
 	}
 	r.ev = &events{}
-	r.l = New(r.st, r.dir, testKey, r.ev.Emit, Options{NewClient: r.f.newClient, Clock: r.clock})
+	r.l = New(r.st, r.dir, testKey, r.ev.Emit, Options{NewClient: r.f.newClient, Clock: r.clock, HistoryQueue: r.queue})
+	if r.queue {
+		r.qc = &queueClock{fakeClock: r.clock}
+		r.l.bq.Clock = r.qc
+		ready := r.l.bq.Ready
+		r.l.bq.Ready = func() bool { return r.queueOn.Load() && ready() }
+	}
 	if err := r.l.Start(context.Background()); err != nil {
 		r.t.Fatalf("Start: %v", err)
 	}

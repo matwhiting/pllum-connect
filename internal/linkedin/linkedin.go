@@ -100,6 +100,9 @@ type Options struct {
 	// Media is the media folder every network shares; main gives each
 	// network the same one. nil makes one of its own.
 	Media *mediacache.Cache
+	// HistoryQueue gives the network a history queue (backlog.go): each
+	// conversation paged on past 730 days to its start, in the background.
+	HistoryQueue bool
 }
 
 // realClient is linkedingo's client, with the page's User-Agent in place of
@@ -184,7 +187,14 @@ type LinkedIn struct {
 	nextBg time.Time // the earliest the next background request may go
 
 	changes network.Changed
-	traffic network.Traffic // the requests that reach LinkedIn, for the history queue
+	traffic network.Traffic // the requests that reach LinkedIn (media fetches too), for the history queue
+
+	// The history queue (backlog.go), with Options.HistoryQueue only: nil
+	// without. bqGen is the run its Run was started for; bqRuns counts the
+	// Runs still running (tests settle on it).
+	bq     *network.Backlog
+	bqGen  int
+	bqRuns atomic.Int32
 
 	// The sends in line (writes.go): one goroutine sends them, in order.
 	outbox network.Outbox
@@ -230,6 +240,13 @@ func New(st *store.Store, dir string, key [32]byte, emit network.Emit, opts Opti
 	l.outbox = network.Outbox{Begin: l.beginSends, End: l.work.Done, Deliver: l.deliver,
 		Stopped: func(id string) { l.fail(id, wire.NotConnected) }, Busy: func(d int) { l.busy.Add(int32(d)) }}
 	l.pause = &pause{now: func() time.Time { return l.clock.Now() }}
+	if opts.HistoryQueue {
+		l.bq = l.newBacklog()
+		l.bqGen = -1
+		// Any pause status, live work's included, holds the queue a day: a
+		// pause ends the run, so the queue would not see it otherwise.
+		l.pause.pushedBack = func() { l.queuePushedBack(wire.RateLimited) }
+	}
 	return l
 }
 
@@ -625,7 +642,8 @@ func (l *LinkedIn) probeRequest(ctx context.Context, pg int, session network.Ses
 			return errNotConnected
 		}
 		// This session LinkedIn won't take is kept as ended too, beside any
-		// kept before; the run in force, if any, goes on.
+		// kept before; the run in force, if any, goes on. The queue holds.
+		l.queuePushedBack(reconnectNeeded)
 		l.endProbe()
 		_ = l.keep("block", strings.Join(append(l.keptBlock(), hash), ","))
 		if l.runs.Ctx() != nil {
@@ -761,6 +779,13 @@ func (l *LinkedIn) request(ctx context.Context, gen int, background bool, fn fun
 			return err
 		}
 	}
+	// The history queue's request goes only if, once its turn in the pace
+	// has come, no other request is in flight or ended within
+	// network.BacklogQuiet, and the queue may still ask (not held, stopped
+	// or yielding to a scroll-back). Otherwise it is not made.
+	if network.IsBacklog(ctx) && (!l.traffic.Quiet(l.clock.Now(), network.BacklogQuiet) || l.bq != nil && !l.bq.MayAsk()) {
+		return errNotConnected
+	}
 	err := func() error {
 		end := l.traffic.Begin(ctx, l.clock.Now())
 		defer func() { end(l.clock.Now()) }()
@@ -830,11 +855,22 @@ func (l *LinkedIn) downloadRaw(ctx context.Context, cli liClient, url string) (r
 	if _, blocked := l.pause.blocked(); blocked {
 		return nil, nil, errRateLimited
 	}
+	end := l.traffic.Begin(ctx, l.clock.Now())
 	resp, raw = cli.DownloadHTTP(ctx, url)
 	if raw == nil {
+		if resp != nil && resp.Body != nil {
+			// In flight until its body is read.
+			resp.Body = endOnClose{ReadCloser: resp.Body, end: func() { end(l.clock.Now()) }}
+		} else {
+			end(l.clock.Now())
+		}
 		return resp, nil, nil
 	}
+	end(l.clock.Now())
 	kind := l.pause.checkMedia(raw)
+	if kind == wire.RateLimited {
+		l.queuePushedBack(wire.RateLimited) // a CDN's 429 or 999 never pauses LinkedIn, but holds the queue
+	}
 	if kind == reconnectNeeded {
 		l.mu.Lock()
 		gen := l.runs.Gen
@@ -862,6 +898,7 @@ func (l *LinkedIn) paused(gen int) {
 // deleted). The run ends, its stream too, and nothing asks with these
 // cookies again, after a restart either, until a new sign-in.
 func (l *LinkedIn) endSession(gen int) {
+	l.queuePushedBack(reconnectNeeded)
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if gen != l.runs.Gen || l.stopped || l.session == nil {

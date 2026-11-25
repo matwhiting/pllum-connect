@@ -80,6 +80,7 @@ func (l *LinkedIn) stayCaughtUp(ctx context.Context, gen int, cli liClient) {
 	l.realtime = true
 	_ = cli.RealtimeConnect(ctx)
 	l.setState(network.Live, "")
+	l.startQueue(gen)
 	l.mu.Unlock()
 
 	for {

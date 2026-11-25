@@ -32,6 +32,9 @@ const reconnectNeeded wire.Kind = "reconnectNeeded"
 // pause keeps the back-off. Its methods are safe from any goroutine.
 type pause struct {
 	now func() time.Time
+	// pushedBack, when set, runs for every pause status LinkedIn answers
+	// (whether or not it starts a new pause), outside the pause's lock.
+	pushedBack func()
 
 	mu      sync.Mutex
 	until   time.Time // no request before this
@@ -66,6 +69,9 @@ func (p *pause) check(err error) (kind wire.Kind, paused bool) {
 		switch re.StatusCode {
 		case 403, 429, 999:
 			p.start()
+			if p.pushedBack != nil {
+				p.pushedBack()
+			}
 			return wire.RateLimited, true
 		case 401, 302:
 			return reconnectNeeded, false
