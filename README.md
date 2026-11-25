@@ -1,6 +1,6 @@
 # Pllum Connect
 
-Pllum Connect is Pllum's network helper. Pllum, a macOS inbox, starts it as a child process and talks to it in JSON lines over its standard input and output. The helper keeps an encrypted message store on the Mac, seals the media it downloads (PROTOCOL.md, Media at rest), and connects to the messaging networks Pllum reads and sends through. Besides the store, the sealed media and a few small state files in its data folder, it writes one log per network, a diagnostics file `<network>/diagnostics.txt` (0600, started again past 64 KB). Each holds a daily count of the Beeper copies that network merged and of the news it matched to them, zero days included, and nothing else but the day and the counts; Messenger's also holds the encrypted side's warnings and self-checks as words, yes/no answers and counts, with every other number replaced by `#`. None ever holds a word of a message, an ID, a JID or a device number (PROTOCOL.md, Diagnostics and Messenger). The helper writes nothing on standard error.
+Pllum Connect is Pllum's network helper. Pllum, a macOS inbox, starts it as a child process and talks to it in JSON lines over its standard input and output. The helper keeps an encrypted message store on the Mac, seals the media it downloads (PROTOCOL.md, Media at rest), and connects to the messaging networks Pllum reads and sends through. Besides the store, the sealed media and a few small state files in its data folder, it writes one log per network, a diagnostics file `<network>/diagnostics.txt` (0600, started again past 64 KB). Each holds a daily count of the Beeper copies that network merged and of the news it matched to them, zero days included, and nothing else but the day and the counts. With `--history-queue`, Instagram's, Messenger's and LinkedIn's also hold the history queue's day line: the day, its counts, `yes`/`no` and a kind word. Messenger's also holds the encrypted side's warnings and self-checks as words, yes/no answers and counts, with every other number replaced by `#`. None ever holds a word of a message, an ID, a JID or a device number (PROTOCOL.md, Diagnostics and Messenger). The helper writes nothing on standard error.
 
 The protocol is in [PROTOCOL.md](PROTOCOL.md).
 
@@ -19,6 +19,8 @@ pllum-connect --data <folder>
 ```
 
 The data folder is made with mode 0700. Only one copy runs per folder: a second exits with code 3. The helper exits 0 at the end of its input.
+
+`--history-queue` turns on the background history queue, which is off without it: on Instagram, Messenger and LinkedIn it pages each chat back to its start, and lists chats older than the first sign-in's year, one request at a time. It asks only while the network is live and quiet, 15 to 25 s after its last request, at most 1,500 times a day; any pushback holds it for a day, and an error it does not know stops it until the next start (PROTOCOL.md, Background history).
 
 `--gate` adds one hidden method, `gateCounts` (counts only), for Messenger's gate: the one sitting in which a Debug Pllum checks whether its encrypted chats can be read before Messenger is built out. With it, every Messenger sign-in lists every folder afresh (with no 365-day reach, so the counts include the oldest threads) and fetches no history. Pllum's own copy never passes it.
 
