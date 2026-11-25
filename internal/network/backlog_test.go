@@ -2,13 +2,16 @@ package network
 
 import (
 	"context"
+	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/matwhiting/pllum-connect/internal/diag"
 	"github.com/matwhiting/pllum-connect/internal/store"
 	"github.com/matwhiting/pllum-connect/internal/testkit"
 	"github.com/matwhiting/pllum-connect/internal/wire"
@@ -537,5 +540,127 @@ func TestBacklogEndsWithItsRun(t *testing.T) {
 	case <-done:
 	case <-time.After(5 * time.Second):
 		t.Fatalf("Run went on after its context ended")
+	}
+}
+
+// dayLines are the history queue's lines in the network's diagnostics
+// file, as written.
+func (q *queue) dayLines() []string {
+	q.t.Helper()
+	b, err := os.ReadFile(filepath.Join(q.dir, "instagram", diag.FileName))
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		q.t.Fatal(err)
+	}
+	var out []string
+	for _, l := range strings.Split(strings.TrimSpace(string(b)), "\n") {
+		if strings.Contains(l, "history queue") {
+			out = append(out, l)
+		}
+	}
+	return out
+}
+
+var dayLineShape = regexp.MustCompile(`^\S+ history queue on \d{4}-\d{2}-\d{2}: pages \d+, chats finished \d+, chats left (\d+|unknown), minutes running \d+, paused (no|yes \w+), stopped (no|yes \w+)$`)
+
+const day1 = "2026-06-10"
+
+func TestBacklogWritesOneDayLinePerLocalDay(t *testing.T) {
+	q := newQueue(t)
+	q.script = []Step{{Outcome: StepMoved}, {Outcome: StepMoved}, {Outcome: StepMoved}, {Outcome: StepStart}}
+	q.onNext = func(_ context.Context, n int) {
+		if n == 4 {
+			q.set(func() { q.live = false })
+		}
+	}
+	q.run(24*time.Hour, 0) // to 01:00 the next day
+	lines := q.dayLines()
+	if len(lines) != 1 {
+		t.Fatalf("lines %q, want one", lines)
+	}
+	want := "history queue on " + day1 + ": pages 4, chats finished 1, chats left 7, minutes running 1, paused no, stopped no"
+	if !strings.HasSuffix(lines[0], " "+want) {
+		t.Errorf("the line is %q, want it to end %q", lines[0], want)
+	}
+}
+
+func TestBacklogDayLineSurvivesARelaunch(t *testing.T) {
+	q := newQueue(t)
+	q.run(time.Hour, 2)
+	if lines := q.dayLines(); len(lines) != 0 {
+		t.Fatalf("a line before the day ended: %q", lines)
+	}
+
+	// The next day, a new helper writes yesterday's line once.
+	q.clock.Advance(time.Date(2026, 6, 11, 9, 0, 0, 0, time.Local).Sub(q.clock.Now()))
+	q.relaunch()
+	q.run(time.Hour, 1)
+	lines := q.dayLines()
+	if len(lines) != 1 || !strings.Contains(lines[0], "history queue on "+day1+": pages 2,") {
+		t.Fatalf("lines %q, want one for %s with 2 pages", lines, day1)
+	}
+
+	// A third start that day writes nothing more, and goes on from the
+	// day's counts.
+	q.clock.Advance(time.Hour)
+	q.relaunch()
+	q.set(func() { q.live = false })
+	q.run(time.Hour, 0)
+	if again := q.dayLines(); len(again) != 1 {
+		t.Errorf("lines %q after a third start, want still one", again)
+	}
+	if q.b.today.pages != 1 {
+		t.Errorf("the third start holds %d pages for the day, want the 1 kept", q.b.today.pages)
+	}
+}
+
+func TestBacklogDayLineSaysPausedAndStopped(t *testing.T) {
+	q := newQueue(t)
+	// The step fails with an error the queue does not know, and a send was
+	// rate-limited meanwhile.
+	q.script = []Step{{Outcome: StepPassed, Err: errOf(wire.Internal)}}
+	q.onNext = func(_ context.Context, n int) {
+		q.set(func() { q.blocked = wire.RateLimited })
+	}
+	q.run(24*time.Hour, 0)
+	lines := q.dayLines()
+	if len(lines) != 1 || !strings.HasSuffix(lines[0], "paused yes rateLimited, stopped yes internal") {
+		t.Fatalf("lines %q, want one ending paused yes rateLimited, stopped yes internal", lines)
+	}
+}
+
+func TestBacklogDayLineHoldsOnlyCounts(t *testing.T) {
+	q := newQueue(t)
+	q.chats = []string{"chat-invented-41", "chat-invented-42", "chat-invented-43", "chat-invented-44"}
+	q.script = []Step{{Outcome: StepMoved}, {Outcome: StepStart}, {Outcome: StepPassed},
+		{Outcome: StepPassed, Err: errOf(wire.Timeout)}, {Outcome: StepNothing}, {Outcome: StepMoved},
+		{Outcome: StepPassed, Err: errOf(wire.Checkpoint)}}
+	q.b.Left = func() (int, bool) { return 0, false }
+	q.run(3*24*time.Hour, 0)
+	lines := q.dayLines()
+	if len(lines) < 2 {
+		t.Fatalf("lines %q, want one a day", lines)
+	}
+	for _, l := range lines {
+		if !dayLineShape.MatchString(l) {
+			t.Errorf("%q is not a counts-only line", l)
+		}
+		for _, c := range q.chats {
+			if strings.Contains(l, c) || strings.Contains(l, strings.TrimPrefix(c, "chat-invented-")+",") {
+				t.Errorf("%q names a chat", l)
+			}
+		}
+	}
+}
+
+func TestBacklogWritesADayLineWhenItAskedNothing(t *testing.T) {
+	q := newQueue(t)
+	q.set(func() { q.live = false })
+	q.run(24*time.Hour, 0)
+	lines := q.dayLines()
+	if len(lines) != 1 || !strings.HasSuffix(lines[0], "history queue on "+day1+": pages 0, chats finished 0, chats left 7, minutes running 0, paused no, stopped no") {
+		t.Fatalf("lines %q, want one for %s with nothing asked", lines, day1)
 	}
 }

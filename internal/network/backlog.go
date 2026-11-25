@@ -2,6 +2,7 @@ package network
 
 import (
 	"context"
+	"fmt"
 	"math/rand/v2"
 	"strconv"
 	"strings"
@@ -9,6 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/matwhiting/pllum-connect/internal/diag"
 	"github.com/matwhiting/pllum-connect/internal/wire"
 )
 
@@ -50,6 +52,7 @@ type Step struct {
 // Batch).
 const (
 	holdKey = "hq.hold" // <until, Unix ms>\n<kind>
+	dayKey  = "hq.day"  // <YYYY-MM-DD>\n<pages>\n<finished>\n<minutes>\n<paused kind>\n<stopped kind>
 )
 
 // Backlog is a network's history queue: it pages its chats back to their
@@ -91,12 +94,15 @@ type Backlog struct {
 	stalls     int       // chats passed over with an error, in a row
 	emptyUntil time.Time // no chat had more: it looks again then
 	today      queueDay
+	since      time.Time // allowed to ask since then, not yet counted in today; zero while not
 }
 
-// queueDay is the queue's counts for one local day.
+// queueDay is the queue's counts for one local day, kept in dayKey: once
+// the day has passed, its line goes to the diagnostics file.
 type queueDay struct {
 	date            string // YYYY-MM-DD, local
 	pages, finished int
+	running         time.Duration // allowed to ask (kept in whole minutes)
 	paused, stopped wire.Kind
 }
 
@@ -112,8 +118,10 @@ func (b *Backlog) Run(ctx context.Context) {
 	defer b.running.Store(false)
 
 	now := b.Clock.Now()
+	b.since = time.Time{}
 	b.roll(now)
 	b.begin(now)
+	b.keepDay()
 	// from is what the gap counts from: the end of the queue's last
 	// request, or the time it was last allowed to ask again (the run's
 	// start, a hold's end, the network going live), so time spent not
@@ -121,16 +129,20 @@ func (b *Backlog) Run(ctx context.Context) {
 	from, gap, allowed := now, b.gap(), false
 	for ctx.Err() == nil {
 		now = b.Clock.Now()
+		b.account(now)
 		b.roll(now)
-		if wait, ok := b.mayAsk(now); !ok {
-			allowed = false
+		wait, ok := b.mayAsk(now)
+		if !ok {
+			allowed, b.since = false, time.Time{}
+		} else if !allowed {
+			allowed, from, b.since = true, now, now
+		}
+		b.keepDay()
+		if !ok {
 			if !b.sleep(ctx, now, wait) {
 				return
 			}
 			continue
-		}
-		if !allowed {
-			allowed, from = true, now
 		}
 		at, quiet := b.askAt(from.Add(gap))
 		if !quiet {
@@ -237,8 +249,10 @@ func (b *Backlog) step(ctx context.Context) {
 	s := b.Next(WithBacklog(ctx), b.isPassed)
 	now := b.Clock.Now()
 	n := b.Traffic.BacklogAsked() - before
+	b.account(now)
 	b.roll(now)
 	b.today.pages += int(n)
+	defer b.keepDay()
 	if n > 1 {
 		// A step makes one request at most: this one is a bug, and
 		// may be a burst.
@@ -321,16 +335,99 @@ func (b *Backlog) stop(kind wire.Kind) {
 	}
 }
 
-// roll starts a new day's counts when now's local day is not the one held.
+// roll starts a new day's counts when now's local day is not the one held,
+// writing the day before's line. The first time, it takes up the day kept
+// by this or an earlier helper: today's counts go on; an earlier day's line
+// is written. A day the helper never ran has no line.
 func (b *Backlog) roll(now time.Time) {
 	date := now.Local().Format(time.DateOnly)
 	if b.today.date == date {
 		return
 	}
+	prev := b.today
+	if prev.date == "" {
+		if kept, ok := b.keptDay(); ok {
+			if kept.date == date {
+				b.today = kept
+				return
+			}
+			prev = kept
+		}
+	}
+	if prev.date != "" && prev.date < date {
+		b.writeLine(now, prev)
+	}
 	b.today = queueDay{date: date, stopped: b.stopped}
 	if now.Before(b.holdUntil) {
 		b.today.paused = b.holdKind
 	}
+}
+
+// account counts the time since b.since, while it was allowed to ask, in
+// today's minutes.
+func (b *Backlog) account(now time.Time) {
+	if b.since.IsZero() {
+		return
+	}
+	if d := now.Sub(b.since); d > 0 {
+		b.today.running += d
+	}
+	b.since = now
+}
+
+// writeLine writes d's line to the network's diagnostics file: counts only.
+func (b *Backlog) writeLine(now time.Time, d queueDay) {
+	if b.Dir == "" || b.Name == "" {
+		return
+	}
+	left := "unknown"
+	if b.Left != nil {
+		if n, ok := b.Left(); ok {
+			left = strconv.Itoa(n)
+		}
+	}
+	diag.For(b.Dir, b.Name).Line(now, fmt.Sprintf(diag.HistoryLine, d.date, d.pages, d.finished, left,
+		int(d.running/time.Minute), yesKind(d.paused), yesKind(d.stopped)))
+}
+
+// keepDay keeps today's counts (written only when they change).
+func (b *Backlog) keepDay() {
+	d := b.today
+	v := strings.Join([]string{d.date, strconv.Itoa(d.pages), strconv.Itoa(d.finished),
+		strconv.Itoa(int(d.running / time.Minute)), string(d.paused), string(d.stopped)}, "\n")
+	_ = b.Values.Keep(dayKey, v)
+}
+
+// keptDay is the day kept in dayKey; ok is false when none can be read.
+func (b *Backlog) keptDay() (queueDay, bool) {
+	v, err := b.Values.Lookup(dayKey)
+	if err != nil || v == "" {
+		return queueDay{}, false
+	}
+	f := strings.Split(v, "\n")
+	if len(f) != 6 {
+		return queueDay{}, false
+	}
+	if _, err := time.Parse(time.DateOnly, f[0]); err != nil {
+		return queueDay{}, false
+	}
+	var n [3]int
+	for i := range n {
+		x, err := strconv.Atoi(f[i+1])
+		if err != nil || x < 0 {
+			return queueDay{}, false
+		}
+		n[i] = x
+	}
+	return queueDay{date: f[0], pages: n[0], finished: n[1], running: time.Duration(n[2]) * time.Minute,
+		paused: wire.Kind(f[4]), stopped: wire.Kind(f[5])}, true
+}
+
+func yesKind(k wire.Kind) string {
+	if k == "" {
+		return "no"
+	}
+	return "yes " + string(k)
 }
 
 // sleep waits d, but no later than the next local midnight (so a day's
