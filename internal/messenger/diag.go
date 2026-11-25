@@ -3,8 +3,6 @@ package messenger
 import (
 	"context"
 	"fmt"
-	"os"
-	"path/filepath"
 	"regexp"
 	"slices"
 	"strconv"
@@ -17,11 +15,12 @@ import (
 	watypes "go.mau.fi/whatsmeow/types"
 	waLog "go.mau.fi/whatsmeow/util/log"
 
+	"github.com/matwhiting/pllum-connect/internal/diag"
 	"github.com/matwhiting/pllum-connect/internal/wire"
 )
 
 // Diagnostics for the encrypted side, in <dir>/messenger/diagnostics.txt
-// (0600, on his Mac only, started again past diagLimit): the library's
+// (diag.For: 0600, on his Mac only, started again past diag.Limit): the library's
 // warnings about decrypting a message, a self-check each time the
 // encrypted socket comes up, and its ICDC half and any re-registration in
 // each run's setup (each of their requests through the pace), and how many
@@ -30,8 +29,6 @@ import (
 // (sanitize), so it
 // holds no ID, JID, device number or time but its own timestamp, and never
 // a word of a message: the library's warnings name a message by its ID only.
-
-const diagLimit = 64 << 10
 
 var digits = regexp.MustCompile(`[0-9]+`)
 
@@ -45,21 +42,7 @@ func (m *Messenger) diag(line string) { m.diagLine(sanitize(line)) }
 // page's passed-over lines (passedOver), made of words, yes/no and counts,
 // never an ID.
 func (m *Messenger) diagLine(line string) {
-	m.diagFile.mu.Lock()
-	defer m.diagFile.mu.Unlock()
-	path := filepath.Join(m.dir, Name, "diagnostics.txt")
-	if info, err := os.Stat(path); err == nil && info.Size() > diagLimit-1024 {
-		_ = os.Remove(path)
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return
-	}
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
-	if err != nil {
-		return
-	}
-	defer f.Close()
-	_, _ = fmt.Fprintf(f, "%s %s\n", m.clock.Now().UTC().Format(time.RFC3339), line)
+	diag.For(m.dir, Name).Line(m.clock.Now(), line)
 }
 
 // diagLogger is the library's logger: its warnings and errors about

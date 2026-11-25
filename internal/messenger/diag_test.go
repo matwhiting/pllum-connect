@@ -13,6 +13,8 @@ import (
 	"go.mau.fi/mautrix-meta/pkg/messagix/securehistory"
 	watypes "go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
+
+	"github.com/matwhiting/pllum-connect/internal/diag"
 )
 
 // A diagnostic line keeps the words and loses every number: IDs, JIDs,
@@ -61,8 +63,8 @@ func TestTheDiagnosticsFileStaysSmall(t *testing.T) {
 		h.m.diag("Error decrypting message: invented reason that is long enough to fill the file quickly")
 	}
 	info, err := os.Stat(filepath.Join(h.dir, Name, "diagnostics.txt"))
-	if err != nil || info.Size() > diagLimit {
-		t.Errorf("the diagnostics file is %d bytes, want at most %d", info.Size(), diagLimit)
+	if err != nil || info.Size() > diag.Limit {
+		t.Errorf("the diagnostics file is %d bytes, want at most %d", info.Size(), diag.Limit)
 	}
 }
 

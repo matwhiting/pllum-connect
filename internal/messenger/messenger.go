@@ -201,7 +201,6 @@ type Messenger struct {
 	devStore deviceStore // the whatsmeow device store (e2ee.go)
 	restore  restoreState
 	book     backupBook
-	diagFile diagFile
 	checked  atomic.Bool // this run's self-check has run (diag.go)
 	ebActive atomic.Bool // the first read of his backup is running (enc_history.go)
 	fills    fills

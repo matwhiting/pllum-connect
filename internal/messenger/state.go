@@ -51,11 +51,6 @@ type backupBook struct {
 	mu sync.Mutex
 }
 
-// diagFile is diagnostics.txt (diag.go): one line written at a time.
-type diagFile struct {
-	mu sync.Mutex
-}
-
 // fills are the chats whose newest backup page is due (catchup.go): due two
 // minutes on, again an hour on. Both are in memory only: a restart forgets
 // them, and the daily catch-up still reads the chat.
