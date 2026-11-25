@@ -47,8 +47,8 @@ const (
 // backfills, older pages), so a direct line still takes over its copy
 // (putNewID, absorbBeeperCopy) and a merge still joins a copy to its line
 // (mergeLine); a write whose chat holds no copy near it skips all of that
-// in one query (copyNear). Every such merge is counted (merges.go), so the
-// day it stops firing shows.
+// in one query (copyNear). Every merge, and every news matched to a copy,
+// is counted (merges.go), so the day it stops firing shows.
 
 // beeperPrefix starts the ID of a line that exists only in Beeper's copy.
 const beeperPrefix = "beeper:"
@@ -780,6 +780,9 @@ func mergeLine(tx *sql.Tx, network, from, into string, rid int64) error {
 			return err
 		}
 		if brid != 0 {
+			if err := countNews(tx, network); err != nil {
+				return err
+			}
 			if err := updateLine(tx, brid, m, media, false); err != nil {
 				return err
 			}
@@ -1123,6 +1126,9 @@ func putNewID(tx *sql.Tx, network string, m Message, media any) (added bool, err
 	case rid != 0 && isWhole(m):
 		return false, takeOver(tx, network, rid, oldID, m, media, false)
 	case rid != 0:
+		if err := countNews(tx, network); err != nil {
+			return false, err
+		}
 		return false, updateLine(tx, rid, m, media, false)
 	case isWhole(m) && near:
 		if rid, oldID, err = beeperLineLike(tx, network, m, 0); err != nil {

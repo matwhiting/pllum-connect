@@ -8,17 +8,18 @@ import (
 	"github.com/matwhiting/pllum-connect/internal/store"
 )
 
-// MergeLine is the day line's text: the local date and how many of
-// Beeper's copied lines the network merged that day, and nothing else.
-const MergeLine = "beeper copies merged on %s: %d"
+// MergeLine is the day line's text: the local date, how many of Beeper's
+// copied lines the network merged that day, and how many receipts, edits
+// and revokes it matched to the copy naming their line, and nothing else.
+const MergeLine = "beeper copies merged on %s: %d, matched news: %d"
 
 // mergeEvery is how often Merges looks whether the day has turned.
 const mergeEvery = time.Minute
 
 // Merges writes, once a day, one line per network to its diagnostics file:
-// how many of Beeper's copied lines it merged that (local) day, zero
-// included (store.CloseMergeDays), so a run of zero days shows when the
-// matching has stopped firing.
+// how many of Beeper's copied lines it merged that (local) day and how much
+// news it matched to them, zero included (store.CloseMergeDays), so a run
+// of zero days shows when the matching has stopped firing.
 type Merges struct {
 	st       *store.Store
 	dir      string
@@ -49,7 +50,7 @@ func (m *Merges) Check(now time.Time) {
 		}
 		f := For(m.dir, network)
 		for _, d := range days {
-			f.Line(now, fmt.Sprintf(MergeLine, d.Day, d.Merged))
+			f.Line(now, fmt.Sprintf(MergeLine, d.Day, d.Merged, d.News))
 		}
 	}
 	if ok {

@@ -12,9 +12,14 @@ import (
 // see when that is, every merge is counted, per network, in beeper_merges:
 // a direct line taking over a copied line (takeOver), and a copied line
 // folded into a direct one (foldLine: absorbBeeperCopy, a twin fold, the
-// stored-twins upgrade, a chat merge). The count rides in the merge's own
-// transaction, so it is exact across restarts. Once a day the diagnostics
-// files get one counts-only line per network (diag.Merges), zero included.
+// stored-twins upgrade, a chat merge). News about a line that the matching
+// lands on the copy naming it, without merging, is counted apart: a
+// receipt, edit or revoke written under the ID a copy named (putNewID), and
+// a chat merge bringing an early row to the copy naming it (mergeLine).
+// With both at zero, no matching fired. The counts ride in the write's own
+// transaction, so they are exact across restarts. Once a day the
+// diagnostics files get one counts-only line per network (diag.Merges),
+// zero included.
 
 // dayLayout is a day as CloseMergeDays takes and gives it.
 const dayLayout = "2006-01-02"
@@ -30,6 +35,14 @@ func countMerge(tx *sql.Tx, network string) error {
 	return err
 }
 
+// countNews counts one piece of news about a line (a receipt, an edit, a
+// revoke) landing on the copied line naming it, for network.
+func countNews(tx *sql.Tx, network string) error {
+	_, err := tx.Exec(`INSERT INTO beeper_merges (network, news) VALUES (?, 1)
+		ON CONFLICT (network) DO UPDATE SET news = news + 1`, network)
+	return err
+}
+
 // countMergeOf counts a fold of line fromID into line toID when it merges a
 // copied line into a direct one: fromID is a beeper: ID and toID is not.
 func countMergeOf(tx *sql.Tx, network, fromID, toID string) error {
@@ -39,19 +52,21 @@ func countMergeOf(tx *sql.Tx, network, fromID, toID string) error {
 	return countMerge(tx, network)
 }
 
-// MergeDay is one day's count of copied lines merged in a network.
+// MergeDay is one day's counts of a network's matching to copied lines.
 type MergeDay struct {
 	Day    string // the local date, YYYY-MM-DD
-	Merged int
+	Merged int    // copied lines merged with their direct line
+	News   int    // receipts, edits and revokes landed on the copy naming their line
 }
 
 // CloseMergeDays closes the days before today (a local date, YYYY-MM-DD)
-// of network's merge count and gives each, oldest first: the open day with
-// what was merged since it opened, then each later day before today with
-// 0 (the helper was not running, so nothing merged). The count starts again
-// for today. The first call for a network gives nothing and opens today, so
-// what was merged before it counts for today; a call on the open day, or
-// with a today before it (the clock moved back), gives nothing.
+// of network's merge counts and gives each, oldest first: the open day
+// with what was merged and matched since it opened, then each later day
+// before today with 0 (the helper was not running, so nothing was). The
+// counts start again for today. The first call for a network gives nothing
+// and opens today, so what came before it counts for today; a call on the
+// open day, or with a today before it (the clock moved back), gives
+// nothing.
 func (s *Store) CloseMergeDays(network, today string) ([]MergeDay, error) {
 	if network == "" {
 		return nil, errBadRequest
@@ -63,11 +78,12 @@ func (s *Store) CloseMergeDays(network, today string) ([]MergeDay, error) {
 	var out []MergeDay
 	err = s.write(func(tx *sql.Tx) error {
 		out = nil
-		var merged int
+		var merged, news int
 		var day string
-		err := tx.QueryRow(`SELECT merged, day FROM beeper_merges WHERE network = ?`, network).Scan(&merged, &day)
+		err := tx.QueryRow(`SELECT merged, news, day FROM beeper_merges WHERE network = ?`, network).
+			Scan(&merged, &news, &day)
 		if errors.Is(err, sql.ErrNoRows) {
-			_, err = tx.Exec(`INSERT INTO beeper_merges (network, merged, day) VALUES (?, 0, ?)`, network, today)
+			_, err = tx.Exec(`INSERT INTO beeper_merges (network, day) VALUES (?, ?)`, network, today)
 			return err
 		}
 		if err != nil {
@@ -75,14 +91,14 @@ func (s *Store) CloseMergeDays(network, today string) ([]MergeDay, error) {
 		}
 		open, perr := time.Parse(dayLayout, day)
 		if perr != nil {
-			// Never opened (merges counted before the first call): today.
+			// Never opened (counted before the first call): today.
 			_, err = tx.Exec(`UPDATE beeper_merges SET day = ? WHERE network = ?`, today, network)
 			return err
 		}
 		if !open.Before(now) {
 			return nil
 		}
-		out = append(out, MergeDay{Day: day, Merged: merged})
+		out = append(out, MergeDay{Day: day, Merged: merged, News: news})
 		first := open.AddDate(0, 0, 1)
 		if limit := now.AddDate(0, 0, -maxZeroDays); first.Before(limit) {
 			first = limit
@@ -90,7 +106,7 @@ func (s *Store) CloseMergeDays(network, today string) ([]MergeDay, error) {
 		for d := first; d.Before(now); d = d.AddDate(0, 0, 1) {
 			out = append(out, MergeDay{Day: d.Format(dayLayout)})
 		}
-		_, err = tx.Exec(`UPDATE beeper_merges SET merged = 0, day = ? WHERE network = ?`, today, network)
+		_, err = tx.Exec(`UPDATE beeper_merges SET merged = 0, news = 0, day = ? WHERE network = ?`, today, network)
 		return err
 	})
 	if err != nil {

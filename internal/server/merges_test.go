@@ -44,7 +44,7 @@ func TestHelloStartsTheDayLineOfMerges(t *testing.T) {
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	if !strings.HasSuffix(strings.TrimSpace(string(b)), " beeper copies merged on 2026-03-01: 0") {
+	if !strings.HasSuffix(strings.TrimSpace(string(b)), " beeper copies merged on 2026-03-01: 0, matched news: 0") {
 		t.Fatalf("the diagnostics file reads %q", b)
 	}
 }

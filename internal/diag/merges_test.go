@@ -70,6 +70,26 @@ func (h *harness) merge(t *testing.T, network string, n int) {
 	}
 }
 
+// news seeds n copied lines in network and has the network send an edit
+// of each under the ID the copy named: n matched news, no merge.
+func (h *harness) news(t *testing.T, network string, n int) {
+	t.Helper()
+	for range n {
+		i := h.merges
+		h.merges++
+		chat := fmt.Sprintf("chat-%s-%d", network, i)
+		id := fmt.Sprintf("line-%s-%d", network, i)
+		if _, err := h.st.SeedCopied(network, chat, "bc-"+chat, []store.CopiedLine{{BeeperID: "bm-" + id, NetworkID: id,
+			TimeMs: int64(1767225600000 + i*60_000), Text: "invented words"}}); err != nil {
+			t.Fatal(err)
+		}
+		added, err := h.st.PutMessage(network, store.Message{ID: id, ChatID: chat, Text: "invented edit", Edited: true})
+		if err != nil || added {
+			t.Fatalf("the edit was added beside its copy (%v)", err)
+		}
+	}
+}
+
 func (h *harness) lines(t *testing.T, network string) []string {
 	t.Helper()
 	var out []string
@@ -80,8 +100,9 @@ func (h *harness) lines(t *testing.T, network string) []string {
 	return out
 }
 
-// The day line: each merge counts, the line is written once a day with the
-// count, a zero day included, and it holds nothing but the day and count.
+// The day line: each merge and each matched news counts, the line is
+// written once a day with both counts, a zero day included, and it holds
+// nothing but the day and the counts.
 func TestTheDayLineCountsEachMergeOnceADay(t *testing.T) {
 	h := newHarness(t)
 	h.m.Check(at(1, 9)) // the first start: opens 1 March, writes nothing
@@ -89,6 +110,7 @@ func TestTheDayLineCountsEachMergeOnceADay(t *testing.T) {
 		t.Fatalf("the first start wrote %q", got)
 	}
 	h.merge(t, "whatsapp", 3)
+	h.news(t, "whatsapp", 2)
 	h.merge(t, "linkedin", 1)
 	h.m.Check(at(1, 23)) // the same day: nothing yet
 	if got := h.lines(t, "whatsapp"); got != nil {
@@ -98,10 +120,10 @@ func TestTheDayLineCountsEachMergeOnceADay(t *testing.T) {
 	h.m.Check(at(2, 0))
 	h.m.Check(at(2, 0).Add(time.Minute)) // once a day, however often it looks
 	h.m.Check(at(2, 12))
-	if got := h.lines(t, "whatsapp"); len(got) != 1 || got[0] != "beeper copies merged on 2026-03-01: 3" {
+	if got := h.lines(t, "whatsapp"); len(got) != 1 || got[0] != "beeper copies merged on 2026-03-01: 3, matched news: 2" {
 		t.Fatalf("WhatsApp's file reads %q", got)
 	}
-	if got := h.lines(t, "linkedin"); len(got) != 1 || got[0] != "beeper copies merged on 2026-03-01: 1" {
+	if got := h.lines(t, "linkedin"); len(got) != 1 || got[0] != "beeper copies merged on 2026-03-01: 1, matched news: 0" {
 		t.Fatalf("LinkedIn's file reads %q", got)
 	}
 
@@ -110,18 +132,18 @@ func TestTheDayLineCountsEachMergeOnceADay(t *testing.T) {
 	h.m.Check(at(3, 8))
 	h.m.Check(at(6, 8))
 	want := []string{
-		"beeper copies merged on 2026-03-01: 3",
-		"beeper copies merged on 2026-03-02: 0",
-		"beeper copies merged on 2026-03-03: 0",
-		"beeper copies merged on 2026-03-04: 0",
-		"beeper copies merged on 2026-03-05: 0",
+		"beeper copies merged on 2026-03-01: 3, matched news: 2",
+		"beeper copies merged on 2026-03-02: 0, matched news: 0",
+		"beeper copies merged on 2026-03-03: 0, matched news: 0",
+		"beeper copies merged on 2026-03-04: 0, matched news: 0",
+		"beeper copies merged on 2026-03-05: 0, matched news: 0",
 	}
 	if got := h.lines(t, "whatsapp"); strings.Join(got, "\n") != strings.Join(want, "\n") {
 		t.Fatalf("WhatsApp's file reads %q, want %q", got, want)
 	}
 
-	// Nothing identifying: every line is the time, the words and two numbers.
-	shape := regexp.MustCompile(`^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ beeper copies merged on \d{4}-\d\d-\d\d: \d+$`)
+	// Nothing identifying: every line is the time, the words, the day and two numbers.
+	shape := regexp.MustCompile(`^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ beeper copies merged on \d{4}-\d\d-\d\d: \d+, matched news: \d+$`)
 	for _, network := range []string{"whatsapp", "linkedin"} {
 		path := filepath.Join(h.dir, network, FileName)
 		b, _ := os.ReadFile(path)
@@ -152,7 +174,7 @@ func TestTheCountOutlivesARestart(t *testing.T) {
 	h.m.Check(at(1, 15))
 	h.merge(t, "whatsapp", 1)
 	h.m.Check(at(2, 9))
-	if got := h.lines(t, "whatsapp"); len(got) != 1 || got[0] != "beeper copies merged on 2026-03-01: 3" {
+	if got := h.lines(t, "whatsapp"); len(got) != 1 || got[0] != "beeper copies merged on 2026-03-01: 3, matched news: 0" {
 		t.Fatalf("WhatsApp's file reads %q", got)
 	}
 }
@@ -173,7 +195,7 @@ func TestRunChecksAtOnceAndStops(t *testing.T) {
 	}
 	cancel()
 	<-done
-	if got := h.lines(t, "linkedin"); len(got) != 1 || got[0] != "beeper copies merged on 2026-03-01: 0" {
+	if got := h.lines(t, "linkedin"); len(got) != 1 || got[0] != "beeper copies merged on 2026-03-01: 0, matched news: 0" {
 		t.Fatalf("LinkedIn's file reads %q", got)
 	}
 }
