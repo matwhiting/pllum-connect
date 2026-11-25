@@ -130,6 +130,17 @@ var schema = []string{
 	)`,
 	`CREATE INDEX IF NOT EXISTS beeper_ids_id ON beeper_ids (network, beeper_id)`,
 
+	// How many of Beeper's copied lines each network has merged (merges.go):
+	// merged since the day line for day was last written. Counts only; it
+	// goes once the matching it counts is removed. Added without a schema
+	// version: a new table changes no row, so an older helper still opens a
+	// store that has it.
+	`CREATE TABLE IF NOT EXISTS beeper_merges (
+		network TEXT    PRIMARY KEY,
+		merged  INTEGER NOT NULL DEFAULT 0,
+		day     TEXT    NOT NULL DEFAULT ''
+	)`,
+
 	`CREATE TABLE IF NOT EXISTS reactions (
 		network   TEXT    NOT NULL,
 		chat_id   TEXT    NOT NULL,

@@ -161,4 +161,7 @@ func TestTheUpgradeFoldsStoredTwins(t *testing.T) {
 	if after := nearMisses(t, s); after != before-1 {
 		t.Fatalf("after the upgrade nearMisses = %d, want %d", after, before-1)
 	}
+	if n := merged(t, s, net); n != 1 {
+		t.Fatalf("the upgrade's fold counted %d merges, want 1", n)
+	}
 }

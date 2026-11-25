@@ -29,6 +29,7 @@ import (
 // (sanitize), so it
 // holds no ID, JID, device number or time but its own timestamp, and never
 // a word of a message: the library's warnings name a message by its ID only.
+// The day line of Beeper merges (diag.Merges) goes to the same file.
 
 var digits = regexp.MustCompile(`[0-9]+`)
 

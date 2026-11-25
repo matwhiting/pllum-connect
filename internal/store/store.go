@@ -47,7 +47,8 @@ const (
 // backfills, older pages), so a direct line still takes over its copy
 // (putNewID, absorbBeeperCopy) and a merge still joins a copy to its line
 // (mergeLine); a write whose chat holds no copy near it skips all of that
-// in one query (copyNear).
+// in one query (copyNear). Every such merge is counted (merges.go), so the
+// day it stops firing shows.
 
 // beeperPrefix starts the ID of a line that exists only in Beeper's copy.
 const beeperPrefix = "beeper:"
@@ -899,6 +900,9 @@ func foldLine(tx *sql.Tx, network, from, into string, fromRid, toRid int64, from
 	if err := tx.QueryRow(`SELECT msg_id FROM messages WHERE rid = ?`, toRid).Scan(&toID); err != nil {
 		return err
 	}
+	if err := countMergeOf(tx, network, fromID, toID); err != nil {
+		return err
+	}
 	for _, q := range []struct {
 		sql  string
 		args []any
@@ -1358,6 +1362,9 @@ func takeOver(tx *sql.Tx, network string, rid int64, oldID string, m Message, me
 		m.Kind, m.Hidden, m.Deleted, m.Edited, m.ReplyTo, media, nilIfEmpty(m.Raw), m.SeenMs,
 		rid)
 	if err != nil {
+		return err
+	}
+	if err := countMergeOf(tx, network, oldID, m.ID); err != nil {
 		return err
 	}
 	return renameLine(tx, network, m.ChatID, oldID, m.ID)

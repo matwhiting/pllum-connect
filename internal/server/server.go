@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/matwhiting/pllum-connect/internal/diag"
 	"github.com/matwhiting/pllum-connect/internal/network"
 	"github.com/matwhiting/pllum-connect/internal/sealed"
 	"github.com/matwhiting/pllum-connect/internal/store"
@@ -43,7 +44,8 @@ type Deps struct {
 	Dir      string // the data folder; each network keeps its files under it
 	Open     func(key [32]byte) (*store.Store, error)
 	Networks func(st *store.Store, dir string, key [32]byte, emit network.Emit) []network.Network
-	// Now is the clock for the 10 s between two FetchOlder calls on a chat;
+	// Now is the clock for the 10 s between two FetchOlder calls on a chat
+	// and for the day the Beeper merges line is written for (diag.Merges);
 	// nil is time.Now. It exists so a test needs no real waiting.
 	Now func() time.Time
 	// Gate is true when the helper was started with --gate: only then is
@@ -263,6 +265,18 @@ func (s *server) hello(id string, params json.RawMessage) {
 				"kind":    wire.KindOf(err),
 			})
 		}
+	}
+
+	// Once a day, each network's count of Beeper copies merged goes to its
+	// diagnostics file. It ends with the requests, before the store closes.
+	if s.deps.Dir != "" && s.store != nil && len(names) > 0 {
+		merges := diag.NewMerges(s.store, s.deps.Dir, names)
+		s.inFlight.Add(1)
+		go func() {
+			defer s.inFlight.Done()
+			defer func() { _ = recover() }()
+			merges.Run(s.ctx, s.now)
+		}()
 	}
 }
 
