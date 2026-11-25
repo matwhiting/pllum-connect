@@ -29,6 +29,8 @@ func (s *server) ownMethod(name string) (handler, bool) {
 		return encryptedHistory, true
 	case "restoreHistory":
 		return restoreHistory, true
+	case "contacts":
+		return contacts, true
 	case "gateCounts":
 		// hidden: it exists only when the helper is started with --gate
 		if s.deps.Gate {
@@ -187,6 +189,31 @@ func restoreHistory(ctx context.Context, n network.Network, params json.RawMessa
 		return nil, badRequest
 	}
 	return wire.Empty, eh.RestoreHistory(ctx, []byte(*p.PIN))
+}
+
+// contacts answers a network's own contact store (WhatsApp's linked device),
+// read locally; the network makes no request for it. Empty fields go out as
+// null, and no contacts as an empty list.
+func contacts(ctx context.Context, n network.Network, _ json.RawMessage) (any, error) {
+	cl, ok := n.(network.ContactLister)
+	if !ok {
+		return nil, unsupported
+	}
+	list, err := cl.Contacts(ctx)
+	if err != nil {
+		return nil, err
+	}
+	items := make([]map[string]any, 0, len(list))
+	for _, c := range list {
+		items = append(items, map[string]any{
+			"id":           c.ID,
+			"phone":        nullable(c.Phone),
+			"name":         nullable(c.Name),
+			"pushName":     nullable(c.PushName),
+			"businessName": nullable(c.BusinessName),
+		})
+	}
+	return map[string]any{"items": items}, nil
 }
 
 // gateCounts answers a network's gate counts (counts only), or unsupported

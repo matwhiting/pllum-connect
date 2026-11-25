@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -406,5 +407,59 @@ func TestOlderPagesIsAskedOnceAtTheOldestLine(t *testing.T) {
 	}
 	if r := result(t, h.call("m7", "messages", map[string]any{"chatID": "wa-chat", "limit": 50})); r["hasMore"] != false {
 		t.Errorf("whatsapp messages = %v", r)
+	}
+}
+
+// contactsNetwork is a whatsapp network with its own contact store.
+type contactsNetwork struct {
+	*fakeNetwork
+	items []network.Contact
+}
+
+func (c *contactsNetwork) Contacts(ctx context.Context) ([]network.Contact, error) {
+	return c.items, nil
+}
+
+func TestContactsIsWhatsAppOnly(t *testing.T) {
+	wa := &contactsNetwork{fakeNetwork: &fakeNetwork{name: "whatsapp"}, items: []network.Contact{
+		{ID: "10000000001@s.whatsapp.net", Phone: "+10000000001", Name: "Alex Example", PushName: "Alex"},
+		{ID: "100000000000007@lid", BusinessName: "Invented Bakery"},
+	}}
+	ig := newMetaNetwork()
+	h := startNets(t, func(emit network.Emit) []network.Network {
+		wa.rawEmit, wa.emit = emit, emit.For("whatsapp")
+		ig.rawEmit, ig.emit = emit, emit.For("instagram")
+		return []network.Network{wa, ig}
+	}, nil, nil)
+	result(t, h.hello())
+
+	r := result(t, h.call("k1", "contacts", nil))
+	wantKeys(t, "contacts", r, "items")
+	items, _ := r["items"].([]any)
+	if len(items) != 2 {
+		t.Fatalf("contacts = %v", r)
+	}
+	for i, it := range items {
+		wantKeys(t, fmt.Sprintf("contact %d", i), it.(map[string]any), "id", "phone", "name", "pushName", "businessName")
+	}
+	first, second := items[0].(map[string]any), items[1].(map[string]any)
+	if first["id"] != "10000000001@s.whatsapp.net" || first["phone"] != "+10000000001" || first["name"] != "Alex Example" ||
+		first["pushName"] != "Alex" || first["businessName"] != nil {
+		t.Errorf("the first contact = %v", first)
+	}
+	if second["id"] != "100000000000007@lid" || second["phone"] != nil || second["name"] != nil ||
+		second["pushName"] != nil || second["businessName"] != "Invented Bakery" {
+		t.Errorf("the second contact = %v", second)
+	}
+
+	// None is an empty list, never null.
+	wa.items = nil
+	r = result(t, h.call("k2", "contacts", nil))
+	if got, ok := r["items"].([]any); !ok || len(got) != 0 {
+		t.Errorf("no contacts = %#v, want []", r["items"])
+	}
+
+	if k := kindOf(t, igCall(h, "k3", "contacts", nil)); k != string(wire.Unsupported) {
+		t.Errorf("contacts on instagram gave %s, want unsupported", k)
 	}
 }

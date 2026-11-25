@@ -168,3 +168,23 @@ type EncryptedHistory interface {
 type Gate interface {
 	GateCounts() any
 }
+
+// Contact is one person in a network's own contact store, as the linked
+// device holds it. ID is how the network names the person as a sender or
+// member; Phone is a real phone number in E.164 with its "+", or empty when
+// none is known (a WhatsApp LID is never one). Any other field may be empty.
+type Contact struct {
+	ID           string
+	Phone        string
+	Name         string // the name he saved the person under on his phone
+	PushName     string // the name the person gave themselves
+	BusinessName string
+}
+
+// ContactLister is a network whose linked device keeps a contact store of
+// its own (WhatsApp). Contacts reads it as it is, sorted by ID, and makes no
+// request to the network. Before sign-in it is a *wire.Error of kind
+// NotConnected.
+type ContactLister interface {
+	Contacts(ctx context.Context) ([]Contact, error)
+}
