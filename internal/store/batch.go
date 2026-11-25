@@ -116,7 +116,7 @@ func (b *Batch) PutMessage(m Message) (added bool, err error) {
 	// queue, a scroll-back, a backfill's older pages): history, never
 	// unread. Only lines newer than what the chat held can be unread; a
 	// chat that held none takes its first page as it always has.
-	if floor > 0 {
+	if floor > 0 && m.TimeMs > 0 && m.TimeMs < floor {
 		if _, err := b.tx.Exec(`UPDATE messages SET older = 1
 				WHERE network = ? AND chat_id = ? AND msg_id = ? AND early = 0 AND ts_ms > 0 AND ts_ms < ?`,
 			b.network, chat, m.ID, floor); err != nil {
@@ -142,11 +142,15 @@ func (b *Batch) PutMessage(m Message) (added bool, err error) {
 // Beeper's copy, not copied, not early) that chat held when the batch first
 // wrote a line to it; 0 when it held none.
 func (b *Batch) oldestHeld(chatID string) (int64, error) {
+	if ms, ok := b.oldest[chatID]; ok {
+		return ms, nil // by the ID as written (most writes of a batch name one chat)
+	}
 	chat, err := resolve(b.tx, b.network, chatID)
 	if err != nil {
 		return 0, err
 	}
 	if ms, ok := b.oldest[chat]; ok {
+		b.oldest[chatID] = ms
 		return ms, nil
 	}
 	var ms sql.NullInt64
@@ -155,7 +159,7 @@ func (b *Batch) oldestHeld(chatID string) (int64, error) {
 		b.network, chat).Scan(&ms); err != nil {
 		return 0, err
 	}
-	b.oldest[chat] = ms.Int64
+	b.oldest[chat], b.oldest[chatID] = ms.Int64, ms.Int64
 	return ms.Int64, nil
 }
 
