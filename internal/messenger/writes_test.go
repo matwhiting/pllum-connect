@@ -1008,17 +1008,24 @@ func TestAFileWhoseTextWentIsNotSentWithItAgain(t *testing.T) {
 }
 
 // stopAfter stops the network (as Pllum quitting does) as soon as the
-// write called name has been answered, before the next request.
-func (h *harness) stopAfter(t *testing.T, name string) {
+// write called name has been answered, before the next request. The wait
+// it returns waits for that Stop to return: a quit's process has ended
+// (its device database closed) before the next one starts, and a second
+// Stop (harness.close) returns at once, without waiting for the first.
+func (h *harness) stopAfter(t *testing.T, name string) (wait func()) {
 	t.Helper()
 	var once sync.Once
+	done := make(chan struct{})
 	h.f.mu.Lock()
 	h.f.hook = func(n string) {
 		if n != name {
 			return
 		}
 		once.Do(func() {
-			go h.m.Stop()
+			go func() {
+				defer close(done)
+				h.m.Stop()
+			}()
 			eventually(t, "the stop", func() bool {
 				h.m.mu.Lock()
 				defer h.m.mu.Unlock()
@@ -1027,6 +1034,17 @@ func (h *harness) stopAfter(t *testing.T, name string) {
 		})
 	}
 	h.f.mu.Unlock()
+	return func() {
+		t.Helper()
+		eventually(t, "the quit's Stop to return", func() bool {
+			select {
+			case <-done:
+				return true
+			default:
+				return false
+			}
+		})
+	}
 }
 
 // Review C1: Pllum quits after a send's text went and before its file
@@ -1060,7 +1078,7 @@ func TestAQuitBetweenTextAndFileIsNeverConfirmed(t *testing.T) {
 			h := newHarnessOver(t, dir, f)
 			h.signIn(t)
 			out := network.Outgoing{ChatID: tc.chat, Text: canary + " caption", File: writePhoto(t), ClientID: "key-quit"}
-			h.stopAfter(t, tc.text)
+			quit := h.stopAfter(t, tc.text)
 			id, err := h.m.Send(context.Background(), out)
 			if err != nil {
 				t.Fatalf("Send: %v", err)
@@ -1074,6 +1092,7 @@ func TestAQuitBetweenTextAndFileIsNeverConfirmed(t *testing.T) {
 			if uploads != 1 || texts != 1 {
 				t.Fatalf("before the restart: %d uploads, %d sends; want 1 and 1 (the text)", uploads, texts)
 			}
+			quit()
 			h.close()
 
 			f.mu.Lock()
