@@ -150,7 +150,14 @@ func tripRig(t *testing.T) (*rig, *tripClient) {
 		trip.inner = fc
 		return trip
 	}
-	r.live()
+	c := r.live()
+	// Start connects in its own goroutine: wait for that Connect, so it
+	// is not taken for the adapter's doing once a test arms the trip.
+	eventually(t, "the adapter's own connect", func() bool {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		return c.connects > 0
+	})
 	return r, trip
 }
 
