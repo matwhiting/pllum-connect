@@ -31,15 +31,20 @@ type queueClock struct {
 
 func (c *queueClock) Sleep(ctx context.Context, d time.Duration) error {
 	ch := make(chan struct{})
+	// The sleep counts as begun only with its timer set, in one step: a
+	// test that sees it asleep (parked) and moves the clock on must find
+	// the timer there, or the clock passes it before it is set and the
+	// queue sleeps on past the test (the timer is not run under c.mu, so
+	// its wake taking c.mu waits for this to end).
 	c.mu.Lock()
-	c.sleeps++
-	c.mu.Unlock()
 	stop := c.fakeClock.AfterFunc(d, func() {
 		c.mu.Lock()
 		c.woke++
 		c.mu.Unlock()
 		close(ch)
 	})
+	c.sleeps++
+	c.mu.Unlock()
 	select {
 	case <-ch:
 		return nil
