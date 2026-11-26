@@ -322,7 +322,21 @@ func TestTheQueueLeavesHeldChatsAlone(t *testing.T) {
 		if n := len(h.f.history.asked(fmt.Sprint(aliceFBID))); n == aliceAsked {
 			t.Errorf("the next chat's backup was not asked")
 		}
-		h.advance(t, stallHold, time.Minute)
+		// To a minute before the hold ends in one move, not a page a
+		// minute: six hours of the endless backup is more than a local
+		// day's queueBackupPages, and whether a midnight fell in between
+		// (the machine's time zone) decided whether any were left for bob.
+		h.f.clock.Advance(until.Add(-time.Minute).Sub(h.f.clock.Now()))
+		h.parked(t)
+		h.settle()
+		h.advance(t, 30*time.Second, time.Second)
+		if n := len(h.f.history.asked(fmt.Sprint(bobFBID))); n != bobAsked {
+			t.Errorf("the held backup was asked %d pages before its hold ended", n-bobAsked)
+		}
+		// Then a minute at a time until it is asked, for at most an hour.
+		for i := 0; i < 60 && len(h.f.history.asked(fmt.Sprint(bobFBID))) == bobAsked; i++ {
+			h.advance(t, time.Minute, time.Second)
+		}
 		if n := len(h.f.history.asked(fmt.Sprint(bobFBID))); n == bobAsked {
 			t.Errorf("the held backup was not asked once its hold ended")
 		}
