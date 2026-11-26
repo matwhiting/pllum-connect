@@ -39,6 +39,21 @@ func (r *rig) sendTo(to *network.Recipient, text, client string) (id, chat strin
 	return id, chat
 }
 
+// newChatAnswers checks the chat IDs a new chat's send and a repeat of it
+// under the same key answered: the send answers none (its chat is stored
+// only once WhatsApp accepts the message), and the repeat answers none, or
+// the chat if WhatsApp accepted the message between the two. Never a chat
+// then none, and never another chat.
+func newChatAnswers(t *testing.T, want, first, repeat string) {
+	t.Helper()
+	if first != "" {
+		t.Fatalf("the new chat's send answered chat %q, want none until WhatsApp accepts it", first)
+	}
+	if repeat != "" && repeat != want {
+		t.Fatalf("the repeat answered chat %q, want none or %q", repeat, want)
+	}
+}
+
 func (r *rig) waitState(id, state string) network.SendState {
 	r.t.Helper()
 	eventually(r.t, "send "+state, func() bool { return r.w.SendState(id).State == state })
@@ -185,9 +200,10 @@ func TestARepeatedNewChatIsTheSameSend(t *testing.T) {
 	r, c := newChatRig(t)
 	id, chat := r.sendTo(phoneTo(carolJID), "invented hello", "client-invented-1")
 	id2, chat2 := r.sendTo(phoneTo(carolJID), "invented hello", "client-invented-1")
-	if id2 != id || chat2 != chat {
-		t.Fatalf("the repeat answered %q %q, want %q %q", id2, chat2, id, chat)
+	if id2 != id {
+		t.Fatalf("the repeat answered %q, want %q", id2, id)
 	}
+	newChatAnswers(t, carolJID.String(), chat, chat2)
 	r.waitState(id, network.SendSent)
 	// Again while offline.
 	c.dispatch(&events.Disconnected{})
@@ -364,9 +380,15 @@ func TestTwoSendsUnderOneKeyAtOnceAreOneNewChat(t *testing.T) {
 	if a.err != nil || b.err != nil {
 		t.Fatalf("the two sends answered %v and %v", a.err, b.err)
 	}
-	if a.id != b.id || a.chat != b.chat {
-		t.Fatalf("the two sends answered %q %q and %q %q, want one send", a.id, a.chat, b.id, b.chat)
+	if a.id != b.id {
+		t.Fatalf("the two sends answered %q and %q, want one send", a.id, b.id)
 	}
+	// The answers arrive in either order: the first call's is the one with
+	// no chat.
+	if a.chat != "" {
+		a, b = b, a
+	}
+	newChatAnswers(t, carolJID.String(), a.chat, b.chat)
 	r.waitState(a.id, network.SendSent)
 	if n := len(c.checksMade()); n != 1 {
 		t.Errorf("IsOnWhatsApp was asked %d times, want once", n)
