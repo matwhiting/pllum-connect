@@ -265,9 +265,13 @@ func openEncrypted(path string, key [32]byte, withFTS bool) (*sql.DB, error) {
 	q := url.Values{}
 	q.Set("vfs", "adiantum")
 	q.Set("hexkey", hex.EncodeToString(key[:]))
+	// busy_timeout first: the pragmas run in order, and journal_mode needs
+	// the database's lock, which another connection may hold for a moment
+	// (one closing checkpoints its write-ahead log); without the timeout
+	// set yet, it fails at once with "database is locked".
+	q.Add("_pragma", "busy_timeout(5000)")
 	q.Add("_pragma", "foreign_keys(1)")
 	q.Add("_pragma", "journal_mode(wal)")
-	q.Add("_pragma", "busy_timeout(5000)")
 	q.Set("_txlock", "immediate")
 	dsn := (&url.URL{Scheme: "file", Path: path, RawQuery: q.Encode()}).String()
 

@@ -3,11 +3,13 @@ package store
 import (
 	"bytes"
 	"context"
+	"database/sql/driver"
 	"errors"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"go.mau.fi/whatsmeow/proto/waAdv"
 	"go.mau.fi/whatsmeow/store/sqlstore"
@@ -219,4 +221,44 @@ func TestCountsAreCountsOnly(t *testing.T) {
 	if err != nil || e.OldestMs != nil || e.Messages != 0 {
 		t.Fatalf("empty Counts = %+v, %v", e, err)
 	}
+}
+
+// Review (CI flake, 2026-11-26): a device database opened while another
+// connection holds its lock for a moment (one closing checkpoints its
+// write-ahead log) waits for it, rather than failing "database is locked"
+// on the journal_mode pragma before the busy timeout is set.
+func TestAnOpenWaitsForAMomentaryLock(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "connect", "messenger", "device.db")
+	db, err := OpenDevice(path, testKey)
+	if err != nil {
+		t.Fatalf("OpenDevice: %v", err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`CREATE TABLE t (x)`); err != nil {
+		t.Fatal(err)
+	}
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// An exclusive lock, held until this connection closes.
+	for _, q := range []string{`PRAGMA locking_mode=EXCLUSIVE`, `BEGIN EXCLUSIVE`, `INSERT INTO t VALUES (1)`, `COMMIT`} {
+		if _, err := conn.ExecContext(ctx, q); err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+	}
+	released := make(chan struct{})
+	go func() {
+		defer close(released)
+		time.Sleep(300 * time.Millisecond)
+		_ = conn.Raw(func(any) error { return driver.ErrBadConn }) // the connection is dropped, not pooled
+		conn.Close()
+	}()
+	again, err := OpenDevice(path, testKey)
+	<-released
+	if err != nil {
+		t.Fatalf("an open during a momentary lock failed: %v", err)
+	}
+	again.Close()
 }
