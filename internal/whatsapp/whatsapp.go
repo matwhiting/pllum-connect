@@ -142,9 +142,9 @@ type WhatsApp struct {
 	newChats *network.NewChats
 	// ncmu serialises SendTo's new chats, from the repeat check to keeping
 	// the send, so two calls under one key count one and check once.
-	ncmu sync.Mutex
-	rmu      sync.Mutex
-	mretry   map[string]chan *events.MediaRetry // media retries waiting for his phone
+	ncmu   sync.Mutex
+	rmu    sync.Mutex
+	mretry map[string]chan *events.MediaRetry // media retries waiting for his phone
 }
 
 var _ network.Network = (*WhatsApp)(nil)
