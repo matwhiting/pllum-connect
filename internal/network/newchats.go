@@ -18,7 +18,7 @@ type Recipient struct {
 }
 
 // Valid reports whether exactly one address is set, and a number is "+"
-// and 6 to 15 digits.
+// and 6 to 15 digits, the first not 0 (no country code starts with 0).
 func (r Recipient) Valid() bool {
 	if (r.Phone == "") == (r.UserID == "") {
 		return false
@@ -27,7 +27,7 @@ func (r Recipient) Valid() bool {
 		return true
 	}
 	digits, ok := strings.CutPrefix(r.Phone, "+")
-	if !ok || len(digits) < 6 || len(digits) > 15 {
+	if !ok || len(digits) < 6 || len(digits) > 15 || digits[0] == '0' {
 		return false
 	}
 	for _, c := range digits {

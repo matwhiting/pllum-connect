@@ -3,9 +3,11 @@ package whatsapp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"time"
 
+	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/types"
 
 	"github.com/matwhiting/pllum-connect/internal/network"
@@ -18,10 +20,14 @@ import (
 // maps to) as any send does, and counts nothing. Otherwise it is a new chat:
 // counted first (network.NewChats: at most WhatsAppNewChatsPerDay a local
 // day, none for a day after WhatsApp refuses one), then, unless the device
-// already knows the number (its contact store, or a LID mapped to it), one
-// IsOnWhatsApp of that one number. That is the only lookup, and it happens
-// only inside a counted new chat he sent. A number not on WhatsApp is a send
-// failed notOnNetwork, with nothing sent and no chat made. A new chat that
+// already knows the number (its contact store, a LID mapped to it, or the
+// form WhatsApp gave it before), one IsOnWhatsApp of that one number. That
+// is the only lookup, and it happens only inside a counted new chat he sent;
+// WhatsApp refusing the lookup itself holds new chats a day as well. A
+// number not on WhatsApp is a send failed notOnNetwork, with nothing sent
+// and no chat made. A chat is never made empty: the new chat's chat row is
+// stored only once WhatsApp has accepted its first message, and a first
+// message that fails stays only as its failed send. A new chat that
 // WhatsApp's server refuses (other than "not on WhatsApp") holds new chats a
 // day, and is never sent again.
 
@@ -65,10 +71,13 @@ func recipientJID(to network.Recipient) (types.JID, error) {
 }
 
 // SendTo sends m (text only) to the person m.To names (see the top of this
-// file). A repeat under the caller's key (m.ClientID) answers the send it
-// made, whatever chat it went to, and asks nothing: a send or a new chat
-// still going or gone, or a new chat refused because the number is not on
-// WhatsApp or WhatsApp turned it down.
+// file). It answers the chat's ID once the store holds the chat, else ""
+// (a new chat, until its first message is accepted). A repeat under the
+// caller's key (m.ClientID) answers the send it made, whatever chat it went
+// to, and asks nothing: a send or a new chat still going or gone, or a new
+// chat refused because the number is not on WhatsApp or WhatsApp turned it
+// down. New chats go one at a time (ncmu), so a repeat that comes while the
+// first is still being checked waits for it and answers it.
 func (w *WhatsApp) SendTo(ctx context.Context, m network.Outgoing) (string, string, error) {
 	if m.To == nil || m.ChatID != "" {
 		return "", "", errBadRequest
@@ -77,6 +86,8 @@ func (w *WhatsApp) SendTo(ctx context.Context, m network.Outgoing) (string, stri
 	if err != nil {
 		return "", "", err
 	}
+	w.ncmu.Lock()
+	defer w.ncmu.Unlock()
 	if id, chat, done, err := w.repeatTo(m.ClientID); err != nil || done {
 		return id, chat, err
 	}
@@ -113,17 +124,26 @@ func (w *WhatsApp) SendTo(ctx context.Context, m network.Outgoing) (string, stri
 	if err != nil {
 		return "", "", errInternal
 	}
-	target := jid
-	if !w.knownOnWhatsApp(ctx, jid) {
+	target, known := w.knownOnWhatsApp(ctx, jid)
+	if !known {
 		resp, err := cli.IsOnWhatsApp(ctx, []string{"+" + jid.User})
 		if err != nil {
-			return "", "", writeErr(err)
+			if unclearSend(err) {
+				return "", "", errUnclear
+			}
+			// WhatsApp turned the lookup down: a pushback like any other.
+			kind := wire.Refused
+			if errors.Is(err, whatsmeow.ErrIQRateOverLimit) {
+				kind = wire.RateLimited
+			}
+			w.newChats.Hold(kind)
+			return "", "", &wire.Error{Kind: kind}
 		}
 		if len(resp) != 1 || !resp[0].IsIn {
 			// Kept failed under the caller's key, so a repeat asks nothing.
 			if err := w.st.PutOutgoing(Name, store.Outgoing{ID: id, ChatID: jid.String(), Kind: outMessage, Client: m.ClientID,
 				State: store.OutFailed, Fail: string(wire.NotOnNetwork), MadeMs: now.UnixMilli(), Request: body}); err != nil {
-				return "", "", err
+				return w.racedTo(m.ClientID, err)
 			}
 			return id, "", nil
 		}
@@ -135,16 +155,29 @@ func (w *WhatsApp) SendTo(ctx context.Context, m network.Outgoing) (string, stri
 	if err != nil {
 		return "", "", err
 	}
-	if err := w.ensureChat(chat, target); err != nil {
-		return "", "", err
+	if target != jid {
+		// WhatsApp's own form of the number: the typed one leads to the
+		// same chat, so it is found, not checked or counted, next time.
+		if err := w.st.Alias(Name, jid.String(), chat); err != nil {
+			return "", "", err
+		}
 	}
+	// No chat row yet: it is stored once WhatsApp accepts this message.
 	if err := w.st.PutOutgoing(Name, store.Outgoing{ID: id, ChatID: chat, Kind: outMessage, Client: m.ClientID,
 		MadeMs: now.UnixMilli(), Request: body}); err != nil {
-		return "", "", err
+		return w.racedTo(m.ClientID, err)
 	}
-	w.changed()
 	w.enqueue(sendJob{id: id, madeMs: now.UnixMilli(), deadline: now.Add(sendWait)})
-	return id, chat, nil
+	return id, "", nil
+}
+
+// racedTo answers a send whose row could not be kept: the one another call
+// with the caller's key kept first (as Send does), else the error.
+func (w *WhatsApp) racedTo(client string, err error) (string, string, error) {
+	if id, chat, done, rerr := w.repeatTo(client); rerr == nil && done {
+		return id, chat, nil
+	}
+	return "", "", err
 }
 
 // repeatTo answers a send already kept under the caller's key: done is true
@@ -175,18 +208,25 @@ func (w *WhatsApp) repeatTo(client string) (id, chat string, done bool, err erro
 }
 
 // knownOnWhatsApp reports whether the device already knows the number is
-// on WhatsApp: it is in his contact store, or a LID maps to it.
-func (w *WhatsApp) knownOnWhatsApp(ctx context.Context, jid types.JID) bool {
+// on WhatsApp, and as which JID: it is in his contact store, a LID maps to
+// it, or the store leads it to WhatsApp's own form of it (aliased by an
+// earlier new chat).
+func (w *WhatsApp) knownOnWhatsApp(ctx context.Context, jid types.JID) (types.JID, bool) {
+	if to, ok := w.st.AliasTarget(Name, jid.String()); ok {
+		if j, err := types.ParseJID(to); err == nil && j.Server == types.DefaultUserServer && j.User != "" {
+			return j, true
+		}
+	}
 	dev := w.device()
 	if dev == nil {
-		return false
+		return jid, false
 	}
 	if dev.Contacts != nil {
 		if ci, err := dev.Contacts.GetContact(ctx, jid); err == nil && ci.Found {
-			return true
+			return jid, true
 		}
 	}
-	return !w.known(jid).IsEmpty()
+	return jid, !w.known(jid).IsEmpty()
 }
 
 // newChatsClock is the adapter's clock as it is when used, so a test's

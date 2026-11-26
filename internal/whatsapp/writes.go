@@ -552,6 +552,12 @@ func (w *WhatsApp) sendOut(ctx context.Context, o store.Outgoing, resend bool) e
 	if ts.IsZero() {
 		ts = w.clock.Now()
 	}
+	if req.NewChat {
+		// Accepted: only now is the new chat stored, so none is ever empty.
+		if err := w.ensureChat(o.ChatID, jid); err != nil {
+			return errUnclear // sent, not stored: as a line not stored, below
+		}
+	}
 	if o.Kind == outReaction {
 		err = w.st.SetReaction(Name, o.ChatID, req.Target,
 			store.Reaction{Emoji: req.Emoji, SenderID: w.self(), FromMe: true})

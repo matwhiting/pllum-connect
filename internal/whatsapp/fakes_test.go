@@ -96,6 +96,9 @@ type fakeClient struct {
 	// IsOnWhatsApp: the numbers (digits) on WhatsApp, and every call's numbers.
 	onWhatsApp map[string]bool
 	checks     [][]string
+	canonical  map[string]string // digits asked → the digits WhatsApp answers, when they differ
+	checkErr   error             // when set, IsOnWhatsApp fails with it
+	checkBlock chan struct{}     // when set, IsOnWhatsApp waits for it or its context
 }
 
 type sentMessage struct {
@@ -126,13 +129,29 @@ func newFakeClient(dev *wastore.Device) *fakeClient {
 // IsOnWhatsApp answers from onWhatsApp, keeping each call's numbers.
 func (f *fakeClient) IsOnWhatsApp(ctx context.Context, phones []string) ([]types.IsOnWhatsAppResponse, error) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.checks = append(f.checks, append([]string(nil), phones...))
+	block := f.checkBlock
+	f.mu.Unlock()
+	if block != nil {
+		select {
+		case <-block:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.checkErr != nil {
+		return nil, f.checkErr
+	}
 	var out []types.IsOnWhatsAppResponse
 	for _, p := range phones {
 		digits := p
 		if len(digits) > 0 && digits[0] == '+' {
 			digits = digits[1:]
+		}
+		if c, ok := f.canonical[digits]; ok {
+			digits = c
 		}
 		out = append(out, types.IsOnWhatsAppResponse{Query: p, JID: types.NewJID(digits, types.DefaultUserServer), IsIn: f.onWhatsApp[digits]})
 	}

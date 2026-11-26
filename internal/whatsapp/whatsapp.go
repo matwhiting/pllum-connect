@@ -140,6 +140,9 @@ type WhatsApp struct {
 	// newChats gates new chats by number (newchat.go), kept in the
 	// network's own values.
 	newChats *network.NewChats
+	// ncmu serialises SendTo's new chats, from the repeat check to keeping
+	// the send, so two calls under one key count one and check once.
+	ncmu sync.Mutex
 	rmu      sync.Mutex
 	mretry   map[string]chan *events.MediaRetry // media retries waiting for his phone
 }
@@ -528,10 +531,12 @@ func (w *WhatsApp) handle(cli waClient, evt any) (ok bool) {
 	case *events.StreamReplaced:
 		w.lost(true)
 	case *events.LoggedOut:
+		w.newChats.Hold(wire.Refused) // a pushback: no new chat for a day, after a re-link too
 		w.ended(network.ReconnectNeeded)
 	case *events.ClientOutdated:
 		w.ended(network.Outdated)
 	case *events.TemporaryBan:
+		w.newChats.Hold(wire.Refused)
 		w.ended(network.Banned)
 	case *events.Message:
 		return w.done(w.onMessage(e, store.SourceLive))

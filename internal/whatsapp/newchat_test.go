@@ -113,10 +113,13 @@ func TestSendToAKnownContactAsksNoCheck(t *testing.T) {
 		t.Fatal(err)
 	}
 	id, chat := r.sendTo(phoneTo(bobJID), "invented hello", "")
-	if chat != bobJID.String() {
-		t.Fatalf("the chat is %q, want Bob's number", chat)
+	if chat != "" {
+		t.Fatalf("a new chat answered chat %q before its message was accepted", chat)
 	}
 	r.waitState(id, network.SendSent)
+	if got, ok, _ := r.w.ChatWith(context.Background(), *phoneTo(bobJID)); !ok || got != bobJID.String() {
+		t.Errorf("after the send ChatWith = %q, %v; want Bob's number", got, ok)
+	}
 	if n := len(c.checksMade()); n != 0 {
 		t.Errorf("a known contact was checked %d times", n)
 	}
@@ -140,8 +143,8 @@ func TestSendToAnUnknownNumberChecksOnce(t *testing.T) {
 	t.Run("on WhatsApp", func(t *testing.T) {
 		r, c := newChatRig(t)
 		id, chat := r.sendTo(phoneTo(carolJID), "invented hello", "")
-		if chat != carolJID.String() {
-			t.Fatalf("the chat is %q, want Carol's number", chat)
+		if chat != "" {
+			t.Fatalf("a new chat answered chat %q before its message was accepted", chat)
 		}
 		r.waitState(id, network.SendSent)
 		checks := c.checksMade()
@@ -190,8 +193,8 @@ func TestARepeatedNewChatIsTheSameSend(t *testing.T) {
 	c.dispatch(&events.Disconnected{})
 	eventually(t, "offline", func() bool { return r.w.Status().State == network.Offline })
 	id3, chat3 := r.sendTo(phoneTo(carolJID), "invented hello", "client-invented-1")
-	if id3 != id || chat3 != chat {
-		t.Fatalf("the repeat while offline answered %q %q, want %q %q", id3, chat3, id, chat)
+	if id3 != id || chat3 != carolJID.String() {
+		t.Fatalf("the repeat while offline answered %q %q, want %q and the chat made since", id3, chat3, id)
 	}
 	if n := len(c.checksMade()); n != 1 {
 		t.Errorf("IsOnWhatsApp was asked %d times, want once", n)
@@ -292,6 +295,7 @@ func TestToAndChatIDTogetherIsABadRequest(t *testing.T) {
 		{To: &network.Recipient{Phone: "+10000000001", UserID: aliceJID.String()}, Text: "x"},
 		{To: &network.Recipient{Phone: "10000000001"}, Text: "x"},
 		{To: &network.Recipient{Phone: "+1000-0000001"}, Text: "x"},
+		{To: &network.Recipient{Phone: "+0100000001"}, Text: "x"},
 	} {
 		if _, _, err := r.w.SendTo(context.Background(), m); wire.KindOf(err) != wire.BadRequest {
 			t.Errorf("SendTo(%+v) = %v, want badRequest", m.To, err)
@@ -333,6 +337,173 @@ func TestNewChatLogsNoNumber(t *testing.T) {
 	for _, kind := range []wire.Kind{wire.DailyCap, wire.NewChatHold} {
 		if sevenDigits.MatchString((&wire.Error{Kind: kind}).Error()) {
 			t.Errorf("%s's text holds a number", kind)
+		}
+	}
+}
+
+func TestTwoSendsUnderOneKeyAtOnceAreOneNewChat(t *testing.T) {
+	r, c := newChatRig(t)
+	block := make(chan struct{})
+	c.with(func() { c.checkBlock = block })
+	type answer struct {
+		id, chat string
+		err      error
+	}
+	answers := make(chan answer, 2)
+	send := func() {
+		id, chat, err := r.w.SendTo(context.Background(), network.Outgoing{To: phoneTo(carolJID), Text: "invented hello", ClientID: "client-invented-3"})
+		answers <- answer{id, chat, err}
+	}
+	go send()
+	eventually(t, "the first check", func() bool { return len(c.checksMade()) == 1 })
+	go send()
+	time.Sleep(50 * time.Millisecond) // the second call, if it were not held, would check now
+	c.with(func() { c.checkBlock = nil })
+	close(block)
+	a, b := <-answers, <-answers
+	if a.err != nil || b.err != nil {
+		t.Fatalf("the two sends answered %v and %v", a.err, b.err)
+	}
+	if a.id != b.id || a.chat != b.chat {
+		t.Fatalf("the two sends answered %q %q and %q %q, want one send", a.id, a.chat, b.id, b.chat)
+	}
+	r.waitState(a.id, network.SendSent)
+	if n := len(c.checksMade()); n != 1 {
+		t.Errorf("IsOnWhatsApp was asked %d times, want once", n)
+	}
+	if left := r.w.newChats.Left(); left != network.WhatsAppNewChatsPerDay-1 {
+		t.Errorf("left %d, want one new chat counted", left)
+	}
+	if sent := c.sentMessages(); len(sent) != 1 {
+		t.Errorf("%d messages sent, want 1", len(sent))
+	}
+}
+
+func TestARefusedLookupHoldsNewChats(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+		want wire.Kind
+	}{
+		{"rate-overlimit", whatsmeow.ErrIQRateOverLimit, wire.RateLimited},
+		{"another IQ error", &whatsmeow.IQError{Code: 403, Text: "forbidden"}, wire.Refused},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r, c := newChatRig(t)
+			c.with(func() { c.checkErr = tc.err })
+			_, _, err := r.w.SendTo(context.Background(), network.Outgoing{To: phoneTo(carolJID), Text: "invented hello"})
+			if wire.KindOf(err) != tc.want {
+				t.Fatalf("SendTo = %v, want %s", err, tc.want)
+			}
+			c.with(func() { c.checkErr = nil })
+			for _, d := range []time.Duration{0, 23 * time.Hour} {
+				r.clock.Advance(d)
+				_, _, err := r.w.SendTo(context.Background(), network.Outgoing{To: phoneTo(daveJID), Text: "invented hello"})
+				if wire.KindOf(err) != wire.NewChatHold {
+					t.Fatalf("%v after the refused lookup SendTo = %v, want newChatHold", d, err)
+				}
+			}
+			if n := len(c.checksMade()); n != 1 {
+				t.Errorf("IsOnWhatsApp was asked %d times, want once", n)
+			}
+			if sent := c.sentMessages(); len(sent) != 0 {
+				t.Errorf("sent %v", sent)
+			}
+		})
+	}
+	t.Run("unclear", func(t *testing.T) {
+		r, c := newChatRig(t)
+		c.with(func() { c.checkErr = whatsmeow.ErrIQTimedOut })
+		_, _, err := r.w.SendTo(context.Background(), network.Outgoing{To: phoneTo(carolJID), Text: "invented hello"})
+		if wire.KindOf(err) != wire.Unclear {
+			t.Fatalf("SendTo = %v, want unclear", err)
+		}
+		if err := r.w.newChats.Take(); err != nil {
+			t.Errorf("after an unclear lookup Take = %v, want no hold", err)
+		}
+	})
+}
+
+func TestANewChatIsStoredOnlyOnceItsMessageIsAccepted(t *testing.T) {
+	t.Run("accepted", func(t *testing.T) {
+		r, c := newChatRig(t)
+		block := make(chan struct{})
+		c.with(func() { c.sendBlock = block })
+		id, _ := r.sendTo(phoneTo(carolJID), "invented hello", "")
+		eventually(t, "the send to go", func() bool { return len(c.sentMessages()) == 1 })
+		if _, ok, _ := r.st.Chat(Name, carolJID.String()); ok {
+			t.Errorf("the chat was stored before WhatsApp accepted its message")
+		}
+		c.with(func() { c.sendBlock = nil })
+		close(block)
+		r.waitState(id, network.SendSent)
+		chat, ok, _ := r.st.Chat(Name, carolJID.String())
+		if !ok {
+			t.Fatalf("the chat was not stored once its message was accepted")
+		}
+		if chat.Kind != "single" || chat.Phone != "+"+carolJID.User {
+			t.Errorf("the new chat is %q with phone %q, want a one-to-one with her number", chat.Kind, chat.Phone)
+		}
+	})
+	t.Run("refused", func(t *testing.T) {
+		r, c := newChatRig(t)
+		c.with(func() { c.sendErr = whatsmeow.ErrServerReturnedError })
+		id, _ := r.sendTo(phoneTo(carolJID), "invented hello", "client-invented-4")
+		r.waitState(id, network.SendFailed)
+		if _, ok, _ := r.st.Chat(Name, carolJID.String()); ok {
+			t.Errorf("a refused first message left a chat")
+		}
+		for _, chat := range r.chatIDs() {
+			if chat == carolJID.String() {
+				t.Errorf("the chat list holds the refused new chat")
+			}
+		}
+		// The failed send is still the key's answer: nothing asked again.
+		id2, chat2 := r.sendTo(phoneTo(carolJID), "invented hello", "client-invented-4")
+		if id2 != id || chat2 != "" {
+			t.Errorf("the repeat answered %q %q, want %q and no chat", id2, chat2, id)
+		}
+		if n := len(c.checksMade()); n != 1 {
+			t.Errorf("IsOnWhatsApp was asked %d times, want once", n)
+		}
+	})
+}
+
+func TestWhatsAppsFormOfANumberIsFoundNotCheckedAgain(t *testing.T) {
+	r, c := newChatRig(t)
+	typed := types.NewJID("10000000008", types.DefaultUserServer) // WhatsApp knows it as carol's
+	c.with(func() { c.canonical = map[string]string{typed.User: carolJID.User} })
+	id, _ := r.sendTo(phoneTo(typed), "invented hello", "")
+	r.waitState(id, network.SendSent)
+	if sent := c.sentMessages(); len(sent) != 1 || sent[0].to != carolJID {
+		t.Fatalf("sent %v, want one message to WhatsApp's form", sent)
+	}
+	if chat, ok, _ := r.w.ChatWith(context.Background(), *phoneTo(typed)); !ok || chat != carolJID.String() {
+		t.Errorf("ChatWith the typed number = %q, %v; want carol's chat", chat, ok)
+	}
+	id2, chat2 := r.sendTo(phoneTo(typed), "invented again", "")
+	if chat2 != carolJID.String() {
+		t.Errorf("the second send answered chat %q, want carol's", chat2)
+	}
+	r.waitState(id2, network.SendSent)
+	if n := len(c.checksMade()); n != 1 {
+		t.Errorf("IsOnWhatsApp was asked %d times, want once", n)
+	}
+	if left := r.w.newChats.Left(); left != network.WhatsAppNewChatsPerDay-1 {
+		t.Errorf("left %d, want one new chat counted", left)
+	}
+}
+
+func TestABanOrALogOutHoldsNewChats(t *testing.T) {
+	for _, ev := range []any{
+		&events.TemporaryBan{Code: events.TempBanSentToTooManyPeople, Expire: time.Hour},
+		&events.LoggedOut{Reason: events.ConnectFailureLoggedOut},
+	} {
+		r, c := newChatRig(t)
+		c.dispatch(ev)
+		eventually(t, "the session to end", func() bool { return r.w.newChats.Left() == 0 })
+		if err := r.w.newChats.Take(); wire.KindOf(err) != wire.NewChatHold {
+			t.Errorf("after %T Take = %v, want newChatHold", ev, err)
 		}
 	}
 }
