@@ -78,6 +78,9 @@ type waClient interface {
 	SendProtocolMessageReceipt(ctx context.Context, id types.MessageID, msgType types.ReceiptType) error
 	// BuildReaction only builds a message; SendMessage sends it.
 	BuildReaction(chat, sender types.JID, id types.MessageID, reaction string) *waE2E.Message
+	// IsOnWhatsApp is asked only inside a counted new chat he sent, for that
+	// one number (newchat.go).
+	IsOnWhatsApp(ctx context.Context, phones []string) ([]types.IsOnWhatsAppResponse, error)
 	waWriter
 }
 
@@ -133,9 +136,12 @@ type WhatsApp struct {
 	onlineGen atomic.Int64    // counts each time the state enters catchingUp or live
 	requeue   atomic.Bool     // every send still sending is due to go again
 
-	media  *mediacache.Cache // the media folder every network shares (media.go)
-	rmu    sync.Mutex
-	mretry map[string]chan *events.MediaRetry // media retries waiting for his phone
+	media *mediacache.Cache // the media folder every network shares (media.go)
+	// newChats gates new chats by number (newchat.go), kept in the
+	// network's own values.
+	newChats *network.NewChats
+	rmu      sync.Mutex
+	mretry   map[string]chan *events.MediaRetry // media retries waiting for his phone
 }
 
 var _ network.Network = (*WhatsApp)(nil)
@@ -170,6 +176,7 @@ func New(st *store.Store, dir string, key [32]byte, emit network.Emit) *WhatsApp
 		media:     mediacache.New(dir, key),
 		mretry:    map[string]chan *events.MediaRetry{},
 	}
+	w.newChats = &network.NewChats{Values: network.NewValues(st, Name), Clock: newChatsClock{w}, PerDay: network.WhatsAppNewChatsPerDay}
 	// A timed mute reads against the adapter's own clock, which tests move.
 	st.SetClock(func() time.Time { return w.clock.Now() })
 	return w

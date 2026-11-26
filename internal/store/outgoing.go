@@ -33,9 +33,11 @@ type Outgoing struct {
 	Message []byte
 }
 
-// PutOutgoing keeps a new write as sending. An ID already kept is an error:
-// each write has its own. So is a send key another row still holds, unless
-// that row failed: the key moves to the new row, as the failed send is done.
+// PutOutgoing keeps a new write as sending, or as failed (o.State OutFailed,
+// with o.Fail) for one refused before it could go, kept so its key answers
+// the same. An ID already kept is an error: each write has its own. So is a
+// send key another row still holds, unless that row failed: the key moves
+// to the new row, as the failed send is done.
 func (s *Store) PutOutgoing(network string, o Outgoing) error {
 	if network == "" || o.ID == "" || o.ChatID == "" || o.Kind == "" {
 		return errBadRequest
@@ -51,9 +53,13 @@ func (s *Store) PutOutgoing(network string, o Outgoing) error {
 				return err
 			}
 		}
-		_, err = tx.Exec(`INSERT INTO outgoing (network, msg_id, chat_id, kind, state, txn, made_ms, request, message, client_id)
-				VALUES (?, ?, ?, ?, ?, NULLIF(?, ''), ?, ?, ?, NULLIF(?, ''))`,
-			network, o.ID, chat, o.Kind, OutSending, o.Txn, o.MadeMs, nilIfEmpty(o.Request), nilIfEmpty(o.Message), o.Client)
+		state, fail := OutSending, ""
+		if o.State == OutFailed {
+			state, fail = OutFailed, o.Fail
+		}
+		_, err = tx.Exec(`INSERT INTO outgoing (network, msg_id, chat_id, kind, state, fail, txn, made_ms, request, message, client_id)
+				VALUES (?, ?, ?, ?, ?, NULLIF(?, ''), NULLIF(?, ''), ?, ?, ?, NULLIF(?, ''))`,
+			network, o.ID, chat, o.Kind, state, fail, o.Txn, o.MadeMs, nilIfEmpty(o.Request), nilIfEmpty(o.Message), o.Client)
 		return err
 	})
 }

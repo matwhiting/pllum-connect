@@ -92,6 +92,10 @@ type fakeClient struct {
 	logouts     int
 	uploadErr   error // when set, Upload fails with it
 	logoutErr   error // when set, Logout fails with it (after deleting, for whatsmeow's store-delete failure)
+
+	// IsOnWhatsApp: the numbers (digits) on WhatsApp, and every call's numbers.
+	onWhatsApp map[string]bool
+	checks     [][]string
 }
 
 type sentMessage struct {
@@ -117,6 +121,29 @@ func newFakeClient(dev *wastore.Device) *fakeClient {
 		history: map[string]*waHistorySync.HistorySync{},
 		files:   map[string][]byte{},
 	}
+}
+
+// IsOnWhatsApp answers from onWhatsApp, keeping each call's numbers.
+func (f *fakeClient) IsOnWhatsApp(ctx context.Context, phones []string) ([]types.IsOnWhatsAppResponse, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.checks = append(f.checks, append([]string(nil), phones...))
+	var out []types.IsOnWhatsAppResponse
+	for _, p := range phones {
+		digits := p
+		if len(digits) > 0 && digits[0] == '+' {
+			digits = digits[1:]
+		}
+		out = append(out, types.IsOnWhatsAppResponse{Query: p, JID: types.NewJID(digits, types.DefaultUserServer), IsIn: f.onWhatsApp[digits]})
+	}
+	return out, nil
+}
+
+// checksMade are the IsOnWhatsApp calls so far, each call's numbers.
+func (f *fakeClient) checksMade() [][]string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([][]string(nil), f.checks...)
 }
 
 // BuildReaction is whatsmeow's own, from a client that never connects.

@@ -48,6 +48,12 @@ const (
 	// asked and its answer lost, so a device may exist; a `state` kind on
 	// reconnectNeeded, kept until a new sign-in.
 	RegistrationUnclear Kind = "registrationUnclear"
+	// DailyCap: the network's new chats for the local day are used up
+	// (refused before any request). NewChatHold: the network refused a new
+	// chat, or pushed back, and new chats wait out a day (also before any
+	// request).
+	DailyCap    Kind = "dailyCap"
+	NewChatHold Kind = "newChatHold"
 )
 
 // Kinds lists every kind of protocol 1.
@@ -56,6 +62,7 @@ var Kinds = []Kind{
 	NotOnNetwork, Refused, Unclear, RateLimited, TooLarge, MediaGone,
 	Unsupported, StoreKey, Outdated, Timeout, Internal,
 	Checkpoint, PinWrong, PinLimit, RegistrationUnclear,
+	DailyCap, NewChatHold,
 }
 
 // Error is an error that carries only its kind, so nothing private can ride

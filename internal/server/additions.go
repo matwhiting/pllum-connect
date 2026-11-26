@@ -31,6 +31,8 @@ func (s *server) ownMethod(name string) (handler, bool) {
 		return restoreHistory, true
 	case "contacts":
 		return contacts, true
+	case "chatWith":
+		return chatWith, true
 	case "gateCounts":
 		// hidden: it exists only when the helper is started with --gate
 		if s.deps.Gate {
@@ -206,6 +208,46 @@ func restoreHistory(ctx context.Context, n network.Network, params json.RawMessa
 		return nil, badRequest
 	}
 	return wire.Empty, eh.RestoreHistory(ctx, []byte(*p.PIN))
+}
+
+// recipient is a person by one exact address, as `chatWith` and `send`'s
+// `to` give it.
+type recipient struct {
+	Phone  string `json:"phone"`
+	UserID string `json:"userID"`
+}
+
+// nullIfEmpty is s, or null when it is empty.
+func nullIfEmpty(s string) any {
+	if s == "" {
+		return nil
+	}
+	return s
+}
+
+// chatWith answers the one-to-one the store holds with a person, by number
+// or ID, or null; read from the store alone, so nothing goes to the network.
+func chatWith(ctx context.Context, n network.Network, params json.RawMessage) (any, error) {
+	var p recipient
+	if err := decode(params, &p); err != nil {
+		return nil, err
+	}
+	to := network.Recipient{Phone: p.Phone, UserID: p.UserID}
+	if !to.Valid() {
+		return nil, badRequest
+	}
+	cf, ok := n.(network.ChatFinder)
+	if !ok {
+		return nil, unsupported
+	}
+	chat, found, err := cf.ChatWith(ctx, to)
+	if err != nil {
+		return nil, err
+	}
+	if !found {
+		chat = ""
+	}
+	return map[string]any{"chatID": nullIfEmpty(chat)}, nil
 }
 
 // contacts answers a network's own contact store (WhatsApp's linked device),

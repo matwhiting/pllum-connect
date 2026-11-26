@@ -582,15 +582,32 @@ var methods = map[string]handler{
 	},
 	"send": func(ctx context.Context, n network.Network, params json.RawMessage) (any, error) {
 		var p struct {
-			ChatID   string `json:"chatID"`
-			Text     string `json:"text"`
-			ReplyTo  string `json:"replyTo"`
-			File     string `json:"file"`
-			FileName string `json:"fileName"`
-			ClientID string `json:"clientID"`
+			ChatID   string     `json:"chatID"`
+			To       *recipient `json:"to"`
+			Text     string     `json:"text"`
+			ReplyTo  string     `json:"replyTo"`
+			File     string     `json:"file"`
+			FileName string     `json:"fileName"`
+			ClientID string     `json:"clientID"`
 		}
 		if err := decode(params, &p); err != nil {
 			return nil, err
+		}
+		if p.To != nil {
+			// To a person by address: into their chat, or a new one.
+			to := network.Recipient{Phone: p.To.Phone, UserID: p.To.UserID}
+			if p.ChatID != "" || !to.Valid() || p.File != "" || p.ReplyTo != "" {
+				return nil, badRequest
+			}
+			ns, ok := n.(network.NewChatSender)
+			if !ok {
+				return nil, unsupported
+			}
+			id, chat, err := ns.SendTo(ctx, network.Outgoing{To: &to, Text: p.Text, ClientID: p.ClientID})
+			if err != nil {
+				return nil, err
+			}
+			return map[string]any{"messageID": id, "chatID": nullIfEmpty(chat)}, nil
 		}
 		if p.ChatID == "" || (p.File != "" && !filepath.IsAbs(p.File)) {
 			return nil, badRequest

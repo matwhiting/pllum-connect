@@ -970,11 +970,12 @@ func TestOnlyTheAllowedWritesExist(t *testing.T) {
 		t.Fatalf("waWriter has %v, want exactly %v", writer, want)
 	}
 	// The rest of what the adapter uses of the client signs in, stays
-	// connected, reads history and acknowledges it, and builds a reaction for
-	// SendMessage: nothing else writes.
+	// connected, reads history and acknowledges it, builds a reaction for
+	// SendMessage, and checks one number inside a counted new chat
+	// (IsOnWhatsApp, newchat.go): nothing else writes.
 	client := names(reflect.TypeOf((*waClient)(nil)).Elem())
 	rest := []string{"AddEventHandlerWithSuccessStatus", "BuildReaction", "Connect", "Disconnect", "DownloadHistorySync",
-		"GetQRChannel", "IsConnected", "ParseWebMessage", "SendProtocolMessageReceipt"}
+		"GetQRChannel", "IsConnected", "IsOnWhatsApp", "ParseWebMessage", "SendProtocolMessageReceipt"}
 	all := append(append([]string(nil), want...), rest...)
 	sort.Strings(all)
 	if !reflect.DeepEqual(client, all) {

@@ -132,6 +132,11 @@ func (c *tripClient) SendMediaRetryReceipt(ctx context.Context, info *types.Mess
 
 func (c *tripClient) Logout(ctx context.Context) error { c.hit("Logout"); return c.inner.Logout(ctx) }
 
+func (c *tripClient) IsOnWhatsApp(ctx context.Context, phones []string) ([]types.IsOnWhatsAppResponse, error) {
+	c.hit("IsOnWhatsApp")
+	return c.inner.IsOnWhatsApp(ctx, phones)
+}
+
 // tripRig is a paired, live adapter whose client is a tripClient.
 func tripRig(t *testing.T) (*rig, *tripClient) {
 	t.Helper()

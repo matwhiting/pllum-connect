@@ -573,3 +573,108 @@ func TestANetworkWithoutScrollBackIsUnchanged(t *testing.T) {
 		t.Fatalf("FetchOlder was not called at the oldest line")
 	}
 }
+
+// newChatsNetwork is a whatsapp network that finds stored one-to-ones and
+// starts new ones by number.
+type newChatsNetwork struct {
+	*fakeNetwork
+	mu   sync.Mutex
+	sent []network.Outgoing
+}
+
+func (n *newChatsNetwork) ChatWith(ctx context.Context, to network.Recipient) (string, bool, error) {
+	if to.Phone == "+10000000001" {
+		return "10000000001@s.whatsapp.net", true, nil
+	}
+	return "", false, nil
+}
+
+func (n *newChatsNetwork) SendTo(ctx context.Context, m network.Outgoing) (string, string, error) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.sent = append(n.sent, m)
+	if m.To.Phone == "+10000000004" {
+		return "made-nochat", "", nil
+	}
+	return "made-new", "10000000003@s.whatsapp.net", nil
+}
+
+func startNewChats(t *testing.T) (*harness, *newChatsNetwork) {
+	t.Helper()
+	wa := &newChatsNetwork{fakeNetwork: &fakeNetwork{name: "whatsapp"}}
+	ig := newMetaNetwork()
+	h := startNets(t, func(emit network.Emit) []network.Network {
+		wa.rawEmit, wa.emit = emit, emit.For("whatsapp")
+		ig.rawEmit, ig.emit = emit, emit.For("instagram")
+		return []network.Network{wa, ig}
+	}, nil, nil)
+	result(t, h.hello())
+	return h, wa
+}
+
+func TestChatWithAnswersOnlyAChatID(t *testing.T) {
+	h, _ := startNewChats(t)
+	r := result(t, h.call("c1", "chatWith", map[string]any{"phone": "+10000000001"}))
+	wantKeys(t, "chatWith", r, "chatID")
+	if r["chatID"] != "10000000001@s.whatsapp.net" {
+		t.Errorf("chatWith = %v", r)
+	}
+	r = result(t, h.call("c2", "chatWith", map[string]any{"phone": "+10000000007"}))
+	wantKeys(t, "chatWith", r, "chatID")
+	if r["chatID"] != nil {
+		t.Errorf("an unknown number's chat is %v, want null", r["chatID"])
+	}
+	for i, p := range []map[string]any{{}, {"phone": "+10000000001", "userID": "x"}, {"phone": "10000000001"}} {
+		if k := kindOf(t, h.call(fmt.Sprintf("c%d", 3+i), "chatWith", p)); k != string(wire.BadRequest) {
+			t.Errorf("chatWith %v gave %s, want badRequest", p, k)
+		}
+	}
+	if k := kindOf(t, igCall(h, "c9", "chatWith", map[string]any{"userID": "17840000000000011"})); k != string(wire.Unsupported) {
+		t.Errorf("chatWith on instagram gave %s, want unsupported", k)
+	}
+}
+
+func TestSendToANumberAnswersItsChat(t *testing.T) {
+	h, wa := startNewChats(t)
+	r := result(t, h.call("s1", "send", map[string]any{"to": map[string]any{"phone": "+10000000003"}, "text": "invented hello", "clientID": "client-invented-1"}))
+	wantKeys(t, "send", r, "messageID", "chatID")
+	if r["messageID"] != "made-new" || r["chatID"] != "10000000003@s.whatsapp.net" {
+		t.Errorf("send to a number = %v", r)
+	}
+	r = result(t, h.call("s2", "send", map[string]any{"to": map[string]any{"phone": "+10000000004"}, "text": "invented hello"}))
+	if r["messageID"] != "made-nochat" || r["chatID"] != nil {
+		t.Errorf("send to a number with no chat = %v, want chatID null", r)
+	}
+	wa.mu.Lock()
+	defer wa.mu.Unlock()
+	if len(wa.sent) != 2 || wa.sent[0].ClientID != "client-invented-1" || wa.sent[0].Text != "invented hello" || wa.sent[0].ChatID != "" {
+		t.Errorf("the network was asked %+v", wa.sent)
+	}
+}
+
+func TestToAndChatIDTogetherIsABadRequest(t *testing.T) {
+	h, wa := startNewChats(t)
+	for i, p := range []map[string]any{
+		{"to": map[string]any{"phone": "+10000000003"}, "chatID": "10000000003@s.whatsapp.net", "text": "x"},
+		{"to": map[string]any{}, "text": "x"},
+		{"to": map[string]any{"phone": "+10000000003", "userID": "x"}, "text": "x"},
+		{"to": map[string]any{"phone": "+1 000"}, "text": "x"},
+		{"text": "x"},
+	} {
+		if k := kindOf(t, h.call(fmt.Sprintf("b%d", i), "send", p)); k != string(wire.BadRequest) {
+			t.Errorf("send %v gave %s, want badRequest", p, k)
+		}
+	}
+	wa.mu.Lock()
+	defer wa.mu.Unlock()
+	if len(wa.sent) != 0 {
+		t.Errorf("a bad request reached the network: %+v", wa.sent)
+	}
+}
+
+func TestToOnANetworkWithoutNewChatsIsUnsupported(t *testing.T) {
+	h, _ := startNewChats(t)
+	if k := kindOf(t, igCall(h, "u1", "send", map[string]any{"to": map[string]any{"userID": "17840000000000011"}, "text": "x"})); k != string(wire.Unsupported) {
+		t.Errorf("send to a user on instagram gave %s, want unsupported", k)
+	}
+}

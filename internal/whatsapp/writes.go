@@ -90,6 +90,7 @@ type sendRequest struct {
 	Mimetype string `json:"mimetype,omitempty"`
 	Target   string `json:"target,omitempty"` // the line a reaction is to
 	Emoji    string `json:"emoji,omitempty"`
+	NewChat  bool   `json:"newChat,omitempty"` // the first message of a new chat (newchat.go)
 }
 
 // sendJob is one send waiting for its turn.
@@ -532,6 +533,16 @@ func (w *WhatsApp) sendOut(ctx context.Context, o store.Outgoing, resend bool) e
 		kind := wire.Refused
 		if mayHaveGone {
 			kind = wire.Unclear
+		}
+		if req.NewChat {
+			// A new chat WhatsApp turned down holds new chats a day, unless
+			// the number is just not on WhatsApp; failed, it is never sent
+			// again.
+			if errors.Is(err, whatsmeow.ErrRecipientNotOnWhatsApp) {
+				kind = wire.NotOnNetwork
+			} else {
+				w.newChats.Hold(wire.Refused)
+			}
 		}
 		w.fail(o.ID, kind)
 		return &wire.Error{Kind: kind}

@@ -81,9 +81,11 @@ const (
 	LoginSession = "session"
 )
 
-// Outgoing is one `send`.
+// Outgoing is one `send`: to a held chat (ChatID), or to a person by their
+// address on the network (To), which may start a new one-to-one.
 type Outgoing struct {
 	ChatID   string
+	To       *Recipient
 	Text     string
 	ReplyTo  string // a message ID, or empty
 	File     string // an absolute path, or empty
@@ -157,6 +159,22 @@ type OlderPages interface {
 // the queue yields for the whole network.
 type ScrollBack interface {
 	ScrolledBack()
+}
+
+// ChatFinder is a network that can say, from its store alone, which held
+// one-to-one is with a person: by their number (WhatsApp: the number's chat,
+// or the LID it maps to) or their ID on the network. It asks the network
+// nothing. ok is false when no one-to-one with them is held.
+type ChatFinder interface {
+	ChatWith(ctx context.Context, to Recipient) (chatID string, ok bool, err error)
+}
+
+// NewChatSender is a network that sends to a person by address (m.To set,
+// m.ChatID empty): into the one-to-one held with them, else as a new chat,
+// counted against the network's daily cap (NewChats). chatID is the chat it
+// went to, empty when there is none (the address is not on the network).
+type NewChatSender interface {
+	SendTo(ctx context.Context, m Outgoing) (messageID, chatID string, err error)
 }
 
 // QueueHolder is a network whose history queue another network's pushback

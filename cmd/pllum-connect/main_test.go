@@ -262,3 +262,23 @@ func TestTheMetaQueuesHoldEachOther(t *testing.T) {
 		}
 	}
 }
+
+// Until phase 2b, only WhatsApp starts new chats or finds a chat by
+// address: the server answers unsupported for the rest.
+func TestOnlyWhatsAppStartsNewChats(t *testing.T) {
+	dir := t.TempDir()
+	var key [32]byte
+	st, err := store.Open(dir, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	for _, n := range networks(st, dir, key, network.Emit(func(map[string]any) {}), false, true) {
+		_, sends := n.(network.NewChatSender)
+		_, finds := n.(network.ChatFinder)
+		if want := n.Name() == "whatsapp"; sends != want || finds != want {
+			t.Errorf("%s: new chats %v, chatWith %v; want %v", n.Name(), sends, finds, want)
+		}
+		n.Stop()
+	}
+}
